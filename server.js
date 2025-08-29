@@ -3,15 +3,19 @@ import express from "express";
 import { createServer } from "http";
 import { WebSocketServer } from "ws";
 
+// Node 18+ provides global fetch, FormData, Blob, Headers
+
 // ---------- CONFIG ----------
 const PORT = process.env.PORT || 3000;
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY || "";
 
-// ElevenLabs STT JSON endpoint (expects base64 audio + model_id)
-const ELEVEN_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text";
-const ELEVEN_STT_MODEL_ID = "eleven_monolingual_v1"; // or "eleven_multilingual_v1"
+// If your account shows a different STT endpoint, set ELEVEN_STT_URL in env
+const ELEVEN_STT_URL =
+  process.env.ELEVEN_STT_URL || "https://api.elevenlabs.io/v1/speech-to-text";
+const ELEVEN_STT_MODEL_ID =
+  process.env.ELEVEN_STT_MODEL_ID || "eleven_monolingual_v1"; // or eleven_multilingual_v1
 
-// batch size (~1.5s) so we don't spam the API
+// Batch ~1.5s of audio before each STT request
 const CHUNK_MS = 1500;
 const FRAME_MS = 20; // Twilio frames are 20ms
 const FRAMES_PER_CHUNK = Math.round(CHUNK_MS / FRAME_MS);
@@ -25,7 +29,7 @@ function ulawByteToLinear(u) {
   const exponent = (u >> 4) & 0x07;
   const mantissa = u & 0x0f;
   let sample = ((mantissa << 1) + 1) << (exponent + 2);
-  sample -= 33; // bias
+  sample -= 33;
   sample = sign * sample;
   if (sample > 32767) sample = 32767;
   if (sample < -32768) sample = -32768;
@@ -35,15 +39,13 @@ function ulawByteToLinear(u) {
 // Convert a Buffer of µ-law bytes -> Int16Array PCM (8kHz mono)
 function ulawToPcm16(ulawBuf) {
   const out = new Int16Array(ulawBuf.length);
-  for (let i = 0; i < ulawBuf.length; i++) {
-    out[i] = ulawByteToLinear(ulawBuf[i] & 0xff);
-  }
+  for (let i = 0; i < ulawBuf.length; i++) out[i] = ulawByteToLinear(ulawBuf[i]);
   return out;
 }
 
 // Make a minimal WAV (PCM16, 8kHz, mono) from Int16Array
 function pcm16ToWavBytes(pcm16, sampleRate = 8000, numChannels = 1) {
-  const byteRate = sampleRate * numChannels * 2; // 16-bit
+  const byteRate = sampleRate * numChannels * 2;
   const blockAlign = numChannels * 2;
   const dataSize = pcm16.length * 2;
   const buffer = Buffer.alloc(44 + dataSize);
@@ -53,13 +55,13 @@ function pcm16ToWavBytes(pcm16, sampleRate = 8000, numChannels = 1) {
   buffer.write("WAVE", 8);
 
   buffer.write("fmt ", 12);
-  buffer.writeUInt32LE(16, 16); // PCM fmt chunk size
-  buffer.writeUInt16LE(1, 20);  // audio format = PCM
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20);
   buffer.writeUInt16LE(numChannels, 22);
   buffer.writeUInt32LE(sampleRate, 24);
   buffer.writeUInt32LE(byteRate, 28);
   buffer.writeUInt16LE(blockAlign, 32);
-  buffer.writeUInt16LE(16, 34); // bits per sample
+  buffer.writeUInt16LE(16, 34);
 
   buffer.write("data", 36);
   buffer.writeUInt32LE(dataSize, 40);
@@ -76,37 +78,33 @@ app.get("/", (_req, res) => res.send("OK"));
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer, path: "/stream" });
 
-// Node 18+ has global fetch; if on older Node, add `node-fetch`
-async function sendToElevenLabsSTT(wavBuffer) {
+async function sendToElevenLabsSTT_Multipart(wavBuffer) {
   if (!ELEVEN_API_KEY) {
     console.warn("[STT] Missing ELEVEN_API_KEY");
     return null;
   }
 
-  // ElevenLabs JSON STT expects base64 audio + model_id
-  const base64 = wavBuffer.toString("base64");
+  // Build multipart/form-data with model_id + file
+  const form = new FormData();
+  form.append("model_id", ELEVEN_STT_MODEL_ID);
+  form.append("file", new Blob([wavBuffer], { type: "audio/wav" }), "audio.wav");
 
   try {
     const resp = await fetch(ELEVEN_STT_URL, {
       method: "POST",
-      headers: {
-        "xi-api-key": ELEVEN_API_KEY,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model_id: ELEVEN_STT_MODEL_ID, // REQUIRED
-        audio: base64
-      })
+      headers: { "xi-api-key": ELEVEN_API_KEY }, // DO NOT set Content-Type; fetch sets boundary
+      body: form
     });
 
+    const textBody = await resp.text();
     if (!resp.ok) {
-      const text = await resp.text();
-      console.warn("[STT] HTTP", resp.status, text);
+      console.warn("[STT] HTTP", resp.status, textBody);
       return null;
     }
-
-    const data = await resp.json();
-    const text = data.text || data.transcription || JSON.stringify(data);
+    // Most STT responses are JSON with a `text` or `transcription` field
+    let data;
+    try { data = JSON.parse(textBody); } catch { data = { text: textBody }; }
+    const text = data.text || data.transcription || textBody;
     return text;
   } catch (err) {
     console.error("[STT] Error:", err);
@@ -119,7 +117,7 @@ wss.on("connection", (ws, req) => {
   console.log("[WS] headers:", req.headers);
 
   let frameCount = 0;
-  let chunkSamples = []; // Int16Array pieces
+  let chunkSamples = [];
 
   const keepalive = setInterval(() => {
     if (ws.readyState === ws.OPEN) ws.ping();
@@ -138,18 +136,18 @@ wss.on("connection", (ws, req) => {
       }
 
       case "media": {
-        // Decode current 20ms frame from base64 µ-law
+        // Decode this 20ms frame
         const ulaw = Buffer.from(data.media.payload, "base64");
         const pcm16 = ulawToPcm16(ulaw);
         chunkSamples.push(pcm16);
         frameCount++;
 
-        // Ack to keep Twilio happy
+        // Ack to keep Twilio streaming
         if (ws.readyState === ws.OPEN) {
           ws.send(JSON.stringify({ event: "mark", mark: { name: `ack_${data.media?.sequenceNumber}` }}));
         }
 
-        // Every ~1.5s, send a chunk to STT
+        // Every ~1.5s send batch to STT
         if (frameCount >= FRAMES_PER_CHUNK) {
           let total = 0;
           for (const seg of chunkSamples) total += seg.length;
@@ -158,10 +156,9 @@ wss.on("connection", (ws, req) => {
           for (const seg of chunkSamples) { merged.set(seg, off); off += seg.length; }
 
           const wav = pcm16ToWavBytes(merged, 8000, 1);
-          const text = await sendToElevenLabsSTT(wav);
+          const text = await sendToElevenLabsSTT_Multipart(wav);
           if (text) console.log(`[STT] ${text}`);
 
-          // reset
           frameCount = 0;
           chunkSamples = [];
         }
@@ -170,7 +167,6 @@ wss.on("connection", (ws, req) => {
 
       case "stop": {
         console.log("[WS] STOP");
-        // Flush any remainder
         if (chunkSamples.length) {
           (async () => {
             let total = 0;
@@ -179,7 +175,7 @@ wss.on("connection", (ws, req) => {
             let off = 0;
             for (const seg of chunkSamples) { merged.set(seg, off); off += seg.length; }
             const wav = pcm16ToWavBytes(merged, 8000, 1);
-            const text = await sendToElevenLabsSTT(wav);
+            const text = await sendToElevenLabsSTT_Multipart(wav);
             if (text) console.log(`[STT][final] ${text}`);
           })();
         }
