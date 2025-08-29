@@ -1,5 +1,5 @@
-// server.js — Twilio Media Streams -> ElevenLabs TTS (PCM16 8 kHz outbound)
-// Node 18+ (global fetch). No node-fetch needed.
+// server.js — Diagnostic: send known-good μ-law 8k (silence + 440Hz tone) to Twilio
+// Node 18+ (global fetch). No dependencies.
 
 import express from "express";
 import { createServer } from "http";
@@ -8,126 +8,73 @@ import { WebSocketServer } from "ws";
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// ===== ElevenLabs config =====
-const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY || "";
-const ELEVEN_VOICE_ID =
-  process.env.ELEVEN_VOICE_ID || "21m00Tcm4TlvDq8ikWAM"; // Rachel
-const ELEVEN_TTS_URL = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
+// ----- μ-law helpers -----
 
-// ===== WAV helpers =====
+// PCM16 sample -> 8-bit μ-law (PCMU). ITU-T G.711 μ-law
+function linear16ToUlaw(sample) {
+  // clamp
+  if (sample > 32767) sample = 32767;
+  if (sample < -32768) sample = -32768;
 
-// Return { data: Buffer, fmt: { sampleRate, bitsPerSample, numChannels, audioFormat } }
-// If not WAV, assume it's already raw PCM16 8 kHz mono and return as-is with fmt fallback.
-function parseWavOrRawPcm16(buf) {
-  const isRiff = buf.length >= 12 && buf.slice(0,4).toString() === "RIFF" && buf.slice(8,12).toString() === "WAVE";
-  if (!isRiff) {
-    // assume raw PCM16 LE mono @ 8 kHz
-    return { data: buf, fmt: { sampleRate: 8000, bitsPerSample: 16, numChannels: 1, audioFormat: 1 } };
+  const BIAS = 0x84; // 132
+  let sign = (sample >> 8) & 0x80;
+  if (sign !== 0) sample = -sample;
+  sample = sample + BIAS;
+  if (sample > 0x7FFF) sample = 0x7FFF;
+
+  let exponent = 7;
+  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; expMask >>= 1) {
+    exponent--;
   }
-
-  // minimal WAV parser
-  let pos = 12;
-  let fmt = null;
-  let data = null;
-
-  while (pos + 8 <= buf.length) {
-    const id = buf.slice(pos, pos + 4).toString();
-    const size = buf.readUInt32LE(pos + 4);
-    const next = pos + 8 + size;
-
-    if (id === "fmt ") {
-      const audioFormat = buf.readUInt16LE(pos + 8);
-      const numChannels = buf.readUInt16LE(pos + 10);
-      const sampleRate = buf.readUInt32LE(pos + 12);
-      const bitsPerSample = buf.readUInt16LE(pos + 22);
-      fmt = { audioFormat, numChannels, sampleRate, bitsPerSample };
-    } else if (id === "data") {
-      data = buf.slice(pos + 8, pos + 8 + size);
-    }
-    pos = next;
-  }
-
-  if (!data) data = Buffer.alloc(0);
-  if (!fmt) fmt = { audioFormat: 1, numChannels: 1, sampleRate: 8000, bitsPerSample: 16 };
-  return { data, fmt };
+  const mantissa = (sample >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0F;
+  let ulawByte = ~(sign | (exponent << 4) | mantissa) & 0xFF;
+  return ulawByte;
 }
 
-// ===== ElevenLabs TTS (PCM16 8 kHz) =====
-async function ttsPcm8k(text) {
-  if (!ELEVEN_API_KEY) {
-    console.warn("[TTS] Missing ELEVEN_API_KEY");
-    return null;
+// Generate μ-law 8kHz buffer for a sine tone (duration ms, freq Hz)
+function genUlawTone(durationMs, freqHz, sampleRate = 8000) {
+  const samples = Math.round(sampleRate * (durationMs / 1000));
+  const buf = Buffer.alloc(samples);
+  for (let i = 0; i < samples; i++) {
+    // sine at -6 dBFS approx
+    const s = Math.sin((2 * Math.PI * freqHz * i) / sampleRate);
+    const pcm16 = Math.round(s * 0.5 * 32767); // -6 dBFS
+    buf[i] = linear16ToUlaw(pcm16);
   }
-
-  const body = {
-    text,
-    output_format: "pcm_8000" // <- Linear PCM 16-bit, 8 kHz
-  };
-
-  const resp = await fetch(ELEVEN_TTS_URL, {
-    method: "POST",
-    headers: {
-      "xi-api-key": ELEVEN_API_KEY,
-      "Content-Type": "application/json",
-      "Accept": "application/octet-stream",
-    },
-    body: JSON.stringify(body),
-  });
-
-  const rawBuf = Buffer.from(await resp.arrayBuffer());
-  if (!resp.ok) {
-    console.warn("[TTS] HTTP", resp.status, rawBuf.toString("utf8").slice(0, 300));
-    return null;
-  }
-
-  const { data, fmt } = parseWavOrRawPcm16(rawBuf);
-  console.log(`[TTS] bytes=${rawBuf.length} wav=${rawBuf.slice(0,4).toString()==="RIFF"} dataBytes=${data.length} fmt=${JSON.stringify(fmt)}`);
-  if (fmt.audioFormat !== 1 || fmt.sampleRate !== 8000 || fmt.bitsPerSample !== 16 || fmt.numChannels !== 1) {
-    console.warn("[TTS] Unexpected format; expected PCM16 LE mono @ 8000 Hz");
-  }
-  return data;
+  return buf;
 }
 
-// ===== Outbound to Twilio: PCM16 frames (320 bytes = 20ms @ 8kHz) =====
-async function sendPcm16FramesToTwilio(ws, streamSid, pcmBuf) {
-  const BYTES_PER_FRAME = 320; // 160 samples * 2 bytes = 20ms
-  const SILENCE_FRAME = Buffer.alloc(BYTES_PER_FRAME, 0x00); // PCM16 silence
+// Generate μ-law silence (0xFF)
+function genUlawSilence(durationMs, sampleRate = 8000) {
+  const samples = Math.round(sampleRate * (durationMs / 1000));
+  return Buffer.alloc(samples, 0xFF);
+}
 
+// Send μ-law 8kHz as 20ms frames (160 bytes), track OUTBOUND
+async function sendUlawFrames(ws, streamSid, ulawBuf) {
+  const BYTES_PER_FRAME = 160;
   let framesSent = 0;
-  for (let off = 0; off < pcmBuf.length; off += BYTES_PER_FRAME) {
+  for (let off = 0; off < ulawBuf.length; off += BYTES_PER_FRAME) {
     if (ws.readyState !== ws.OPEN) break;
-
-    let frame = pcmBuf.slice(off, Math.min(off + BYTES_PER_FRAME, pcmBuf.length));
+    let frame = ulawBuf.slice(off, Math.min(off + BYTES_PER_FRAME, ulawBuf.length));
     if (frame.length < BYTES_PER_FRAME) {
-      const padded = Buffer.alloc(BYTES_PER_FRAME, 0x00);
+      const padded = Buffer.alloc(BYTES_PER_FRAME, 0xFF);
       frame.copy(padded);
       frame = padded;
     }
-
     ws.send(JSON.stringify({
       event: "media",
       streamSid,
+      track: "outbound",                   // REQUIRED by many accounts
       media: { payload: frame.toString("base64") }
     }));
-
     framesSent++;
     await new Promise(r => setTimeout(r, 20));
   }
-
-  // a short trailing silence frame helps avoid truncation on some stacks
-  if (ws.readyState === ws.OPEN) {
-    ws.send(JSON.stringify({
-      event: "media",
-      streamSid,
-      media: { payload: SILENCE_FRAME.toString("base64") }
-    }));
-    framesSent++;
-  }
-
-  console.log(`[OUT-PCM] framesSent=${framesSent} (~${framesSent * 20}ms)`);
+  console.log(`[OUT-ULAW] framesSent=${framesSent} (~${framesSent * 20}ms)`);
 }
 
-// ===== WebSocket handling =====
+// ----- WebSocket -----
 
 const wss = new WebSocketServer({ noServer: true });
 
@@ -139,53 +86,41 @@ wss.on("connection", (ws) => {
     let msg;
     try { msg = JSON.parse(message.toString()); } catch { return; }
 
-    switch (msg.event) {
-      case "start":
-        streamSid = msg.start?.streamSid || null;
-        console.log("[WS] START streamSid:", streamSid);
+    if (msg.event === "start") {
+      streamSid = msg.start?.streamSid || null;
+      console.log("[WS] START streamSid:", streamSid);
 
-        // Give Twilio a brief moment to be ready
-        setTimeout(async () => {
-          const pcm = await ttsPcm8k("Connected. I can speak now.");
-          if (pcm && streamSid && ws.readyState === ws.OPEN) {
-            await sendPcm16FramesToTwilio(ws, streamSid, pcm);
-          }
-        }, 250);
-        break;
-
-      case "media":
-        // Acknowledge inbound frames so Twilio continues streaming
-        if (msg.media?.sequenceNumber !== undefined) {
-          ws.send(JSON.stringify({
-            event: "mark",
-            mark: { name: `ack_${msg.media.sequenceNumber}` }
-          }));
+      // small arm time
+      setTimeout(async () => {
+        // 2s silence then 1s 440Hz tone
+        const ulaw = Buffer.concat([
+          genUlawSilence(2000),
+          genUlawTone(1000, 440)
+        ]);
+        if (ws.readyState === ws.OPEN && streamSid) {
+          await sendUlawFrames(ws, streamSid, ulaw);
         }
-        break;
-
-      case "stop":
-        console.log("[WS] STOP");
-        break;
-
-      default:
-        break;
+      }, 250);
+    } else if (msg.event === "media") {
+      // ack inbound so Twilio keeps streaming
+      if (msg.media?.sequenceNumber !== undefined) {
+        ws.send(JSON.stringify({ event: "mark", mark: { name: `ack_${msg.media.sequenceNumber}` } }));
+      }
+    } else if (msg.event === "stop") {
+      console.log("[WS] STOP");
     }
   });
 
   ws.on("close", () => console.log("🔌 WebSocket closed"));
-  ws.on("error", (err) => console.error("[WS] ERROR", err));
+  ws.on("error", (e) => console.error("[WS] ERROR", e));
 });
 
-// ===== HTTP/WS server =====
+// ----- HTTP/WS server -----
 
 const server = createServer(app);
-
 server.on("upgrade", (req, socket, head) => {
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req);
-  });
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
 app.get("/", (_req, res) => res.send("OK"));
-
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
