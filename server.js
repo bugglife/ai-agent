@@ -1,5 +1,5 @@
-// server.js — Twilio Media Streams <-> ElevenLabs TTS (ulaw_8000), clean build for Node 18+
-// No 'node-fetch' needed (fetch/FormData/Blob are global)
+// server.js — Twilio Media Streams -> ElevenLabs TTS (ulaw_8000)
+// Node 18+ (global fetch). No node-fetch.
 
 import express from "express";
 import { createServer } from "http";
@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 10000;
 // ===== ElevenLabs config =====
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY || "";
 const ELEVEN_VOICE_ID =
-  process.env.ELEVEN_VOICE_ID || "21m00Tcm4TlvDq8ikWAM"; // Rachel (sample)
+  process.env.ELEVEN_VOICE_ID || "21m00Tcm4TlvDq8ikWAM"; // Rachel
 const ELEVEN_TTS_URL = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
 
 // ===== Helpers =====
@@ -62,11 +62,12 @@ async function ttsUlaw8k(text) {
   return ulaw;
 }
 
-// Split μ-law 8kHz into exact 160-byte frames, mark OUTBOUND, pace ~20 ms
+// Send μ-law 8kHz bytes back to Twilio as exact 20ms frames (160 bytes), paced ~20 ms
 async function sendUlawFramesToTwilio(ws, streamSid, ulawBuf) {
   const BYTES_PER_FRAME = 160; // 20ms at 8kHz μ-law
   const SILENCE = 0xff;        // μ-law silence
 
+  let framesSent = 0;
   for (let off = 0; off < ulawBuf.length; off += BYTES_PER_FRAME) {
     if (ws.readyState !== ws.OPEN) break;
 
@@ -77,15 +78,17 @@ async function sendUlawFramesToTwilio(ws, streamSid, ulawBuf) {
       frame = padded;
     }
 
+    // NOTE: no 'track' field; Twilio accepts outbound without it
     ws.send(JSON.stringify({
       event: "media",
       streamSid,
-      track: "outbound",                 // <-- top-level (important)
       media: { payload: frame.toString("base64") }
     }));
 
+    framesSent++;
     await new Promise(r => setTimeout(r, 20));
   }
+  console.log(`[OUT] framesSent=${framesSent} (~${framesSent * 20}ms)`);
 }
 
 // ===== WebSocket handling =====
@@ -105,19 +108,24 @@ wss.on("connection", (ws) => {
         streamSid = msg.start?.streamSid || null;
         console.log("[WS] START streamSid:", streamSid);
 
-        // Play a short greeting to confirm outbound audio is correct
-        (async () => {
+        // Give Twilio ~250ms to be fully ready before we send audio
+        setTimeout(async () => {
           const ulaw = await ttsUlaw8k("Connected. I can speak now.");
-          if (ulaw && streamSid) await sendUlawFramesToTwilio(ws, streamSid, ulaw);
-        })();
+          if (ulaw && streamSid && ws.readyState === ws.OPEN) {
+            await sendUlawFramesToTwilio(ws, streamSid, ulaw);
+          }
+        }, 250);
+
         break;
 
       case "media":
         // Acknowledge inbound frames so Twilio keeps streaming
-        ws.send(JSON.stringify({
-          event: "mark",
-          mark: { name: `ack_${msg.media?.sequenceNumber}` }
-        }));
+        if (msg.media?.sequenceNumber !== undefined) {
+          ws.send(JSON.stringify({
+            event: "mark",
+            mark: { name: `ack_${msg.media.sequenceNumber}` }
+          }));
+        }
         break;
 
       case "stop":
