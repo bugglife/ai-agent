@@ -125,7 +125,7 @@ async function ttsUlaw8k(text) {
   const body = {
     text,
     // voice_settings: { stability: 0.4, similarity_boost: 0.8 },
-    output_format: "ulaw_8000" // <- μ-law @ 8kHz direct
+    output_format: "ulaw_8000" // μ-law @ 8 kHz (may come as WAV)
   };
 
   try {
@@ -144,25 +144,43 @@ async function ttsUlaw8k(text) {
       return null;
     }
     const arrayBuf = await resp.arrayBuffer();
-    // Raw μ-law (8kHz mono) bytes
-    return Buffer.from(arrayBuf);
+    const raw = Buffer.from(arrayBuf);
+    return extractWavDataIfNeeded(raw); // <-- strip WAV header if present
   } catch (err) {
     console.error("[TTS] Error:", err);
     return null;
   }
 }
 
-// Split μ-law 8kHz buffer into 20ms frames (160 bytes) and send to Twilio
+
+// Split μ-law 8kHz into exact 160-byte frames, mark as outbound, pace at 20ms
 async function sendUlawFramesToTwilio(ws, streamSid, ulawBuf) {
   const BYTES_PER_FRAME = 160; // 20ms @ 8kHz μ-law
+  const SILENCE = 0xFF;       // μ-law silence
+
   for (let offset = 0; offset < ulawBuf.length; offset += BYTES_PER_FRAME) {
     if (ws.readyState !== ws.OPEN) break;
-    const frame = ulawBuf.slice(offset, Math.min(offset + BYTES_PER_FRAME, ulawBuf.length));
+
+    let frame = ulawBuf.slice(offset, Math.min(offset + BYTES_PER_FRAME, ulawBuf.length));
+
+    // Pad last frame to exactly 160 bytes
+    if (frame.length < BYTES_PER_FRAME) {
+      const padded = Buffer.alloc(BYTES_PER_FRAME, SILENCE);
+      frame.copy(padded, 0);
+      frame = padded;
+    }
+
     const payload = frame.toString("base64");
-    ws.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
-    await new Promise((r) => setTimeout(r, 20)); // pace frames in real time
+    ws.send(JSON.stringify({
+      event: "media",
+      streamSid,
+      media: { payload, track: "outbound" } // <-- IMPORTANT
+    }));
+
+    await new Promise(r => setTimeout(r, 20));
   }
 }
+
 
 // ---------- SERVER ----------
 const app = express();
