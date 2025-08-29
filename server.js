@@ -1,4 +1,6 @@
 // server.js
+// Node 18+ (uses global fetch / FormData / Blob)
+
 import express from "express";
 import { createServer } from "http";
 import { WebSocketServer } from "ws";
@@ -9,15 +11,15 @@ const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY || "";
 const ELEVEN_STT_URL =
   process.env.ELEVEN_STT_URL || "https://api.elevenlabs.io/v1/speech-to-text";
 const ELEVEN_STT_MODEL_ID =
-  process.env.ELEVEN_STT_MODEL_ID || "scribe_v1";
+  process.env.ELEVEN_STT_MODEL_ID || "scribe_v1"; // <- your requested model
 
-// batching & filters
-const FRAME_MS = 20;          // each Twilio frame is ~20ms @ 8kHz µ-law
-const CHUNK_MS = 1500;        // send to STT roughly every 1.5s
+// Batching & filters
+const FRAME_MS = 20;           // each Twilio frame ~20ms @ 8kHz µ-law
+const CHUNK_MS = 1500;         // send to STT roughly every 1.5s
 const FRAMES_PER_CHUNK = Math.round(CHUNK_MS / FRAME_MS);
-const MIN_SPEECH_MS = 400;    // require ~0.4s of voiced audio per chunk
+const MIN_SPEECH_MS = 400;     // require ~0.4s of voiced audio per chunk
 const MIN_SPEECH_FRAMES = Math.round(MIN_SPEECH_MS / FRAME_MS);
-const SILENCE_RMS = 300;      // simple energy gate (0..32768)
+const SILENCE_RMS = 300;       // simple energy gate (0..32768)
 
 // ---------- AUDIO HELPERS ----------
 
@@ -87,15 +89,16 @@ async function sttMultipart(wavBuffer) {
     console.warn("[STT] Missing ELEVEN_API_KEY");
     return null;
   }
+
   const form = new FormData();
-  form.append("model_id", ELEVEN_STT_MODEL_ID);               // REQUIRED by ElevenLabs
+  form.append("model_id", ELEVEN_STT_MODEL_ID); // REQUIRED by ElevenLabs
   form.append("file", new Blob([wavBuffer], { type: "audio/wav" }), "audio.wav");
 
   try {
     const resp = await fetch(ELEVEN_STT_URL, {
       method: "POST",
-      headers: { "xi-api-key": ELEVEN_API_KEY },              // let fetch set content-type/boundary
-      body: form
+      headers: { "xi-api-key": ELEVEN_API_KEY }, // let fetch add Content-Type boundary
+      body: form,
     });
 
     const bodyText = await resp.text();
@@ -127,9 +130,9 @@ wss.on("connection", (ws, req) => {
   let framesSeen = 0;
   let voicedFrames = 0;
   let chunkPieces = [];      // Int16Array segments
-  let processing = false;    // ONE request at a time
+  let processing = false;    // ensure ONE STT request at a time
 
-  // keepalive
+  // keepalive pings so free-tier hosts don't time out the socket
   const keepalive = setInterval(() => {
     if (ws.readyState === ws.OPEN) ws.ping();
   }, 15000);
@@ -149,26 +152,28 @@ wss.on("connection", (ws, req) => {
       }
 
       case "media": {
+        // One 20ms frame of μ-law audio
         const ulaw = Buffer.from(data.media.payload, "base64");
         const pcm16 = ulawToPcm16(ulaw);
 
-        // energy gate to reduce "white noise" spam
+        // Energy gate to reduce "white noise" / silence spam
         if (rms(pcm16) > SILENCE_RMS) {
           chunkPieces.push(pcm16);
           voicedFrames++;
         }
         framesSeen++;
 
-        // ack so Twilio keeps streaming
+        // Ack so Twilio keeps streaming
         if (ws.readyState === ws.OPEN) {
-          ws.send(JSON.stringify({ event: "mark", mark: { name: `ack_${data.media?.sequenceNumber}` }}));
+          ws.send(JSON.stringify({ event: "mark", mark: { name: `ack_${data.media?.sequenceNumber}` } }));
         }
 
-        // every ~1.5s, if we have speech and not already processing, send ONE STT request
+        // Every ~1.5s, if we have speech and not already processing, send ONE STT request
         if (framesSeen >= FRAMES_PER_CHUNK && !processing) {
           framesSeen = 0;
 
           if (voicedFrames < MIN_SPEECH_FRAMES) {
+            // mostly silence; drop it
             voicedFrames = 0;
             chunkPieces = [];
             break;
@@ -176,7 +181,7 @@ wss.on("connection", (ws, req) => {
 
           processing = true;
 
-          // merge Int16 chunks
+          // Merge Int16 chunks into one Int16Array
           let total = 0;
           for (const seg of chunkPieces) total += seg.length;
           const merged = new Int16Array(total);
@@ -186,8 +191,8 @@ wss.on("connection", (ws, req) => {
           const wav = pcm16ToWavBytes(merged, 8000, 1);
           const text = await sttMultipart(wav);
 
-          // log meaningful text only
-          if (text && !/^\s*\(?(silence|white noise|music|musique|static)\)?\s*$/i.test(text)) {
+          // Log meaningful text
+          if (text && !/^\s*\(?(silence|white noise|music|static)\)?\s*$/i.test(text)) {
             console.log(`[STT] ${text}`);
           }
 
@@ -200,7 +205,7 @@ wss.on("connection", (ws, req) => {
 
       case "stop": {
         console.log("[WS] STOP");
-        // optional final flush if any voiced audio is left and we're not processing
+        // Optional final flush (if any voiced audio remains and we're not processing)
         if (!processing && chunkPieces.length) {
           (async () => {
             let total = 0;
