@@ -1,126 +1,111 @@
-// server.js — Diagnostic: send known-good μ-law 8k (silence + 440Hz tone) to Twilio
-// Node 18+ (global fetch). No dependencies.
-
-import express from "express";
-import { createServer } from "http";
+import http from "http";
 import { WebSocketServer } from "ws";
 
-const app = express();
+// Twilio will connect to wss://<your-host>/stream
 const PORT = process.env.PORT || 10000;
+const WS_PATH = "/stream";
 
-// ----- μ-law helpers -----
-
-// PCM16 sample -> 8-bit μ-law (PCMU). ITU-T G.711 μ-law
-function linear16ToUlaw(sample) {
-  // clamp
-  if (sample > 32767) sample = 32767;
-  if (sample < -32768) sample = -32768;
-
-  const BIAS = 0x84; // 132
+// ---- μ-law encoder (G.711) ----
+function linearToULaw(sample) {
+  // sample: 16-bit signed PCM (-32768..32767)
+  const BIAS = 0x84;
+  const CLIP = 32635;
   let sign = (sample >> 8) & 0x80;
-  if (sign !== 0) sample = -sample;
+  if (sample < 0) sample = -sample;
+  if (sample > CLIP) sample = CLIP;
   sample = sample + BIAS;
-  if (sample > 0x7FFF) sample = 0x7FFF;
 
   let exponent = 7;
   for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; expMask >>= 1) {
     exponent--;
   }
-  const mantissa = (sample >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0F;
+  let mantissa = (sample >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0F;
   let ulawByte = ~(sign | (exponent << 4) | mantissa) & 0xFF;
   return ulawByte;
 }
 
-// Generate μ-law 8kHz buffer for a sine tone (duration ms, freq Hz)
-function genUlawTone(durationMs, freqHz, sampleRate = 8000) {
-  const samples = Math.round(sampleRate * (durationMs / 1000));
-  const buf = Buffer.alloc(samples);
-  for (let i = 0; i < samples; i++) {
-    // sine at -6 dBFS approx
-    const s = Math.sin((2 * Math.PI * freqHz * i) / sampleRate);
-    const pcm16 = Math.round(s * 0.5 * 32767); // -6 dBFS
-    buf[i] = linear16ToUlaw(pcm16);
+// Generate one 20ms frame of μ-law tone (8kHz, 160 samples)
+function toneFrameULaw(freqHz = 440, phaseRef = 0) {
+  const SR = 8000;          // sample rate
+  const N = 160;            // 20ms
+  const TWO_PI = 2 * Math.PI;
+  const frame = new Uint8Array(N);
+
+  for (let i = 0; i < N; i++) {
+    const t = (phaseRef + i) / SR;
+    // Sine @ ~ -12 dBFS for headroom
+    const pcm = Math.round(10000 * Math.sin(TWO_PI * freqHz * t));
+    frame[i] = linearToULaw(pcm);
   }
-  return buf;
+  return frame;
 }
 
-// Generate μ-law silence (0xFF)
-function genUlawSilence(durationMs, sampleRate = 8000) {
-  const samples = Math.round(sampleRate * (durationMs / 1000));
-  return Buffer.alloc(samples, 0xFF);
-}
-
-// Send μ-law 8kHz as 20ms frames (160 bytes), track OUTBOUND
-async function sendUlawFrames(ws, streamSid, ulawBuf) {
-  const BYTES_PER_FRAME = 160;
-  let framesSent = 0;
-  for (let off = 0; off < ulawBuf.length; off += BYTES_PER_FRAME) {
-    if (ws.readyState !== ws.OPEN) break;
-    let frame = ulawBuf.slice(off, Math.min(off + BYTES_PER_FRAME, ulawBuf.length));
-    if (frame.length < BYTES_PER_FRAME) {
-      const padded = Buffer.alloc(BYTES_PER_FRAME, 0xFF);
-      frame.copy(padded);
-      frame = padded;
-    }
-    ws.send(JSON.stringify({
-      event: "media",
-      streamSid,
-      track: "outbound",                   // REQUIRED by many accounts
-      media: { payload: frame.toString("base64") }
-    }));
-    framesSent++;
-    await new Promise(r => setTimeout(r, 20));
-  }
-  console.log(`[OUT-ULAW] framesSent=${framesSent} (~${framesSent * 20}ms)`);
-}
-
-// ----- WebSocket -----
+// ---- HTTP + WS server ----
+const httpServer = http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end("ok");
+});
 
 const wss = new WebSocketServer({ noServer: true });
 
+httpServer.on("upgrade", (req, socket, head) => {
+  try {
+    const url = new URL(req.url, "http://localhost");
+    if (url.pathname !== WS_PATH) {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } catch {
+    socket.destroy();
+  }
+});
+
 wss.on("connection", (ws) => {
   console.log("🔗 WebSocket connected");
-  let streamSid = null;
 
-  ws.on("message", async (message) => {
-    let msg;
-    try { msg = JSON.parse(message.toString()); } catch { return; }
+  // Keep-alive (so Twilio doesn’t drop us)
+  ws.isAlive = true;
+  ws.on("pong", () => (ws.isAlive = true));
+  const pingIv = setInterval(() => {
+    if (!ws.isAlive) return ws.terminate();
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  }, 25000);
 
-    if (msg.event === "start") {
-      streamSid = msg.start?.streamSid || null;
-      console.log("[WS] START streamSid:", streamSid);
+  // Send a 440Hz tone: 20ms frames, every 20ms
+  let phase = 0;
+  const SR = 8000;
+  const N = 160;
+  const sendIv = setInterval(() => {
+    if (ws.readyState !== ws.OPEN) return;
+    const frame = toneFrameULaw(440, phase);
+    phase += N; // advance phase by 20ms worth of samples
+    const b64 = Buffer.from(frame).toString("base64");
+    ws.send(JSON.stringify({ event: "media", media: { payload: b64 } }));
+  }, 20);
 
-      // small arm time
-      setTimeout(async () => {
-        // 2s silence then 1s 440Hz tone
-        const ulaw = Buffer.concat([
-          genUlawSilence(2000),
-          genUlawTone(1000, 440)
-        ]);
-        if (ws.readyState === ws.OPEN && streamSid) {
-          await sendUlawFrames(ws, streamSid, ulaw);
-        }
-      }, 250);
-    } else if (msg.event === "media") {
-      // ack inbound so Twilio keeps streaming
-      if (msg.media?.sequenceNumber !== undefined) {
-        ws.send(JSON.stringify({ event: "mark", mark: { name: `ack_${msg.media.sequenceNumber}` } }));
-      }
-    } else if (msg.event === "stop") {
-      console.log("[WS] STOP");
-    }
+  ws.on("message", (data) => {
+    // Optional: log Twilio messages (start/media/stop)
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.event === "start") console.log("[WS] START", msg.streamSid);
+      if (msg.event === "media") {/* inbound audio from caller */}
+      if (msg.event === "stop") console.log("[WS] STOP");
+    } catch {}
   });
 
-  ws.on("close", () => console.log("🔌 WebSocket closed"));
-  ws.on("error", (e) => console.error("[WS] ERROR", e));
+  ws.on("close", () => {
+    clearInterval(sendIv);
+    clearInterval(pingIv);
+    console.log("👋 WebSocket closed");
+  });
+
+  ws.on("error", (e) => console.error("WS error:", e.message));
 });
 
-// ----- HTTP/WS server -----
-
-const server = createServer(app);
-server.on("upgrade", (req, socket, head) => {
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+httpServer.listen(PORT, () => {
+  console.log(`🚀 Server listening on ${PORT} (ws path: ${WS_PATH})`);
 });
-
-app.get("/", (_req, res) => res.send("OK"));
-server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
