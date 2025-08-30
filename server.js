@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import WebSocket, { WebSocketServer } from "ws";
 import fetch from "node-fetch";
@@ -5,134 +6,186 @@ import fetch from "node-fetch";
 const app = express();
 const port = process.env.PORT || 10000;
 
+// ---- Config ----
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
-const ELEVEN_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"; // change if you like
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL"; // Rachel as default
+const VERBOSE_MEDIA = false; // set true only when debugging frame-by-frame
 
+// Twilio media format: 8kHz, mono, μ-law (G.711 u-law)
+// 20ms per frame => 160 samples => 160 bytes (μ-law), but Twilio typically carries 320 bytes (2x 10ms)
+const FRAME_MS = 20;
+const CHUNK_BYTES = 320; // 20ms at 8k μ-law as Twilio sends
+
+// ---- WebSocket (Twilio) ----
 const wss = new WebSocketServer({ noServer: true });
 
-// --- helpers ---------------------------------------------------------------
-
-function wsSend(ws, obj) {
-  try {
-    ws.send(JSON.stringify(obj));
-  } catch (e) {
-    console.error("❌ WS send error:", e);
-  }
+function log(...args) {
+  console.log(...args);
 }
 
-async function ttsUlaw8000(text) {
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream`;
+// Turn a raw μ-law buffer into paced Twilio media frames
+async function sendUlawBufferPaced(ws, ulawBuffer) {
+  // Split into 320-byte frames and send at ~20ms cadence
+  const frames = [];
+  for (let i = 0; i < ulawBuffer.length; i += CHUNK_BYTES) {
+    frames.push(ulawBuffer.subarray(i, i + CHUNK_BYTES));
+  }
 
+  let idx = 0;
+  await new Promise((resolve) => {
+    const timer = setInterval(() => {
+      if (idx >= frames.length || ws.readyState !== WebSocket.OPEN) {
+        clearInterval(timer);
+        return resolve();
+      }
+      ws.send(
+        JSON.stringify({
+          event: "media",
+          media: { payload: frames[idx].toString("base64") },
+        })
+      );
+      idx++;
+    }, FRAME_MS); // ~20ms between frames
+  });
+}
+
+async function ttsUlaw(text) {
+  // ElevenLabs non-streaming TTS → μ-law output
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream`;
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "xi-api-key": ELEVEN_API_KEY,
-      "content-type": "application/json",
-      "accept": "audio/ulaw", // Twilio expects 8k mu-law
+      "Content-Type": "application/json",
+      // μ-law at 8kHz so it matches Twilio
+      Accept: "audio/ulaw",
     },
     body: JSON.stringify({
       text,
+      // basic settings; tweak if you want
       voice_settings: { stability: 0.5, similarity_boost: 0.5 },
+      output_format: "ulaw_8000",
     }),
   });
 
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`ElevenLabs ${res.status} ${res.statusText}: ${body}`);
+    const msg = await res.text().catch(() => res.statusText);
+    throw new Error(`ElevenLabs TTS failed: ${res.status} ${msg}`);
   }
 
-  const buf = Buffer.from(await res.arrayBuffer());
-  return buf;
+  const arr = await res.arrayBuffer();
+  return Buffer.from(arr);
 }
 
-// --- websocket handling ----------------------------------------------------
-
 wss.on("connection", (ws) => {
-  console.log("🔗 WebSocket connected");
-
+  log("🔗 WebSocket connected");
+  let firstHeard = false;
   let streamSid = null;
+  let framesIn = 0;
+
+  const safeSpeak = async (phrase) => {
+    try {
+      const ulaw = await ttsUlaw(phrase);
+      log(`[TTS] bytes=${ulaw.length}`);
+      await sendUlawBufferPaced(ws, ulaw);
+    } catch (err) {
+      console.error("[TTS] error:", err.message);
+    }
+  };
 
   ws.on("message", async (raw) => {
     let msg;
     try {
       msg = JSON.parse(raw.toString());
-    } catch (e) {
-      console.error("❌ Could not parse WS message:", e);
+    } catch {
       return;
     }
 
-    // Log everything for now so we can see the flow
-    console.log("[WS-IN]", msg.event, msg);
-
-    try {
-      if (msg.event === "start") {
-        streamSid = msg.start?.streamSid || msg.streamSid || null;
-        console.log("➡️  START streamSid:", streamSid);
-
-        // (Optional) say hello right away (requires track="both_tracks" + account flag)
-        const audio = await ttsUlaw8000("Hello! I am ready.");
-        wsSend(ws, {
-          event: "media",
-          streamSid,                       // ✅ required by Twilio
-          media: { payload: audio.toString("base64") },
-        });
-        console.log(`[OUT-ULAW] bytes=${audio.length}`);
+    switch (msg.event) {
+      case "connected": {
+        // Twilio tells us media format here (ulaw/8000/mono)
+        log(
+          "[WS-IN] connected",
+          JSON.stringify(
+            {
+              protocol: msg.protocol,
+              version: msg.version,
+              mediaFormat: msg.mediaFormat,
+            },
+            null,
+            0
+          )
+        );
+        // Greet the caller to prove outbound audio works
+        safeSpeak("Hello! I’m online. Say something and I’ll reply.");
+        break;
       }
 
-      // Twilio will send a lot of "media" with inbound audio from the caller.
-      // We don't need to do anything with it for a simple test, but we could
-      // collect speech and then reply via TTS.
-      else if (msg.event === "media") {
-        // You can inspect msg.media.payload (base64 μ-law) if needed
+      case "start": {
+        streamSid = msg.start?.streamSid;
+        log(`🚀 START streamSid: ${streamSid}`);
+        break;
       }
 
-      else if (msg.event === "mark" || msg.event === "stop") {
-        console.log("➡️  Event:", msg.event);
-      }
-
-      // If you ever wire STT yourself and produce text, you can TTS and send:
-      else if (msg.event === "transcription" && msg.text) {
-        if (!streamSid) {
-          console.warn("No streamSid yet; cannot send audio back.");
-          return;
+      case "media": {
+        framesIn++;
+        if (VERBOSE_MEDIA && framesIn <= 10) {
+          // print only first few to avoid log floods
+          log("[WS-IN] media", {
+            seq: msg.sequenceNumber,
+            chunk: msg.media?.chunk,
+            ts: msg.media?.timestamp,
+          });
         }
-        const audio = await ttsUlaw8000(`You said: ${msg.text}`);
-        wsSend(ws, {
-          event: "media",
-          streamSid,
-          media: { payload: audio.toString("base64") },
-        });
-        console.log(`[OUT-ULAW] bytes=${audio.length}`);
+
+        // First time we detect any media, confirm back to caller
+        if (!firstHeard) {
+          firstHeard = true;
+          safeSpeak("Got it. I hear you.");
+        }
+        break;
       }
-    } catch (err) {
-      console.error("❌ Handler error:", err);
+
+      case "stop": {
+        log("🛑 WS stop");
+        try {
+          ws.close();
+        } catch {}
+        break;
+      }
+
+      default:
+        // ignore other events to keep logs clean
+        break;
     }
   });
 
-  ws.on("close", () => console.log("👋 WS closed"));
-  ws.on("error", (e) => console.error("❌ WS error:", e));
+  ws.on("close", () => {
+    log("👋 WS closed");
+  });
 });
 
-// --- health endpoints ------------------------------------------------------
-
+// ---- Minimal HTTP (health + root) ----
 app.get("/", (_req, res) => {
-  res.status(200).send("✅ Server is running. WebSocket endpoint is at /stream");
+  res
+    .status(200)
+    .send("✅ Server is running. Twilio WebSocket endpoint: wss://<host>/stream");
 });
+
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-// --- HTTP server + Upgrade to WS ------------------------------------------
+const server = app.listen(port, () => {
+  log(`🚀 Server running on port ${port}`);
+});
 
-const server = app.listen(port, () =>
-  console.log(`🚀 Server running on port ${port}`)
-);
-
-server.on("upgrade", (req, socket, head) => {
-  // only accept /stream
-  if (req.url !== "/stream") {
-    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
-    return socket.destroy();
+// Upgrade HTTP → WS at /stream
+server.on("upgrade", (request, socket, head) => {
+  const { url } = request;
+  if (!url || !url.startsWith("/stream")) {
+    socket.destroy();
+    return;
   }
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req);
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit("connection", ws, request);
   });
 });
