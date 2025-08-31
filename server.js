@@ -1,9 +1,9 @@
-// server.js — Twilio <-> ElevenLabs STT+TTS with correct μ-law framing
-// Node 18+ (if on older runtime keep node-fetch import)
+// server.js — Twilio <-> ElevenLabs, stable "noServer" WS upgrade + μ-law framing
 import express from "express";
 import { createServer } from "http";
 import { WebSocketServer } from "ws";
 import fetch from "node-fetch";
+import { URL } from "url";
 
 // ------------------ CONFIG ------------------
 const PORT = process.env.PORT || 10000;
@@ -24,12 +24,12 @@ const ENERGY_GATE = 300;              // basic speech gate (RMS)
 
 // ------------------ HTTP ------------------
 const app = express();
-app.get("/", (_req, res) => res.send("OK"));
+app.get("/", (_req, res) => res.send("OK")); // sanity check
 
-const httpServer = createServer(app);
+const server = createServer(app);
 
-// ------------------ WS SERVER ------------------
-const wss = new WebSocketServer({ server: httpServer, path: "/stream" });
+// ------------------ WS SERVER (noServer) ------------------
+const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", (ws, req) => {
   console.log("🔗 WebSocket connected from", req.socket?.remoteAddress);
@@ -54,20 +54,19 @@ wss.on("connection", (ws, req) => {
       streamSid = msg.start?.streamSid;
       console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${streamSid}`);
 
-      // send an immediate spoken confirmation so we can test outbound path
+      // quick spoken confirmation to validate outbound path
       if (!ttsBusy) {
         ttsBusy = true;
-        const ulawGreeting = await ttsUlaw8k("You are connected. Say something and I will echo it back.");
-        if (ulawGreeting) await sendUlawFrames(ws, streamSid, ulawGreeting);
+        const greet = await ttsUlaw8k("You are connected. Say something and I will echo it back.");
+        if (greet) await sendUlawFrames(ws, streamSid, greet);
         ttsBusy = false;
       }
       return;
     }
 
     if (msg.event === "media") {
-      // inbound 20ms μ-law frame from Twilio
-      const ulaw = Buffer.from(msg.media.payload, "base64");
-      const pcm16 = ulawToPcm16(ulaw); // for energy + wav building
+      const ulaw = Buffer.from(msg.media.payload, "base64"); // inbound μ-law
+      const pcm16 = ulawToPcm16(ulaw);                       // for energy + WAV
 
       if (rms(pcm16) > ENERGY_GATE) {
         chunkPieces.push(pcm16);
@@ -75,15 +74,9 @@ wss.on("connection", (ws, req) => {
       }
       framesSeen++;
 
-      // optional ack
-      if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({ event: "mark", mark: { name: `ack_${msg.media.sequenceNumber}` }}));
-      }
-
       if (framesSeen >= FRAMES_PER_CHUNK && !sttBusy) {
         framesSeen = 0;
 
-        // too quiet? reset and wait
         if (voicedFrames < 4) { // ~80ms voiced
           voicedFrames = 0;
           chunkPieces = [];
@@ -101,8 +94,8 @@ wss.on("connection", (ws, req) => {
         if (text && !ttsBusy) {
           console.log("[STT]", text);
           ttsBusy = true;
-          const ulawReply = await ttsUlaw8k(`You said: ${text}`);
-          if (ulawReply) await sendUlawFrames(ws, streamSid, ulawReply);
+          const reply = await ttsUlaw8k(`You said: ${text}`);
+          if (reply) await sendUlawFrames(ws, streamSid, reply);
           ttsBusy = false;
         }
       }
@@ -123,9 +116,22 @@ wss.on("connection", (ws, req) => {
   ws.on("error", (err) => console.error("[WS] ERROR", err));
 });
 
-httpServer.listen(PORT, () =>
-  console.log(`🚀 Server running on port ${PORT} (ws path: /stream)`)
-);
+// Only upgrade if the pathname is exactly /stream (Twilio URL must match)
+server.on("upgrade", (req, socket, head) => {
+  try {
+    const { pathname } = new URL(req.url, "http://localhost");
+    if (pathname !== "/stream") {
+      socket.destroy();
+      return;
+    }
+  } catch {
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+});
+
+server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
 // ------------------ AUDIO HELPERS ------------------
 
