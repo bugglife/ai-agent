@@ -1,6 +1,6 @@
-// server.js — Twilio <-> ElevenLabs
-// Safe by default (inbound-only). Flip ALLOW_BIDIRECTIONAL=true after Twilio enables it.
-// Requires Node 18+ and ELEVEN_API_KEY env var.
+// server.js — Twilio <-> ElevenLabs media bridge
+// Safe default: inbound-only. Flip ALLOW_BIDIRECTIONAL=true once Twilio enables it for your account.
+// Node 18+ (for FormData/Blob via undici). Set ELEVEN_API_KEY in Render env.
 
 import express from "express";
 import { createServer } from "http";
@@ -18,25 +18,24 @@ const ELEVEN_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text";
 const ELEVEN_STT_MODEL = "scribe_v1";
 
 // Twilio media framing (for outbound when enabled)
-const FRAME_MS = 20;             // 20 ms per Twilio frame
-const BYTES_PER_FRAME = 160;     // 20 ms @ 8 kHz μ-law = 160 bytes
-const SILENCE_ULAW = 0xFF;       // μ-law silence
+const FRAME_MS = 20;           // 20 ms frames
+const BYTES_PER_FRAME = 160;   // 20 ms @ 8kHz μ-law
+const SILENCE_ULAW = 0xff;
 
-// STT batching
+// Simple STT chunking
 const CHUNK_MS = 1500;
 const FRAMES_PER_CHUNK = Math.round(CHUNK_MS / FRAME_MS);
-const ENERGY_GATE = 300;
+const ENERGY_GATE = 300;       // RMS gate
 
 // ------------------ HTTP ------------------
 const app = express();
-app.get("/", (_req, res) => res.send("OK")); // health check
-
+app.get("/", (_req, res) => res.send("OK")); // Health check
 const server = createServer(app);
 
 // ------------------ WS SERVER ------------------
 const wss = new WebSocketServer({ noServer: true });
 
-// accept upgrades (log path for sanity)
+// accept upgrades from any path and log it
 server.on("upgrade", (req, socket, head) => {
   try { console.log("[UPGRADE] url:", req.url); } catch {}
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
@@ -48,10 +47,11 @@ wss.on("connection", (ws, req) => {
   let streamSid = null;
   let framesSeen = 0;
   let voicedFrames = 0;
-  let chunkPieces = [];    // Int16Array list
+  let chunkPieces = [];          // Int16Array list
   let sttBusy = false;
   let ttsBusy = false;
 
+  // keepalive to avoid idle closes
   const keepAlive = setInterval(() => {
     if (ws.readyState === ws.OPEN) ws.ping();
   }, 15000);
@@ -64,7 +64,7 @@ wss.on("connection", (ws, req) => {
       streamSid = msg.start?.streamSid;
       console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${streamSid}  bidi=${ALLOW_BIDIRECTIONAL}`);
 
-      // Optional greeting ONLY if bidirectional is allowed
+      // Send greeting only when bidirectional is allowed
       if (ALLOW_BIDIRECTIONAL && !ttsBusy) {
         ttsBusy = true;
         const greet = await ttsUlaw8k("You are connected. Say something and I will echo it back.");
@@ -75,17 +75,18 @@ wss.on("connection", (ws, req) => {
     }
 
     if (msg.event === "media") {
-      // inbound μ-law 20ms
+      // inbound μ-law (20ms)
       const ulaw = Buffer.from(msg.media.payload, "base64");
       const pcm16 = ulawToPcm16(ulaw);
 
+      // basic VAD
       if (rms(pcm16) > ENERGY_GATE) {
         chunkPieces.push(pcm16);
         voicedFrames++;
       }
       framesSeen++;
 
-      // batch to STT periodically
+      // every ~1.5s run STT, then optionally TTS back
       if (framesSeen >= FRAMES_PER_CHUNK && !sttBusy) {
         framesSeen = 0;
 
@@ -106,7 +107,6 @@ wss.on("connection", (ws, req) => {
         if (text) {
           console.log("[STT]", text);
 
-          // Only speak back if bidirectional is enabled
           if (ALLOW_BIDIRECTIONAL && !ttsBusy) {
             ttsBusy = true;
             const reply = await ttsUlaw8k(`You said: ${text}`);
@@ -143,7 +143,7 @@ server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
 // ------------------ AUDIO HELPERS ------------------
 
-// μ-law byte -> PCM16
+// μ-law byte -> PCM16 (approx)
 function ulawByteToLinear(u) {
   u = ~u & 0xff;
   const sign = (u & 0x80) ? -1 : 1;
@@ -203,7 +203,7 @@ function pcm16ChunksToWav(chunks, sr = 8000) {
   return buf;
 }
 
-// If ElevenLabs responds with WAV container for μ-law, extract 'data' bytes
+// Extract 'data' from WAV if the TTS response is RIFF; otherwise return raw μ-law
 function extractWavDataIfNeeded(buf) {
   if (buf.length >= 12 &&
       buf.slice(0, 4).toString() === "RIFF" &&
@@ -217,7 +217,7 @@ function extractWavDataIfNeeded(buf) {
       pos = next;
     }
   }
-  return buf; // already raw μ-law
+  return buf;
 }
 
 // ------------------ ELEVENLABS ------------------
@@ -244,7 +244,7 @@ async function ttsUlaw8k(text) {
   return extractWavDataIfNeeded(Buffer.from(arr));
 }
 
-// STT once (upload a small WAV) using scribe_v1
+// STT once (upload small WAV) using scribe_v1
 async function sttOnce(wavBuffer) {
   if (!ELEVEN_API_KEY) { console.warn("[STT] Missing ELEVEN_API_KEY"); return null; }
 
@@ -265,9 +265,9 @@ async function sttOnce(wavBuffer) {
   catch { return txt; }
 }
 
-// Send μ-law bytes as 160-byte frames every 20 ms (only when bidi is enabled)
+// Send μ-law bytes as 160-byte frames every 20 ms (only when bidirectional is enabled)
 async function sendUlawFrames(ws, streamSid, ulawBuf) {
-  if (!ALLOW_BIDIRECTIONAL) return;           // guard for accounts without bidi feature
+  if (!ALLOW_BIDIRECTIONAL) return;               // guard for accounts without bidi feature
   if (!ulawBuf || !ulawBuf.length || !streamSid) return;
 
   for (let o = 0; o < ulawBuf.length; o += BYTES_PER_FRAME) {
@@ -283,7 +283,7 @@ async function sendUlawFrames(ws, streamSid, ulawBuf) {
     ws.send(JSON.stringify({
       event: "media",
       streamSid,
-      media: { payload: frame.toString("base64"), track: "outbound" }
+      media: { payload: frame.toString("base64"), track: "outbound" } // track is ignored by Twilio unless bidi is enabled
     }));
 
     await new Promise(r => setTimeout(r, FRAME_MS));
