@@ -1,9 +1,10 @@
-// server.js — Twilio <-> ElevenLabs, stable "noServer" WS upgrade + μ-law framing
+// server.js — Twilio <-> ElevenLabs with correct tracks & μ-law framing
+// Node 18+ recommended. Requires ELEVEN_API_KEY in env.
+
 import express from "express";
 import { createServer } from "http";
 import { WebSocketServer } from "ws";
 import fetch from "node-fetch";
-import { URL } from "url";
 
 // ------------------ CONFIG ------------------
 const PORT = process.env.PORT || 10000;
@@ -14,47 +15,59 @@ const ELEVEN_TTS_URL = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOI
 const ELEVEN_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text";
 const ELEVEN_STT_MODEL = "scribe_v1";
 
-// media framing
-const FRAME_MS = 20;                  // Twilio frame duration
-const BYTES_PER_FRAME = 160;          // 20ms @ 8kHz μ-law
-const SILENCE_ULAW = 0xFF;            // μ-law silence
-const CHUNK_MS = 1500;                // batch STT every ~1.5s
+// Twilio media framing
+const FRAME_MS = 20;             // 20 ms per Twilio frame
+const BYTES_PER_FRAME = 160;     // 20 ms @ 8 kHz μ-law = 160 bytes
+const SILENCE_ULAW = 0xFF;       // μ-law silence
+
+// Simple STT chunking params
+const CHUNK_MS = 1500;                            // batch STT roughly every 1.5s
 const FRAMES_PER_CHUNK = Math.round(CHUNK_MS / FRAME_MS);
-const ENERGY_GATE = 300;              // basic speech gate (RMS)
+const ENERGY_GATE = 300;                          // basic energy threshold
 
 // ------------------ HTTP ------------------
 const app = express();
-app.get("/", (_req, res) => res.send("OK")); // sanity check
+app.get("/", (_req, res) => res.send("OK"));
 
 const server = createServer(app);
 
-// ------------------ WS SERVER (noServer) ------------------
+// ------------------ WS SERVER ------------------
 const wss = new WebSocketServer({ noServer: true });
+
+// Accept upgrade on any path (log it so we can see what Twilio used)
+server.on("upgrade", (req, socket, head) => {
+  try { console.log("[UPGRADE] url:", req.url); } catch (_) {}
+  wss.handleUpgrade(req, socket, head, ws => wss.emit("connection", ws, req));
+});
 
 wss.on("connection", (ws, req) => {
   console.log("🔗 WebSocket connected from", req.socket?.remoteAddress);
 
   let streamSid = null;
+
+  // STT batching state
   let framesSeen = 0;
   let voicedFrames = 0;
-  let chunkPieces = [];                     // Int16Array list
+  let chunkPieces = []; // Int16Array list
   let sttBusy = false;
   let ttsBusy = false;
 
-  // keepalive
   const keepAlive = setInterval(() => {
     if (ws.readyState === ws.OPEN) ws.ping();
   }, 15000);
 
-  ws.on("message", async (buf) => {
+  ws.on("message", async (raw) => {
     let msg;
-    try { msg = JSON.parse(buf.toString()); } catch { return; }
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-    if (msg.event === "start") {
+    // Log anything unknown so we can spot Twilio warnings/errors
+    const type = msg.event;
+
+    if (type === "start") {
       streamSid = msg.start?.streamSid;
       console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${streamSid}`);
 
-      // quick spoken confirmation to validate outbound path
+      // Immediate TTS greeting over the stream to validate outbound audio
       if (!ttsBusy) {
         ttsBusy = true;
         const greet = await ttsUlaw8k("You are connected. Say something and I will echo it back.");
@@ -64,20 +77,26 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    if (msg.event === "media") {
-      const ulaw = Buffer.from(msg.media.payload, "base64"); // inbound μ-law
-      const pcm16 = ulawToPcm16(ulaw);                       // for energy + WAV
+    if (type === "media") {
+      // inbound μ-law bytes from Twilio (20 ms)
+      const ulaw = Buffer.from(msg.media.payload, "base64");
+      const pcm16 = ulawToPcm16(ulaw);
 
+      // simple energy gate
       if (rms(pcm16) > ENERGY_GATE) {
         chunkPieces.push(pcm16);
         voicedFrames++;
       }
       framesSeen++;
 
+      // Optional: acknowledge back (not required)
+      // ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `ack_${msg.media.sequenceNumber}` }}));
+
+      // Time to run STT?
       if (framesSeen >= FRAMES_PER_CHUNK && !sttBusy) {
         framesSeen = 0;
 
-        if (voicedFrames < 4) { // ~80ms voiced
+        if (voicedFrames < 4) { // roughly 80 ms voiced
           voicedFrames = 0;
           chunkPieces = [];
           return;
@@ -102,10 +121,19 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    if (msg.event === "stop") {
+    if (type === "stop") {
       console.log("[WS] STOP");
       return;
     }
+
+    // Twilio may send warnings/errors as events
+    if (type === "warning" || type === "error") {
+      console.warn(`[WS] ${type.toUpperCase()}:`, msg);
+      return;
+    }
+
+    // Catch-all
+    console.log("[WS] event:", msg);
   });
 
   ws.on("close", (code, reason) => {
@@ -116,26 +144,13 @@ wss.on("connection", (ws, req) => {
   ws.on("error", (err) => console.error("[WS] ERROR", err));
 });
 
-// Only upgrade if the pathname is exactly /stream (Twilio URL must match)
-server.on("upgrade", (req, socket, head) => {
-  try {
-    const { pathname } = new URL(req.url, "http://localhost");
-    if (pathname !== "/stream") {
-      socket.destroy();
-      return;
-    }
-  } catch {
-    socket.destroy();
-    return;
-  }
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+server.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
-
-server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
 // ------------------ AUDIO HELPERS ------------------
 
-// μ-law byte -> PCM16 sample (approx)
+// μ-law byte -> PCM16 (approx)
 function ulawByteToLinear(u) {
   u = ~u & 0xff;
   const sign = (u & 0x80) ? -1 : 1;
@@ -161,7 +176,7 @@ function rms(int16) {
   return Math.sqrt(s / (int16.length || 1));
 }
 
-// merge Int16 chunks -> WAV (8kHz mono)
+// Merge Int16 chunks -> mono 8kHz WAV
 function pcm16ChunksToWav(chunks, sr = 8000) {
   let total = 0;
   for (const c of chunks) total += c.length;
@@ -195,9 +210,11 @@ function pcm16ChunksToWav(chunks, sr = 8000) {
   return buf;
 }
 
-// If ElevenLabs returns WAV (RIFF/WAVE), extract its 'data' bytes
+// If ElevenLabs responds with WAV container for μ-law, extract 'data' bytes
 function extractWavDataIfNeeded(buf) {
-  if (buf.length >= 12 && buf.slice(0, 4).toString() === "RIFF" && buf.slice(8, 12).toString() === "WAVE") {
+  if (buf.length >= 12 &&
+      buf.slice(0, 4).toString() === "RIFF" &&
+      buf.slice(8, 12).toString() === "WAVE") {
     let pos = 12;
     while (pos + 8 <= buf.length) {
       const id = buf.slice(pos, pos + 4).toString();
@@ -207,16 +224,15 @@ function extractWavDataIfNeeded(buf) {
       pos = next;
     }
   }
-  return buf;
+  return buf; // raw already
 }
 
 // ------------------ ELEVENLABS ------------------
 
-// TTS -> μ-law 8 kHz (raw or WAV), returns raw μ-law bytes
+// TTS -> μ-law 8kHz (raw bytes)
 async function ttsUlaw8k(text) {
   if (!ELEVEN_API_KEY) { console.warn("[TTS] Missing ELEVEN_API_KEY"); return null; }
 
-  const body = { text, output_format: "ulaw_8000" };
   const resp = await fetch(ELEVEN_TTS_URL, {
     method: "POST",
     headers: {
@@ -224,23 +240,35 @@ async function ttsUlaw8k(text) {
       "Content-Type": "application/json",
       "Accept": "application/octet-stream"
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify({
+      text,
+      output_format: "ulaw_8000"
+    })
   });
 
   const arr = await resp.arrayBuffer();
-  if (!resp.ok) { console.warn("[TTS] HTTP", resp.status, Buffer.from(arr).toString()); return null; }
+  if (!resp.ok) {
+    console.warn("[TTS] HTTP", resp.status, Buffer.from(arr).toString());
+    return null;
+  }
   return extractWavDataIfNeeded(Buffer.from(arr));
 }
 
-// STT batch (upload WAV) using scribe_v1
+// STT once (upload a small WAV) using scribe_v1
 async function sttOnce(wavBuffer) {
   if (!ELEVEN_API_KEY) { console.warn("[STT] Missing ELEVEN_API_KEY"); return null; }
 
+  // Using global FormData/Blob available in Node 18 via undici
   const form = new FormData();
   form.append("model_id", ELEVEN_STT_MODEL);
   form.append("file", new Blob([wavBuffer], { type: "audio/wav" }), "audio.wav");
 
-  const resp = await fetch(ELEVEN_STT_URL, { method: "POST", headers: { "xi-api-key": ELEVEN_API_KEY }, body: form });
+  const resp = await fetch(ELEVEN_STT_URL, {
+    method: "POST",
+    headers: { "xi-api-key": ELEVEN_API_KEY },
+    body: form
+  });
+
   const txt = await resp.text();
   if (!resp.ok) { console.warn("[STT] HTTP", resp.status, txt); return null; }
 
@@ -248,21 +276,25 @@ async function sttOnce(wavBuffer) {
   catch { return txt; }
 }
 
-// send μ-law bytes in exact 160-byte, 20ms frames with track=outbound
+// Send μ-law bytes as 160-byte frames every 20 ms, with track="outbound"
 async function sendUlawFrames(ws, streamSid, ulawBuf) {
+  if (!ulawBuf || !ulawBuf.length || !streamSid) return;
   for (let o = 0; o < ulawBuf.length; o += BYTES_PER_FRAME) {
     if (ws.readyState !== ws.OPEN) break;
+
     let frame = ulawBuf.slice(o, Math.min(o + BYTES_PER_FRAME, ulawBuf.length));
     if (frame.length < BYTES_PER_FRAME) {
       const pad = Buffer.alloc(BYTES_PER_FRAME, SILENCE_ULAW);
       frame.copy(pad);
       frame = pad;
     }
+
     ws.send(JSON.stringify({
       event: "media",
       streamSid,
       media: { payload: frame.toString("base64"), track: "outbound" }
     }));
+
     await new Promise(r => setTimeout(r, FRAME_MS));
   }
 }
