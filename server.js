@@ -1,174 +1,193 @@
-// server.js
-// Twilio <Connect><Stream> bridge with ElevenLabs TTS (u-law 8 kHz)
-// - Sends an immediate greeting on START so you hear audio even if STT isn't enabled
-// - Still replies to Twilio real-time STT "transcription" events if present
-
 import express from "express";
-import WebSocket, { WebSocketServer } from "ws";
 import fetch from "node-fetch";
+import { WebSocketServer } from "ws";
 
 const app = express();
-const port = process.env.PORT || 10000;
+const PORT = process.env.PORT || 10000;
 
-// === ENV ===
-const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY; // REQUIRED
-const ELEVEN_VOICE_ID =
-  process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL"; // Rachel default
-const ELEVEN_TTS_URL = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
+// ───────────────────────────────────────────────────────────────────────────────
+// CONFIG
+// ───────────────────────────────────────────────────────────────────────────────
+const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL"; // change if you like
 
-const wss = new WebSocketServer({ noServer: true });
+if (!ELEVEN_API_KEY) {
+  console.error("❌ ELEVEN_API_KEY is not set");
+}
+if (!ELEVEN_VOICE_ID) {
+  console.error("❌ ELEVEN_VOICE_ID is not set");
+}
 
-// Chunk a Buffer into 160-byte μ-law frames (20 ms @ 8 kHz) and send to Twilio
-async function sendMuLawFrames(ws, ulawBuffer) {
-  const FRAME = 160;
+// Twilio media expects 16-bit PCM mono @ 8kHz → 20ms frames = 160 samples = 320 bytes
+const SAMPLE_RATE = 8000;
+const BYTES_PER_SAMPLE = 2;
+const FRAME_MS = 20;
+const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS; // 160
+const BYTES_PER_FRAME = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE; // 320
+
+// ───────────────────────────────────────────────────────────────────────────────
+// UTIL: Chunk PCM into 20ms frames and send to Twilio
+// ───────────────────────────────────────────────────────────────────────────────
+async function streamPcmToTwilio(ws, pcmBuffer) {
   let offset = 0;
-  while (offset < ulawBuffer.length && ws.readyState === WebSocket.OPEN) {
-    const end = Math.min(offset + FRAME, ulawBuffer.length);
-    const slice = ulawBuffer.subarray(offset, end);
-    const frame =
-      slice.length === FRAME
-        ? slice
-        : Buffer.concat([slice, Buffer.alloc(FRAME - slice.length, 0xff)]);
-    ws.send(JSON.stringify({ event: "media", media: { payload: frame.toString("base64") } }));
-    offset = end;
-    await new Promise((r) => setTimeout(r, 20)); // pace at 20 ms
+  let frames = 0;
+
+  while (offset < pcmBuffer.length) {
+    const end = Math.min(offset + BYTES_PER_FRAME, pcmBuffer.length);
+    const frame = pcmBuffer.slice(offset, end);
+
+    // If last frame is short, pad with silence so Twilio gets full frame
+    let payload;
+    if (frame.length < BYTES_PER_FRAME) {
+      const padded = Buffer.alloc(BYTES_PER_FRAME);
+      frame.copy(padded, 0);
+      payload = padded.toString("base64");
+    } else {
+      payload = frame.toString("base64");
+    }
+
+    ws.send(
+      JSON.stringify({
+        event: "media",
+        media: { payload },
+      })
+    );
+
+    frames++;
+    if (frames % 100 === 0) {
+      console.log(`[TTS] sent ${frames} frames (~${(frames * FRAME_MS) / 1000}s)`);
+    }
+
+    // Twilio expects ~real-time pacing; 20ms per frame is safe.
+    await new Promise((r) => setTimeout(r, FRAME_MS));
+    offset += BYTES_PER_FRAME;
   }
 }
 
-// Ask ElevenLabs to return raw μ-law @ 8k so it matches Twilio exactly
-async function elevenTTS_Ulaw8k(text) {
-  if (!ELEVEN_API_KEY) {
-    console.error("[TTS] Missing ELEVEN_API_KEY");
-    return null;
-  }
-  const resp = await fetch(ELEVEN_TTS_URL, {
+// ───────────────────────────────────────────────────────────────────────────────
+// TTS: Ask ElevenLabs for 8kHz PCM (16-bit, mono)
+// NOTE: If your ElevenLabs plan/voice doesn't support pcm_8000,
+// change "pcm_8000" to "pcm_16000" and we can add a small downsampler next.
+// ───────────────────────────────────────────────────────────────────────────────
+async function ttsElevenLabsPcm8k(text) {
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
+
+  // Many accounts accept `output_format: "pcm_8000"` in the JSON body.
+  // We also set Accept so the wire type is clear.
+  const res = await fetch(url, {
     method: "POST",
     headers: {
       "xi-api-key": ELEVEN_API_KEY,
       "Content-Type": "application/json",
-      Accept: "*/*",
+      // Not strictly required when using output_format, but helpful:
+      Accept: "audio/pcm", // raw PCM stream in response body
     },
     body: JSON.stringify({
       text,
-      voice_settings: { stability: 0.5, similarity_boost: 0.5 },
-      output_format: "ulaw_8000",
+      // You may omit model_id; ElevenLabs will pick the right TTS model.
+      // model_id: "eleven_multilingual_v2",
+      voice_settings: {
+        stability: 0.4,
+        similarity_boost: 0.7,
+      },
+      // Ask for 8kHz PCM so it matches Twilio exactly.
+      output_format: "pcm_8000",
     }),
   });
 
-  const buf = Buffer.from(await resp.arrayBuffer());
-  if (!resp.ok) {
-    console.error("[TTS] HTTP", resp.status, buf.toString());
-    return null;
+  if (!res.ok) {
+    const errTxt = await res.text().catch(() => "");
+    throw new Error(
+      `ElevenLabs TTS failed: ${res.status} ${res.statusText} ${errTxt}`
+    );
   }
-  return buf; // raw μ-law 8 kHz
+
+  const arrayBuf = await res.arrayBuffer();
+  const pcmBuffer = Buffer.from(arrayBuf);
+
+  // Sanity check: frame alignment helps avoid partial-frame edge cases
+  if (pcmBuffer.length % BYTES_PER_SAMPLE !== 0) {
+    console.warn(
+      `[WARN] PCM length ${pcmBuffer.length} is not sample-aligned; Twilio may ignore a tail byte.`
+    );
+  }
+
+  return pcmBuffer;
 }
 
-// Optional keep-alive (pings + brief silence) to keep the stream flowing
-function startKeepAlive(ws) {
-  const SILENCE = Buffer.alloc(160, 0xff);
-  const id = setInterval(() => {
-    if (ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ event: "ping" }));
-    for (let i = 0; i < 5; i++) {
-      ws.send(JSON.stringify({ event: "media", media: { payload: SILENCE.toString("base64") } }));
-    }
-  }, 10000);
-  return () => clearInterval(id);
-}
+// ───────────────────────────────────────────────────────────────────────────────
+// WEBSOCKET SERVER (Twilio <Connect><Stream> hits wss://.../stream)
+// ───────────────────────────────────────────────────────────────────────────────
+const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", (ws) => {
   console.log("🔗 WebSocket connected");
-  let streamSid = null;
-  let mediaCount = 0;
-  const stopKA = startKeepAlive(ws);
 
-  ws.on("message", async (raw) => {
+  ws.on("message", async (data) => {
     let msg;
     try {
-      msg = JSON.parse(raw.toString());
+      msg = JSON.parse(data.toString());
     } catch {
-      return;
+      return; // ignore non-JSON pings etc.
     }
 
     if (msg.event === "connected") {
-      console.log("[WS] event:", msg);
-      return;
+      console.log(
+        `[WS] event: { event: 'connected', protocol: '${msg.protocol}', version: '${msg.version}' }`
+      );
     }
 
     if (msg.event === "start") {
-      streamSid = msg.start?.streamSid;
       console.log(
-        "[WS] START callSid=%s streamSid=%s bidi=%s",
-        msg.start?.callSid,
-        streamSid,
-        msg.start?.bidi
+        `[WS] START callSid=${msg.start?.callSid} streamSid=${msg.start?.streamSid} bidi=${msg.start?.bidirectional}`
       );
 
-      // 🔊 NEW: Play a greeting immediately so you hear audio even without STT
-      const greeting =
-        "Hi! I’m your AI receptionist. I can hear you now. Please say something after the beep.";
-      const beep = Buffer.alloc(160, 0x2a); // crude short tone as a cue
-      const ulaw = await elevenTTS_Ulaw8k(greeting);
-      if (ulaw) {
+      // Send a short greeting right away
+      try {
         console.log("[TTS] sending greeting…");
-        await sendMuLawFrames(ws, ulaw);
-        // quick "beep"
-        for (let i = 0; i < 10; i++) {
-          ws.send(JSON.stringify({ event: "media", media: { payload: beep.toString("base64") } }));
-          await new Promise((r) => setTimeout(r, 20));
-        }
-      } else {
-        console.warn("[TTS] Greeting failed (no audio returned).");
+        const pcm = await ttsElevenLabsPcm8k(
+          "Hi! I’m your AI receptionist. How can I help you today?"
+        );
+        await streamPcmToTwilio(ws, pcm);
+      } catch (e) {
+        console.error("[TTS] greeting failed:", e.message);
       }
-      return;
     }
 
     if (msg.event === "media") {
-      mediaCount++;
-      if (mediaCount % 100 === 0) {
-        console.log("[MEDIA] frames received:", mediaCount);
+      // Inbound audio from caller (we're not using it yet, just logging throughput)
+      // msg.media.payload is base64 PCM (8kHz, 16-bit mono)
+      // Keep lightweight to avoid backpressure
+      if (!ws._rxCount) ws._rxCount = 0;
+      ws._rxCount++;
+      if (ws._rxCount % 100 === 0) {
+        console.log(`[MEDIA] frames received: ${ws._rxCount * 1}`);
       }
-      // No STT here; we just count frames to know we're getting audio from the caller
-      return;
-    }
-
-    // If Twilio real-time STT is enabled, you'll get these:
-    if (msg.event === "transcription") {
-      const text = (msg.text || "").trim();
-      console.log("[STT]", text);
-      if (!text) return;
-
-      const reply = `You said: ${text}`;
-      const ulaw = await elevenTTS_Ulaw8k(reply);
-      if (!ulaw) return;
-      console.log("[TTS] sending reply frames…");
-      await sendMuLawFrames(ws, ulaw);
-      ws.send(JSON.stringify({ event: "mark", mark: { name: "tts_end" } }));
-      return;
-    }
-
-    if (msg.event === "mark") {
-      console.log("[MARK]", msg.mark?.name);
-      return;
     }
 
     if (msg.event === "stop") {
-      console.log("[WS] STOP (total inbound frames:", mediaCount, ")");
-      return;
+      console.log(
+        `[WS] STOP (total inbound frames: ${ws._rxCount || 0})`
+      );
     }
   });
 
-  ws.on("close", (code, reason) => {
-    stopKA();
-    console.log("[WS] CLOSE code=%s reason=%s", code, reason?.toString());
+  ws.on("close", () => {
+    console.log("[WS] CLOSE code=1005 reason=");
+  });
+
+  ws.on("error", (err) => {
+    console.error("[WS] error", err);
   });
 });
 
-const server = app.listen(port, () => {
-  console.log(`🚀 Server running on port ${port} (ws path: /stream)`);
+// HTTP server + WS upgrade
+const server = app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
 
 server.on("upgrade", (req, socket, head) => {
+  // Only accept upgrades for /stream
   if (req.url !== "/stream") {
     socket.destroy();
     return;
@@ -176,4 +195,9 @@ server.on("upgrade", (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => {
     wss.emit("connection", ws, req);
   });
+});
+
+// Simple healthcheck
+app.get("/", (_req, res) => {
+  res.status(200).send("OK");
 });
