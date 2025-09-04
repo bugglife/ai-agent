@@ -1,5 +1,5 @@
-// server.js — Twilio <-> ElevenLabs media bridge with explicit PCM->μ-law encode
-// Node 18+. Env: ELEVEN_API_KEY (required), ELEVEN_VOICE_ID (optional)
+// server.js — Twilio <-> ElevenLabs bridge with tolerant PCM/WAV handling.
+// Node 18+. Set ELEVEN_API_KEY (required), ELEVEN_VOICE_ID (optional)
 
 import express from "express";
 import { createServer } from "http";
@@ -15,9 +15,9 @@ const ELEVEN_TTS_URL = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOI
 const ELEVEN_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text";
 const ELEVEN_STT_MODEL = "scribe_v1";
 
-// Twilio media framing (we send μ-law back)
-const FRAME_MS = 20;           // 20 ms frames
-const BYTES_PER_FRAME = 160;   // 20 ms @ 8kHz μ-law
+// Twilio media framing
+const FRAME_MS = 20;           // 20 ms
+const BYTES_PER_FRAME = 160;   // μ-law @ 8kHz, 20ms
 const SILENCE_ULAW = 0xFF;
 
 // STT batching
@@ -27,13 +27,13 @@ const ENERGY_GATE = 300;
 
 // ------------------ HTTP ------------------
 const app = express();
-app.get("/", (_req, res) => res.send("OK")); // Health check
+app.get("/", (_req, res) => res.send("OK"));
 const server = createServer(app);
 
 // ------------------ WS SERVER ------------------
 const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
-  try { console.log("[UPGRADE] url:", req.url); } catch {}
+  try { console.log("[UPGRADE] url: /stream"); } catch {}
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
@@ -43,51 +43,40 @@ wss.on("connection", (ws, req) => {
   let streamSid = null;
   let framesSeen = 0;
   let voicedFrames = 0;
-  let chunkPieces = [];          // Int16Array list
+  let chunkPieces = []; // Int16Array[]
   let sttBusy = false;
   let ttsBusy = false;
 
-  const keepAlive = setInterval(() => {
-    if (ws.readyState === ws.OPEN) ws.ping();
-  }, 15000);
+  const keepAlive = setInterval(() => { if (ws.readyState === ws.OPEN) ws.ping(); }, 15000);
 
   ws.on("message", async (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid;
       console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${streamSid}`);
 
-      // Greeting
+      // Greeting (fix: tolerant PCM/WAV)
       ttsBusy = true;
-      const greetUlaw = await ttsToUlaw8k("You are connected. Say something and I will echo it back.");
-      if (greetUlaw) await sendUlawFrames(ws, streamSid, greetUlaw);
+      const greet = await ttsToUlaw8k("You are connected. Say something and I will echo it back.");
+      if (greet) await sendUlawFrames(ws, streamSid, greet);
       ttsBusy = false;
       return;
     }
 
     if (msg.event === "media") {
-      // inbound μ-law (20ms)
       const ulaw = Buffer.from(msg.media.payload, "base64");
-      const pcm16 = ulawToPcm16(ulaw);
+      const pcm16 = ulawToPcm16(ulaw); // inbound -> PCM
 
-      // basic VAD
       if (rms(pcm16) > ENERGY_GATE) {
         chunkPieces.push(pcm16);
         voicedFrames++;
       }
       framesSeen++;
 
-      // every ~1.5s run STT, then TTS a reply
       if (framesSeen >= FRAMES_PER_CHUNK && !sttBusy) {
         framesSeen = 0;
-
-        if (voicedFrames < 4) { // ~80ms voiced
-          voicedFrames = 0;
-          chunkPieces = [];
-          return;
-        }
+        if (voicedFrames < 4) { voicedFrames = 0; chunkPieces = []; return; }
 
         sttBusy = true;
         const wav = pcm16ChunksToWav(chunkPieces, 8000);
@@ -101,8 +90,8 @@ wss.on("connection", (ws, req) => {
           console.log("[STT]", text);
           if (!ttsBusy) {
             ttsBusy = true;
-            const replyUlaw = await ttsToUlaw8k(`You said: ${text}`);
-            if (replyUlaw) await sendUlawFrames(ws, streamSid, replyUlaw);
+            const reply = await ttsToUlaw8k(`You said: ${text}`);
+            if (reply) await sendUlawFrames(ws, streamSid, reply);
             ttsBusy = false;
           }
         }
@@ -110,10 +99,7 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    if (msg.event === "stop") {
-      console.log("[WS] STOP");
-      return;
-    }
+    if (msg.event === "stop") { console.log("[WS] STOP"); return; }
 
     if (msg.event === "warning" || msg.event === "error") {
       console.warn(`[WS] ${msg.event.toUpperCase()}:`, msg);
@@ -127,15 +113,12 @@ wss.on("connection", (ws, req) => {
     clearInterval(keepAlive);
     console.log(`[WS] CLOSE code=${code} reason=${reason}`);
   });
-
   ws.on("error", (err) => console.error("[WS] ERROR", err));
 });
 
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
 // ------------------ AUDIO HELPERS ------------------
-
-// μ-law <-> PCM16
 function ulawByteToLinear(u) {
   u = ~u & 0xff;
   const sign = (u & 0x80) ? -1 : 1;
@@ -148,49 +131,34 @@ function ulawByteToLinear(u) {
   if (sample < -32768) sample = -32768;
   return sample;
 }
-
 function ulawToPcm16(ulawBuf) {
   const out = new Int16Array(ulawBuf.length);
   for (let i = 0; i < ulawBuf.length; i++) out[i] = ulawByteToLinear(ulawBuf[i]);
   return out;
 }
-
 function linearToUlaw(sample) {
-  // ITU-T G.711 μ-law encode
   const MU_MAX = 0x1FFF;
   let s = Math.max(-32768, Math.min(32767, sample));
   const sign = (s < 0) ? 0x80 : 0x00;
   if (s < 0) s = -s;
   s = Math.min(MU_MAX, s + 0x84);
-  const exponent = Math.floor(Math.log2(s)) - 6; // 2^6 = 64
-  const mantissa =
-    exponent < 0 ? (s >> 1) & 0x0F
-                 : (s >> (exponent + 3)) & 0x0F;
-  const uval = ~(sign | ((exponent & 0x07) << 4) | mantissa) & 0xFF;
-  return uval;
+  const exponent = Math.floor(Math.log2(s)) - 6;
+  const mantissa = exponent < 0 ? (s >> 1) & 0x0F : (s >> (exponent + 3)) & 0x0F;
+  return ~(sign | ((exponent & 0x07) << 4) | mantissa) & 0xFF;
 }
-
 function pcm16ToUlaw(pcm16) {
   const out = Buffer.alloc(pcm16.length);
-  for (let i = 0; i < pcm16.length; i++) {
-    out[i] = linearToUlaw(pcm16[i]);
-  }
+  for (let i = 0; i < pcm16.length; i++) out[i] = linearToUlaw(pcm16[i]);
   return out;
 }
-
 function rms(int16) {
-  let s = 0;
-  for (let i = 0; i < int16.length; i++) s += int16[i] * int16[i];
+  let s = 0; for (let i = 0; i < int16.length; i++) s += int16[i] * int16[i];
   return Math.sqrt(s / (int16.length || 1));
 }
-
-// Merge Int16 chunks -> mono 8kHz WAV
 function pcm16ChunksToWav(chunks, sr = 8000) {
-  let total = 0;
-  for (const c of chunks) total += c.length;
+  let total = 0; for (const c of chunks) total += c.length;
   const merged = new Int16Array(total);
-  let off = 0;
-  for (const c of chunks) { merged.set(c, off); off += c.length; }
+  let off = 0; for (const c of chunks) { merged.set(c, off); off += c.length; }
 
   const numChannels = 1;
   const byteRate = sr * numChannels * 2;
@@ -212,56 +180,52 @@ function pcm16ChunksToWav(chunks, sr = 8000) {
   buf.write("data", 36);
   buf.writeUInt32LE(dataSize, 40);
 
-  for (let i = 0; i < merged.length; i++) {
-    buf.writeInt16LE(merged[i], 44 + i * 2);
-  }
+  for (let i = 0; i < merged.length; i++) buf.writeInt16LE(merged[i], 44 + i*2);
   return buf;
 }
 
-// Parse PCM WAV (mono 8k) -> Int16Array
+// WAV parser (PCM 16-bit, mono, 8k). Returns Int16Array
 function parsePcmWav(buffer) {
-  if (buffer.slice(0,4).toString() !== "RIFF" || buffer.slice(8,12).toString() !== "WAVE") {
+  if (buffer.length < 12) throw new Error("Not a WAV file");
+  if (buffer.slice(0,4).toString() !== "RIFF" || buffer.slice(8,12).toString() !== "WAVE")
     throw new Error("Not a WAV file");
-  }
-  let fmtPos = 12;
-  let audioFormat = null, numChannels = null, sampleRate = null, byteRate = null, blockAlign = null, bitsPerSample = null;
-  let dataPos = null, dataSize = null;
-
-  // read chunks
   let pos = 12;
+  let fmt = null, dataPos = null, dataSize = null;
   while (pos + 8 <= buffer.length) {
     const id = buffer.slice(pos, pos+4).toString();
     const size = buffer.readUInt32LE(pos+4);
     const next = pos + 8 + size;
-    if (id === "fmt ") {
-      audioFormat = buffer.readUInt16LE(pos+8);
-      numChannels = buffer.readUInt16LE(pos+10);
-      sampleRate = buffer.readUInt32LE(pos+12);
-      byteRate = buffer.readUInt32LE(pos+16);
-      blockAlign = buffer.readUInt16LE(pos+20);
-      bitsPerSample = buffer.readUInt16LE(pos+22);
-    } else if (id === "data") {
-      dataPos = pos + 8;
-      dataSize = size;
-    }
+    if (id === "fmt ") fmt = { pos: pos+8, size };
+    else if (id === "data") { dataPos = pos+8; dataSize = size; }
     pos = next;
   }
-
-  if (audioFormat !== 1) throw new Error(`Unsupported WAV format code ${audioFormat} (need PCM=1)`);
-  if (numChannels !== 1) throw new Error(`Expected mono, got ${numChannels}ch`);
-  if (sampleRate !== 8000) throw new Error(`Expected 8000 Hz, got ${sampleRate}`);
-  if (bitsPerSample !== 16) throw new Error(`Expected 16-bit PCM, got ${bitsPerSample}`);
+  if (!fmt || dataPos == null) throw new Error("Malformed WAV");
+  const audioFormat = buffer.readUInt16LE(fmt.pos);
+  const numChannels = buffer.readUInt16LE(fmt.pos + 2);
+  const sampleRate = buffer.readUInt32LE(fmt.pos + 4);
+  const bitsPerSample = buffer.readUInt16LE(fmt.pos + 14);
+  if (audioFormat !== 1) throw new Error(`WAV not PCM (fmt=${audioFormat})`);
+  if (numChannels !== 1) throw new Error(`WAV not mono (ch=${numChannels})`);
+  if (sampleRate !== 8000) throw new Error(`WAV not 8000 Hz (sr=${sampleRate})`);
+  if (bitsPerSample !== 16) throw new Error(`WAV not 16-bit (bps=${bitsPerSample})`);
 
   const samples = new Int16Array(dataSize / 2);
-  for (let i = 0; i < samples.length; i++) {
-    samples[i] = buffer.readInt16LE(dataPos + i*2);
-  }
+  for (let i = 0; i < samples.length; i++) samples[i] = buffer.readInt16LE(dataPos + i*2);
   return samples;
+}
+
+// Fallback: raw PCM 16-bit LE → Int16Array
+function rawPcm16LEToInt16(buffer) {
+  if (buffer.length % 2 !== 0) throw new Error("Raw PCM length not even");
+  const n = buffer.length / 2;
+  const out = new Int16Array(n);
+  for (let i = 0; i < n; i++) out[i] = buffer.readInt16LE(i*2);
+  return out;
 }
 
 // ------------------ ELEVENLABS ------------------
 
-// TTS -> request PCM 8k, convert to μ-law
+// TOLERANT: ask for PCM 8k, accept WAV **or** raw PCM 16LE and encode to μ-law
 async function ttsToUlaw8k(text) {
   if (!ELEVEN_API_KEY) { console.warn("[TTS] Missing ELEVEN_API_KEY"); return null; }
 
@@ -274,23 +238,30 @@ async function ttsToUlaw8k(text) {
     },
     body: JSON.stringify({
       text,
-      // explicit PCM 8kHz so we can encode to μ-law ourselves
-      output_format: "pcm_8000"
+      output_format: "pcm_8000"   // request PCM 8kHz
     })
   });
 
   const arr = await resp.arrayBuffer();
+  const buf = Buffer.from(arr);
+
   if (!resp.ok) {
-    console.warn("[TTS] HTTP", resp.status, Buffer.from(arr).toString());
+    console.warn("[TTS] HTTP", resp.status, buf.toString());
     return null;
   }
 
   let pcm16;
   try {
-    pcm16 = parsePcmWav(Buffer.from(arr));
-  } catch (e) {
-    console.warn("[TTS] parse WAV failed:", e.message);
-    return null;
+    // Try WAV first
+    pcm16 = parsePcmWav(buf);
+  } catch {
+    // Not a WAV — try raw PCM 16LE
+    try {
+      pcm16 = rawPcm16LEToInt16(buf);
+    } catch (e2) {
+      console.warn("[TTS] parse failed (neither WAV nor raw PCM):", e2.message);
+      return null;
+    }
   }
 
   const ulaw = pcm16ToUlaw(pcm16);
@@ -300,22 +271,14 @@ async function ttsToUlaw8k(text) {
 // STT once (upload small WAV) using scribe_v1
 async function sttOnce(wavBuffer) {
   if (!ELEVEN_API_KEY) { console.warn("[STT] Missing ELEVEN_API_KEY"); return null; }
-
   const form = new FormData();
   form.append("model_id", ELEVEN_STT_MODEL);
   form.append("file", new Blob([wavBuffer], { type: "audio/wav" }), "audio.wav");
 
-  const resp = await fetch(ELEVEN_STT_URL, {
-    method: "POST",
-    headers: { "xi-api-key": ELEVEN_API_KEY },
-    body: form
-  });
-
+  const resp = await fetch(ELEVEN_STT_URL, { method: "POST", headers: { "xi-api-key": ELEVEN_API_KEY }, body: form });
   const txt = await resp.text();
   if (!resp.ok) { console.warn("[STT] HTTP", resp.status, txt); return null; }
-
-  try { const j = JSON.parse(txt); return j.text || j.transcription || txt; }
-  catch { return txt; }
+  try { const j = JSON.parse(txt); return j.text || j.transcription || txt; } catch { return txt; }
 }
 
 // Send μ-law bytes as 160-byte frames every 20 ms
@@ -329,8 +292,7 @@ async function sendUlawFrames(ws, streamSid, ulawBuf) {
     let frame = ulawBuf.slice(o, Math.min(o + BYTES_PER_FRAME, ulawBuf.length));
     if (frame.length < BYTES_PER_FRAME) {
       const pad = Buffer.alloc(BYTES_PER_FRAME, SILENCE_ULAW);
-      frame.copy(pad);
-      frame = pad;
+      frame.copy(pad); frame = pad;
     }
 
     ws.send(JSON.stringify({
