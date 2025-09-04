@@ -1,13 +1,15 @@
-// server.js — Twilio <-> ElevenLabs bridge with robust WAV + resample -> μ-law
-// Node 18+. Env: ELEVEN_API_KEY (required), ELEVEN_VOICE_ID (optional)
+// server.js — Twilio <Connect><Stream> <-> ElevenLabs bridge
+// Node 18+.  Env: ELEVEN_API_KEY (required), ELEVEN_VOICE_ID (optional)
 
 import express from "express";
 import { createServer } from "http";
 import { WebSocketServer } from "ws";
 import fetch from "node-fetch";
 
+// -----------------------------------------------------------------------------
+// Config
+// -----------------------------------------------------------------------------
 const PORT = process.env.PORT || 10000;
-
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY || "";
 const ELEVEN_VOICE_ID =
   process.env.ELEVEN_VOICE_ID || "21m00Tcm4TlvDq8ikWAM"; // Rachel
@@ -15,9 +17,9 @@ const ELEVEN_TTS_URL = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOI
 const ELEVEN_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text";
 const ELEVEN_STT_MODEL = "scribe_v1";
 
-// Twilio media framing
+// Twilio stream (PCMU @8k) framing:
 const FRAME_MS = 20;
-const BYTES_PER_FRAME = 160; // 20ms of PCMU @ 8k
+const ULAW_BYTES_PER_FRAME = 160; // 20ms PCMU @ 8k
 const SILENCE_ULAW = 0xff;
 
 // STT batching
@@ -25,6 +27,9 @@ const CHUNK_MS = 1500;
 const FRAMES_PER_CHUNK = Math.round(CHUNK_MS / FRAME_MS);
 const ENERGY_GATE = 300;
 
+// -----------------------------------------------------------------------------
+// Web server + WS
+// -----------------------------------------------------------------------------
 const app = express();
 app.get("/", (_req, res) => res.send("OK"));
 const server = createServer(app);
@@ -34,113 +39,12 @@ server.on("upgrade", (req, socket, head) => {
   try {
     console.log("[UPGRADE] url: /stream");
   } catch {}
-  wss.handleUpgrade(req, socket, head, (ws) =>
-    wss.emit("connection", ws, req)
-  );
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
-wss.on("connection", (ws, req) => {
-  console.log("🔗 WebSocket connected from", req.socket?.remoteAddress);
-
-  let streamSid = null;
-  let framesSeen = 0;
-  let voicedFrames = 0;
-  let chunkPieces = []; // Int16Array[]
-  let sttBusy = false;
-  let ttsBusy = false;
-
-  const keepAlive = setInterval(() => {
-    if (ws.readyState === ws.OPEN) ws.ping();
-  }, 15000);
-
-  ws.on("message", async (raw) => {
-    let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
-
-    if (msg.event === "start") {
-      streamSid = msg.start?.streamSid;
-      console.log(
-        `[WS] START callSid=${msg.start?.callSid} streamSid=${streamSid}`
-      );
-
-      // Greeting
-      ttsBusy = true;
-      const greet = await ttsToUlaw8k(
-        "You are connected. Say something and I will echo it back."
-      );
-      if (greet) await sendUlawFrames(ws, streamSid, greet);
-      ttsBusy = false;
-      return;
-    }
-
-    if (msg.event === "media") {
-      const ulaw = Buffer.from(msg.media.payload, "base64");
-      const pcm16 = ulawToPcm16(ulaw); // inbound caller audio → PCM
-
-      if (rms(pcm16) > ENERGY_GATE) {
-        chunkPieces.push(pcm16);
-        voicedFrames++;
-      }
-      framesSeen++;
-
-      if (framesSeen >= FRAMES_PER_CHUNK && !sttBusy) {
-        framesSeen = 0;
-
-        if (voicedFrames < 4) {
-          voicedFrames = 0;
-          chunkPieces = [];
-          return;
-        }
-
-        sttBusy = true;
-        const wav = pcm16ChunksToWav(chunkPieces, 8000);
-        voicedFrames = 0;
-        chunkPieces = [];
-
-        const text = await sttOnce(wav);
-        sttBusy = false;
-
-        if (text) {
-          console.log("[STT]", text);
-          if (!ttsBusy) {
-            ttsBusy = true;
-            const reply = await ttsToUlaw8k(`You said: ${text}`);
-            if (reply) await sendUlawFrames(ws, streamSid, reply);
-            ttsBusy = false;
-          }
-        }
-      }
-      return;
-    }
-
-    if (msg.event === "stop") {
-      console.log("[WS] STOP");
-      return;
-    }
-
-    if (msg.event === "warning" || msg.event === "error") {
-      console.warn(`[WS] ${msg.event.toUpperCase()}:`, msg);
-      return;
-    }
-
-    console.log("[WS] event:", msg);
-  });
-
-  ws.on("close", (code, reason) => {
-    clearInterval(keepAlive);
-    console.log(`[WS] CLOSE code=${code} reason=${reason}`);
-  });
-  ws.on("error", (err) => console.error("[WS] ERROR", err));
-});
-
-server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
-
-// ------------------ AUDIO HELPERS ------------------
-
+// -----------------------------------------------------------------------------
+// Audio utils (μ-law, resample, WAV wrapper for STT uploads)
+// -----------------------------------------------------------------------------
 function ulawByteToLinear(u) {
   u = ~u & 0xff;
   const sign = u & 0x80 ? -1 : 1;
@@ -179,81 +83,7 @@ function rms(int16) {
   for (let i = 0; i < int16.length; i++) s += int16[i] * int16[i];
   return Math.sqrt(s / (int16.length || 1));
 }
-
-function pcm16ChunksToWav(chunks, sr = 8000) {
-  let total = 0;
-  for (const c of chunks) total += c.length;
-  const merged = new Int16Array(total);
-  let off = 0;
-  for (const c of chunks) {
-    merged.set(c, off);
-    off += c.length;
-  }
-
-  const numChannels = 1;
-  const byteRate = sr * numChannels * 2;
-  const blockAlign = numChannels * 2;
-  const dataSize = merged.length * 2;
-  const buf = Buffer.alloc(44 + dataSize);
-
-  buf.write("RIFF", 0);
-  buf.writeUInt32LE(36 + dataSize, 4);
-  buf.write("WAVE", 8);
-  buf.write("fmt ", 12);
-  buf.writeUInt32LE(16, 16);
-  buf.writeUInt16LE(1, 20);
-  buf.writeUInt16LE(numChannels, 22);
-  buf.writeUInt32LE(sr, 24);
-  buf.writeUInt32LE(byteRate, 28);
-  buf.writeUInt16LE(blockAlign, 32);
-  buf.writeUInt16LE(16, 34);
-  buf.write("data", 36);
-  buf.writeUInt32LE(dataSize, 40);
-
-  for (let i = 0; i < merged.length; i++)
-    buf.writeInt16LE(merged[i], 44 + i * 2);
-  return buf;
-}
-
-// Parse PCM WAV (mono). Returns { pcm16: Int16Array, sampleRate: number }
-function parsePcmWav(buffer) {
-  if (buffer.length < 12) throw new Error("Not a WAV file");
-  if (
-    buffer.slice(0, 4).toString() !== "RIFF" ||
-    buffer.slice(8, 12).toString() !== "WAVE"
-  )
-    throw new Error("Not a WAV file");
-  let pos = 12;
-  let fmt = null,
-    dataPos = null,
-    dataSize = null;
-  while (pos + 8 <= buffer.length) {
-    const id = buffer.slice(pos, pos + 4).toString();
-    const size = buffer.readUInt32LE(pos + 4);
-    const next = pos + 8 + size;
-    if (id === "fmt ") fmt = { pos: pos + 8, size };
-    else if (id === "data") {
-      dataPos = pos + 8;
-      dataSize = size;
-    }
-    pos = next;
-  }
-  if (!fmt || dataPos == null) throw new Error("Malformed WAV");
-  const audioFormat = buffer.readUInt16LE(fmt.pos);
-  const numChannels = buffer.readUInt16LE(fmt.pos + 2);
-  const sampleRate = buffer.readUInt32LE(fmt.pos + 4);
-  const bitsPerSample = buffer.readUInt16LE(fmt.pos + 14);
-  if (audioFormat !== 1) throw new Error(`WAV not PCM (fmt=${audioFormat})`);
-  if (numChannels !== 1) throw new Error(`WAV not mono (ch=${numChannels})`);
-  if (bitsPerSample !== 16) throw new Error(`WAV not 16-bit (bps=${bitsPerSample})`);
-
-  const samples = new Int16Array(dataSize / 2);
-  for (let i = 0; i < samples.length; i++)
-    samples[i] = buffer.readInt16LE(dataPos + i * 2);
-  return { pcm16: samples, sampleRate };
-}
-
-// Simple linear resampler for Int16 PCM
+// Linear resampler for Int16 PCM
 function resamplePcm16(int16, inRate, outRate) {
   if (inRate === outRate) return int16;
   const ratio = outRate / inRate;
@@ -269,57 +99,76 @@ function resamplePcm16(int16, inRate, outRate) {
   }
   return out;
 }
+// Build a tiny WAV (mono 16-bit PCM) for STT upload
+function pcm16ToWav(pcm16, sr = 8000) {
+  const numChannels = 1;
+  const byteRate = sr * numChannels * 2;
+  const blockAlign = numChannels * 2;
+  const dataSize = pcm16.length * 2;
+  const buf = Buffer.alloc(44 + dataSize);
 
-// ------------------ ELEVENLABS ------------------
+  buf.write("RIFF", 0);
+  buf.writeUInt32LE(36 + dataSize, 4);
+  buf.write("WAVE", 8);
+  buf.write("fmt ", 12);
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20); // PCM
+  buf.writeUInt16LE(numChannels, 22);
+  buf.writeUInt32LE(sr, 24);
+  buf.writeUInt32LE(byteRate, 28);
+  buf.writeUInt16LE(blockAlign, 32);
+  buf.writeUInt16LE(16, 34); // bits
+  buf.write("data", 36);
+  buf.writeUInt32LE(dataSize, 40);
+  for (let i = 0; i < pcm16.length; i++) buf.writeInt16LE(pcm16[i], 44 + i * 2);
+  return buf;
+}
 
-// Request WAV from ElevenLabs; parse and resample to 8 kHz; encode μ-law
+// -----------------------------------------------------------------------------
+// ElevenLabs calls
+// -----------------------------------------------------------------------------
+
+// TTS → raw PCM16 @16k from ElevenLabs, resample to 8k, μ-law, return Buffer
 async function ttsToUlaw8k(text) {
   if (!ELEVEN_API_KEY) {
     console.warn("[TTS] Missing ELEVEN_API_KEY");
     return null;
   }
-
   const resp = await fetch(ELEVEN_TTS_URL, {
     method: "POST",
     headers: {
       "xi-api-key": ELEVEN_API_KEY,
       "Content-Type": "application/json",
-      Accept: "audio/wav", // <-- force WAV
+      Accept: "audio/pcm", // request raw PCM (no container)
     },
     body: JSON.stringify({
       text,
-      output_format: "wav", // <-- WAV container
-      // You can also try: "voice_settings": { "stability": 0.5, "similarity_boost": 0.5 }
+      // raw PCM output @ 16k from ElevenLabs
+      output_format: "pcm_16000",
+      voice_settings: { stability: 0.5, similarity_boost: 0.5 },
     }),
   });
 
   const arr = await resp.arrayBuffer();
-  const buf = Buffer.from(arr);
-
   if (!resp.ok) {
-    console.warn("[TTS] HTTP", resp.status, buf.toString());
+    console.warn("[TTS] HTTP", resp.status, Buffer.from(arr).toString());
     return null;
   }
 
-  let pcm16, sr;
-  try {
-    const parsed = parsePcmWav(buf);
-    pcm16 = parsed.pcm16;
-    sr = parsed.sampleRate;
-  } catch (e) {
-    console.warn("[TTS] WAV parse failed:", e.message);
-    return null;
+  // Interpret as little-endian 16-bit PCM @ 16k
+  const int16_16k = new Int16Array(arr.byteLength / 2);
+  const view = new DataView(arr);
+  for (let i = 0; i < int16_16k.length; i++) {
+    int16_16k[i] = view.getInt16(i * 2, true);
   }
 
-  if (sr !== 8000) {
-    pcm16 = resamplePcm16(pcm16, sr, 8000);
-  }
-
-  const ulaw = pcm16ToUlaw(pcm16);
+  // Resample to 8 kHz for Twilio
+  const int16_8k = resamplePcm16(int16_16k, 16000, 8000);
+  const ulaw = pcm16ToUlaw(int16_8k);
   return ulaw;
 }
 
-// STT once (upload small WAV) using scribe_v1
+// One-off STT (upload WAV) using scribe_v1
 async function sttOnce(wavBuffer) {
   if (!ELEVEN_API_KEY) {
     console.warn("[STT] Missing ELEVEN_API_KEY");
@@ -334,6 +183,7 @@ async function sttOnce(wavBuffer) {
     headers: { "xi-api-key": ELEVEN_API_KEY },
     body: form,
   });
+
   const txt = await resp.text();
   if (!resp.ok) {
     console.warn("[STT] HTTP", resp.status, txt);
@@ -351,23 +201,145 @@ async function sttOnce(wavBuffer) {
 async function sendUlawFrames(ws, streamSid, ulawBuf) {
   if (!ulawBuf || !ulawBuf.length || !streamSid) return;
   let frames = 0;
-  for (let o = 0; o < ulawBuf.length; o += BYTES_PER_FRAME) {
+  for (let o = 0; o < ulawBuf.length; o += ULAW_BYTES_PER_FRAME) {
     if (ws.readyState !== ws.OPEN) break;
-    let frame = ulawBuf.slice(o, Math.min(o + BYTES_PER_FRAME, ulawBuf.length));
-    if (frame.length < BYTES_PER_FRAME) {
-      const pad = Buffer.alloc(BYTES_PER_FRAME, SILENCE_ULAW);
+    let frame = ulawBuf.slice(o, Math.min(o + ULAW_BYTES_PER_FRAME, ulawBuf.length));
+    if (frame.length < ULAW_BYTES_PER_FRAME) {
+      const pad = Buffer.alloc(ULAW_BYTES_PER_FRAME, SILENCE_ULAW);
       frame.copy(pad);
       frame = pad;
     }
-    ws.send(
-      JSON.stringify({
-        event: "media",
-        streamSid,
-        media: { payload: frame.toString("base64") },
-      })
-    );
+    ws.send(JSON.stringify({
+      event: "media",
+      streamSid,
+      media: { payload: frame.toString("base64") },
+    }));
     frames++;
     await new Promise((r) => setTimeout(r, FRAME_MS));
   }
   console.log(`[TTS] sent ${frames} frames (~${(frames * FRAME_MS / 1000).toFixed(2)}s)`);
 }
+
+// -----------------------------------------------------------------------------
+// WS connection handling
+// -----------------------------------------------------------------------------
+wss.on("connection", (ws, req) => {
+  console.log("🔗 WebSocket connected from", req.socket?.remoteAddress);
+
+  let streamSid = null;
+  let framesSeen = 0;
+  let voicedFrames = 0;
+  let chunkPieces = []; // Int16Array[]
+  let sttBusy = false;
+  let ttsBusy = false;
+
+  const keepAlive = setInterval(() => {
+    if (ws.readyState === ws.OPEN) ws.ping();
+  }, 15000);
+
+  ws.on("message", async (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+
+    if (msg.event === "connected") {
+      console.log("[WS] event:", msg);
+      return;
+    }
+
+    if (msg.event === "start") {
+      streamSid = msg.start?.streamSid;
+      console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${streamSid}`);
+
+      // Greeting
+      ttsBusy = true;
+      const greet = await ttsToUlaw8k("You are connected. Say something and I will echo it back.");
+      if (greet) await sendUlawFrames(ws, streamSid, greet);
+      ttsBusy = false;
+      return;
+    }
+
+    if (msg.event === "media") {
+      // inbound from Twilio: μ-law @8k in base64
+      const ulaw = Buffer.from(msg.media.payload, "base64");
+      const pcm16 = ulawToPcm16(ulaw);
+
+      if (rms(pcm16) > ENERGY_GATE) {
+        chunkPieces.push(pcm16);
+        voicedFrames++;
+      }
+      framesSeen++;
+
+      // Every ~1.5s, if speech was detected, send to STT
+      if (framesSeen >= FRAMES_PER_CHUNK && !sttBusy) {
+        framesSeen = 0;
+
+        if (voicedFrames < 4) {
+          voicedFrames = 0;
+          chunkPieces = [];
+          return;
+        }
+
+        sttBusy = true;
+        const all = mergeInt16(chunkPieces);
+        voicedFrames = 0;
+        chunkPieces = [];
+
+        const wav = pcm16ToWav(all, 8000);
+        const text = await sttOnce(wav);
+        sttBusy = false;
+
+        if (text && text.trim()) {
+          console.log("[STT]", text);
+          if (!ttsBusy) {
+            ttsBusy = true;
+            const reply = await ttsToUlaw8k(`You said: ${text}`);
+            if (reply) await sendUlawFrames(ws, streamSid, reply);
+            ttsBusy = false;
+          }
+        }
+      }
+      return;
+    }
+
+    if (msg.event === "stop") {
+      console.log("[WS] STOP");
+      return;
+    }
+
+    if (msg.event === "warning" || msg.event === "error") {
+      console.warn(`[WS] ${msg.event.toUpperCase()}:`, msg);
+      return;
+    }
+
+    // Fallback log
+    console.log("[WS] event:", msg);
+  });
+
+  ws.on("close", (code, reason) => {
+    clearInterval(keepAlive);
+    console.log(`[WS] CLOSE code=${code} reason=${reason}`);
+  });
+  ws.on("error", (err) => console.error("[WS] ERROR", err));
+});
+
+// Merge array of Int16Array into one
+function mergeInt16(chunks) {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const merged = new Int16Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    merged.set(c, off);
+    off += c.length;
+  }
+  return merged;
+}
+
+// -----------------------------------------------------------------------------
+// Start server
+// -----------------------------------------------------------------------------
+server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
