@@ -1,7 +1,5 @@
-// server.js
-// Minimal Twilio <Connect><Stream> bridge that plays a beep + greeting.
-// FIXED: every outbound "media" frame now includes the Twilio streamSid.
-// Audio format: 16-bit PCM, little-endian, mono, 8000 Hz, 20 ms frames (320 bytes).
+// server.js — Twilio Streams (bidirectional) with proper μ-law (PCMU) outbound audio.
+// Outbound format: μ-law (8-bit), mono, 8000 Hz, 20 ms frames (160 bytes).
 
 import express from "express";
 import fetch from "node-fetch";
@@ -10,92 +8,65 @@ import { WebSocketServer } from "ws";
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Config / Env
-// ───────────────────────────────────────────────────────────────────────────────
+// ── ENV ────────────────────────────────────────────────────────────────────────
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY || "";
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL"; // default "Bella"
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL";
 
-// Twilio media framing constants
-const SAMPLE_RATE = 8000;           // 8 kHz
-const BYTES_PER_SAMPLE = 2;         // 16-bit PCM (LE)
-const FRAME_MS = 20;                // 20 ms per frame
-const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS; // 160
-const BYTES_PER_FRAME = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE; // 320
+// ── AUDIO CONSTANTS ───────────────────────────────────────────────────────────
+const SR = 8000;                 // samples/sec
+const PCM_BYTES_PER_SAMPLE = 2;  // int16 LE
+const FRAME_MS = 20;             // 20 ms
+const SAMPLES_PER_FRAME = (SR / 1000) * FRAME_MS; // 160
+const OUT_BYTES_PER_FRAME = 160; // μ-law: 1 byte/sample * 160 samples
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Helpers: Beep, Silence, TTS(11labs), and framed streaming to Twilio
-// ───────────────────────────────────────────────────────────────────────────────
+// ── μ-LAW ENCODER (PCM16 LE -> μ-law byte) ───────────────────────────────────
+const BIAS = 0x84;
+const CLIP = 32635;
+function linear16ToMulawSample(sample) {
+  let sign = (sample >> 8) & 0x80;
+  if (sign) sample = -sample;
+  if (sample > CLIP) sample = CLIP;
+  sample = sample + BIAS;
 
-/** Generate a simple 1 kHz beep (durationMs) as 16-bit PCM LE @ 8 kHz */
-function makeBeepPcm(durationMs = 500, freq = 1000, gain = 0.3) {
-  const totalSamples = Math.floor((SAMPLE_RATE * durationMs) / 1000);
-  const buf = Buffer.alloc(totalSamples * BYTES_PER_SAMPLE);
+  let exponent = 7;
+  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; expMask >>= 1) {
+    exponent--;
+  }
+  const mantissa = (sample >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0F;
+  let mulaw = ~(sign | (exponent << 4) | mantissa) & 0xFF;
+  return mulaw;
+}
+
+/** Convert a PCM16 LE buffer (8 kHz, mono) to μ-law buffer */
+function pcm16ToMulawBuffer(pcmBuf) {
+  const samples = pcmBuf.length / 2;
+  const out = Buffer.allocUnsafe(samples);
+  for (let i = 0; i < samples; i++) {
+    const s = pcmBuf.readInt16LE(i * 2);
+    out[i] = linear16ToMulawSample(s);
+  }
+  return out;
+}
+
+// ── Beep & Silence (generate PCM then convert to μ-law) ───────────────────────
+function makeBeepMulaw(durationMs = 200, freq = 1000, gain = 0.3) {
+  const totalSamples = Math.floor((SR * durationMs) / 1000);
+  const pcm = Buffer.alloc(totalSamples * PCM_BYTES_PER_SAMPLE);
   for (let i = 0; i < totalSamples; i++) {
-    const t = i / SAMPLE_RATE;
-    const sample = Math.max(-1, Math.min(1, Math.sin(2 * Math.PI * freq * t))) * gain;
-    buf.writeInt16LE(Math.floor(sample * 0x7fff), i * 2);
+    const t = i / SR;
+    const v = Math.sin(2 * Math.PI * freq * t) * gain;
+    pcm.writeInt16LE(Math.floor(v * 0x7fff), i * 2);
   }
-  return buf;
+  return pcm16ToMulawBuffer(pcm);
 }
 
-/** Make n ms of silence */
-function makeSilencePcm(durationMs = 200) {
-  const totalSamples = Math.floor((SAMPLE_RATE * durationMs) / 1000);
-  return Buffer.alloc(totalSamples * BYTES_PER_SAMPLE);
+function makeSilenceMulaw(durationMs = 200) {
+  const bytes = Math.floor((SR * durationMs) / 1000); // 1 byte/sample in μ-law
+  return Buffer.alloc(bytes, 0xFF); // μ-law "silence"
 }
 
-/** Stream a PCM buffer to Twilio as 20 ms frames, tagging streamSid */
-async function streamPcmToTwilio(ws, pcmBuffer, label = "TTS/PCM") {
-  if (!ws._streamSid) {
-    console.warn(`[${label}] No streamSid on socket — Twilio will drop frames`);
-  }
-  let offset = 0, frames = 0;
-  while (offset < pcmBuffer.length && ws.readyState === ws.OPEN) {
-    const end = Math.min(offset + BYTES_PER_FRAME, pcmBuffer.length);
-    const frame = pcmBuffer.slice(offset, end);
-    const payload =
-      frame.length === BYTES_PER_FRAME
-        ? frame
-        : Buffer.concat([frame, Buffer.alloc(BYTES_PER_FRAME - frame.length)]);
-
-    ws.send(
-      JSON.stringify({
-        event: "media",
-        streamSid: ws._streamSid,              // ← CRITICAL
-        media: { payload: payload.toString("base64") },
-      })
-    );
-
-    frames++;
-    if (frames % 100 === 0) {
-      console.log(`[${label}] sent ${frames} frames (~${(frames * FRAME_MS) / 1000}s)`);
-    }
-
-    await new Promise((r) => setTimeout(r, FRAME_MS));
-    offset += BYTES_PER_FRAME;
-  }
-  console.log(`[${label}] done.`);
-}
-
-/** Send N ms of *silent* media frames (keepalive) */
-function sendSilence(ws, ms = 200) {
-  if (!ws._streamSid || ws.readyState !== ws.OPEN) return;
-  const frames = Math.ceil(ms / FRAME_MS);
-  const silentFrame = Buffer.alloc(BYTES_PER_FRAME).toString("base64");
-  for (let i = 0; i < frames; i++) {
-    ws.send(
-      JSON.stringify({
-        event: "media",
-        streamSid: ws._streamSid,              // ← include streamSid
-        media: { payload: silentFrame },
-      })
-    );
-  }
-}
-
-/** ElevenLabs TTS → raw PCM (8 kHz, 16-bit) */
-async function elevenLabsTtsPcm(text) {
+// ── ElevenLabs: ask for 8 kHz PCM16, then convert to μ-law ───────────────────
+async function elevenLabsPcm(text) {
   if (!ELEVEN_API_KEY) throw new Error("ELEVEN_API_KEY not set");
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
   const res = await fetch(url, {
@@ -108,36 +79,69 @@ async function elevenLabsTtsPcm(text) {
     body: JSON.stringify({
       text,
       voice_settings: { stability: 0.4, similarity_boost: 0.7 },
-      output_format: "pcm_8000", // 8 kHz PCM
+      output_format: "pcm_8000",
     }),
   });
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`ElevenLabs failed: ${res.status} ${res.statusText} ${body}`);
+    const err = await res.text().catch(() => "");
+    throw new Error(`ElevenLabs TTS failed: ${res.status} ${res.statusText} ${err}`);
   }
-  const arrayBuf = await res.arrayBuffer();
-  const pcm = Buffer.from(arrayBuf);
-  if (pcm.length % BYTES_PER_SAMPLE !== 0) {
+  const pcm = Buffer.from(await res.arrayBuffer());
+  if (pcm.length % 2 !== 0) {
     console.warn(`[TTS] PCM length ${pcm.length} not sample-aligned; tail byte may be ignored`);
   }
   return pcm;
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// WebSocket server (Twilio will connect to wss://<host>/stream)
-// ───────────────────────────────────────────────────────────────────────────────
+// ── Stream μ-law to Twilio in 20 ms frames (160 bytes) ───────────────────────
+async function streamMulaw(ws, mulawBuf, label = "OUT") {
+  if (!ws._streamSid) {
+    console.warn(`[${label}] Missing streamSid; Twilio will drop outbound audio`);
+  }
+  let offset = 0, frames = 0;
+  while (offset < mulawBuf.length && ws.readyState === ws.OPEN) {
+    const end = Math.min(offset + OUT_BYTES_PER_FRAME, mulawBuf.length);
+    let chunk = mulawBuf.slice(offset, end);
+    if (chunk.length < OUT_BYTES_PER_FRAME) {
+      // pad last frame with μ-law silence
+      chunk = Buffer.concat([chunk, Buffer.alloc(OUT_BYTES_PER_FRAME - chunk.length, 0xFF)]);
+    }
+    ws.send(JSON.stringify({
+      event: "media",
+      streamSid: ws._streamSid,              // <- CRUCIAL
+      media: { payload: chunk.toString("base64") },
+    }));
+    frames++;
+    if (frames % 100 === 0) console.log(`[${label}] sent ${frames} frames (~${(frames * FRAME_MS) / 1000}s)`);
+    await new Promise(r => setTimeout(r, FRAME_MS));
+    offset += OUT_BYTES_PER_FRAME;
+  }
+  console.log(`[${label}] done.`);
+}
 
+/** Send short μ-law silence as keepalive (200 ms) */
+function sendKeepalive(ws) {
+  if (!ws._streamSid || ws.readyState !== ws.OPEN) return;
+  const silent = makeSilenceMulaw(200);
+  let offset = 0;
+  while (offset < silent.length) {
+    const chunk = silent.slice(offset, offset + OUT_BYTES_PER_FRAME);
+    ws.send(JSON.stringify({
+      event: "media",
+      streamSid: ws._streamSid,
+      media: { payload: chunk.toString("base64") },
+    }));
+    offset += OUT_BYTES_PER_FRAME;
+  }
+  console.log("[KEEPALIVE] sent 200ms silence");
+}
+
+// ── WS server ─────────────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", (ws) => {
   console.log("🔗 WebSocket connected");
-
-  // Keepalive timer (send 200ms silence every 4s while idle)
-  let keepaliveTimer = null;
-  const armKeepalive = () => {
-    if (keepaliveTimer) clearInterval(keepaliveTimer);
-    keepaliveTimer = setInterval(() => sendSilence(ws, 200), 4000);
-  };
+  let keepalive;
 
   ws.on("message", async (data) => {
     let msg;
@@ -152,62 +156,63 @@ wss.on("connection", (ws) => {
       ws._streamSid = msg.start?.streamSid;
       console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${ws._streamSid}`);
 
-      // Short beep so we know audio downstream is working
-      console.log("[BEEP] playing 200 ms…");
-      try { await streamPcmToTwilio(ws, makeBeepPcm(200), "BEEP"); } catch (e) { console.error(e); }
-
-      // Greeting (use ElevenLabs if configured, else another short beep as placeholder)
+      // 1) short beep (μ-law)
       try {
-        if (ELEVEN_API_KEY) {
-          const greeting = await elevenLabsTtsPcm("Hi! I'm your AI receptionist. How can I help you today?");
-          console.log("[TTS] streaming greeting as PCM…");
-          await streamPcmToTwilio(ws, greeting, "TTS");
-        } else {
-          console.log("[TTS] ELEVEN_API_KEY missing; sending fallback beep.");
-          await streamPcmToTwilio(ws, makeBeepPcm(300), "TTS-Fallback");
-        }
-      } catch (err) {
-        console.error("[TTS] greeting failed:", err.message);
+        const beep = makeBeepMulaw(200);
+        await streamMulaw(ws, beep, "BEEP");
+      } catch (e) {
+        console.error("[BEEP] failed:", e);
       }
 
-      // start keepalive after greeting
-      armKeepalive();
+      // 2) ElevenLabs greeting (PCM->μ-law), or fallback beep
+      try {
+        if (ELEVEN_API_KEY) {
+          const pcm = await elevenLabsPcm("Hi! I'm your AI receptionist. How can I help you today?");
+          const mulaw = pcm16ToMulawBuffer(pcm);
+          console.log("[TTS] streaming greeting…");
+          await streamMulaw(ws, mulaw, "TTS");
+        } else {
+          console.log("[TTS] ELEVEN_API_KEY missing; sending fallback beep.");
+          await streamMulaw(ws, makeBeepMulaw(300), "TTS-Fallback");
+        }
+      } catch (e) {
+        console.error("[TTS] greeting failed:", e.message);
+      }
+
+      // keepalive every 4s
+      if (keepalive) clearInterval(keepalive);
+      keepalive = setInterval(() => sendKeepalive(ws), 4000);
       return;
     }
 
     if (msg.event === "media") {
-      // inbound audio from caller (we're not decoding it here)
-      ws._rxFrames = (ws._rxFrames || 0) + 1;
-      if (ws._rxFrames % 100 === 0) console.log(`[MEDIA] frames received: ${ws._rxFrames}`);
+      ws._rx = (ws._rx || 0) + 1;
+      if (ws._rx % 100 === 0) console.log(`[MEDIA] frames received: ${ws._rx}`);
       return;
     }
 
     if (msg.event === "stop") {
-      console.log(`[WS] STOP (total inbound frames: ${ws._rxFrames || 0})`);
+      console.log(`[WS] STOP (total inbound frames: ${ws._rx || 0})`);
       return;
     }
   });
 
   ws.on("close", () => {
-    if (keepaliveTimer) clearInterval(keepaliveTimer);
+    if (keepalive) clearInterval(keepalive);
     console.log("[WS] CLOSE code=1005 reason=");
   });
 
   ws.on("error", (err) => console.error("[WS] error", err));
 });
 
-// HTTP entry + WS upgrade for /stream only
+// HTTP + upgrade
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
 
 server.on("upgrade", (req, socket, head) => {
-  if (req.url !== "/stream") {
-    socket.destroy();
-    return;
-  }
+  if (req.url !== "/stream") return socket.destroy();
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
-// Simple health check
 app.get("/", (_req, res) => res.status(200).send("OK"));
