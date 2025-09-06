@@ -19,11 +19,11 @@ const BIZ = {
   bookingEmail: process.env.BIZ_BOOKING_EMAIL || "",
 };
 
-// IMPORTANT: Twilio prefers mulaw on outbound media
+// Prefer mulaw for Twilio; you can flip to pcm16 to test.
 const TWILIO_CODEC = (process.env.TWILIO_CODEC || "mulaw").toLowerCase(); // "mulaw" | "pcm16"
 
 const SAMPLE_RATE = 8000;
-const BYTES_PER_SAMPLE = 2; // for linear PCM
+const BYTES_PER_SAMPLE = 2; // linear PCM
 const FRAME_MS = 20;
 const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS; // 160
 const BYTES_PER_FRAME   = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE; // 320
@@ -53,26 +53,20 @@ async function saveAppointment(payload) {
   if (error) console.error("❌ saveAppointment:", error);
 }
 
-/* ──────────────── Audio helpers ─────────────── */
+/* ─────────────── Audio helpers ─────────────── */
 
 // Linear16 sample (Int16) → μ-law byte
 function linear16ToMulawSample(sample) {
-  // Clamp
   let s = Math.max(-32768, Math.min(32767, sample));
   const SIGN = s < 0 ? 0x80 : 0x00;
   if (s < 0) s = -s;
-  // Bias and clip (per G.711 μ-law)
   s = s + 0x84;
   if (s > 0x7FFF) s = 0x7FFF;
 
-  // Determine exponent
   let exponent = 7;
   for (let expMask = 0x4000; (s & expMask) === 0 && exponent > 0; expMask >>= 1) exponent--;
-
-  // Mantissa
   const mantissa = (s >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0F;
   const mulaw = ~(SIGN | (exponent << 4) | mantissa) & 0xFF;
-
   return mulaw;
 }
 
@@ -98,23 +92,26 @@ function makeBeepPcm({ hz = 1000, ms = 120, gain = 0.25 } = {}) {
   return buf;
 }
 
-// Send (beep or TTS) to Twilio in real-time frames
-async function streamAudioToTwilio(ws, linearPcm) {
+// Send (beep or TTS) to Twilio in real-time frames — NOW including streamSid
+async function streamAudioToTwilio(ws, linearPcm, streamSid) {
+  if (!streamSid) {
+    console.warn("⚠️ streamAudioToTwilio called without streamSid — audio will be dropped by Twilio");
+  }
   const frames = [];
   for (let off = 0; off < linearPcm.length; off += BYTES_PER_FRAME) {
     let frame = linearPcm.slice(off, Math.min(off + BYTES_PER_FRAME, linearPcm.length));
-    if (frame.length < BYTES_PER_FRAME) {
-      frame = Buffer.concat([frame, Buffer.alloc(BYTES_PER_FRAME - frame.length)]);
-    }
-    if (TWILIO_CODEC === "mulaw") {
-      frame = linear16ToMulawBuffer(frame); // convert to μ-law
-    }
+    if (frame.length < BYTES_PER_FRAME) frame = Buffer.concat([frame, Buffer.alloc(BYTES_PER_FRAME - frame.length)]);
+    if (TWILIO_CODEC === "mulaw") frame = linear16ToMulawBuffer(frame);
     frames.push(frame);
   }
 
-  console.log(`[TTS] streaming ${frames.length} frames as ${TWILIO_CODEC} …`);
+  console.log(`[TTS] streaming ${frames.length} frames as ${TWILIO_CODEC} (streamSid=${streamSid}) …`);
   for (let i = 0; i < frames.length; i++) {
-    ws.send(JSON.stringify({ event: "media", media: { payload: frames[i].toString("base64") } }));
+    ws.send(JSON.stringify({
+      event: "media",
+      streamSid,                       // ← REQUIRED for <Connect><Stream>
+      media: { payload: frames[i].toString("base64") },
+    }));
     if ((i + 1) % 100 === 0) console.log(`[TTS] sent ${(i + 1)} frames (~${((i + 1) * FRAME_MS) / 1000}s)`);
     await new Promise((r) => setTimeout(r, FRAME_MS));
   }
@@ -141,17 +138,15 @@ async function ttsElevenLabsPcm8k(text) {
     throw new Error(`ElevenLabs TTS failed: ${res.status} ${res.statusText} ${txt}`);
   }
   const pcm = Buffer.from(await res.arrayBuffer());
-  if (pcm.length % 2 !== 0) {
-    console.warn(`[WARN] PCM length ${pcm.length} not sample-aligned; tail byte may be ignored.`);
-  }
+  if (pcm.length % 2 !== 0) console.warn(`[WARN] PCM length ${pcm.length} not sample-aligned; tail byte may be ignored.`);
   return pcm;
 }
 
-async function speak(ws, text) {
+async function speak(ws, text, streamSid) {
   console.log(`[TTS] reply -> "${text}"`);
   const beep = makeBeepPcm({ ms: 120, hz: 1000, gain: 0.25 });
   const voice = await ttsElevenLabsPcm8k(text);
-  await streamAudioToTwilio(ws, Buffer.concat([beep, voice]));
+  await streamAudioToTwilio(ws, Buffer.concat([beep, voice]), streamSid);
 }
 
 /* ─────────────── Intent router ─────────────── */
@@ -159,10 +154,10 @@ async function routeIntent(ws, text, state) {
   const lower = text.toLowerCase();
 
   if (/\bhours?\b|\bopen\b|\bclose\b/.test(lower)) {
-    return speak(ws, `${BIZ.name} is open ${BIZ.hours}. How can I help you next?`);
+    return speak(ws, `${BIZ.name} is open ${BIZ.hours}. How can I help you next?`, state.streamSid);
   }
   if (/\barea\b|\bserve\b|\bcoverage\b|\bwhere\b/.test(lower)) {
-    return speak(ws, `We serve ${BIZ.area}. Would you like to book an appointment?`);
+    return speak(ws, `We serve ${BIZ.area}. Would you like to book an appointment?`, state.streamSid);
   }
   if (/\bbook\b|\bappointment\b|\bschedule\b/.test(lower)) {
     await saveAppointment({
@@ -174,11 +169,11 @@ async function routeIntent(ws, text, state) {
       start_at: new Date().toISOString(),
       raw: { heard: text },
     });
-    return speak(ws, `Great. I’ve placed a pending appointment request. You’ll get a confirmation shortly. Anything else?`);
+    return speak(ws, `Great. I’ve placed a pending appointment request. You’ll get a confirmation shortly. Anything else?`, state.streamSid);
   }
   if (/\bvoicemail\b|\bleave (a )?message\b|\bmessage\b/.test(lower)) {
     state.voicemailMode = true;
-    return speak(ws, `Sure. After the tone, please leave your message. When you finish, say “done”.`);
+    return speak(ws, `Sure. After the tone, please leave your message. When you finish, say “done”.`, state.streamSid);
   }
   if (state.voicemailMode) {
     if (/\bdone\b|\bthat’s all\b|\bthat is all\b/.test(lower)) {
@@ -188,14 +183,14 @@ async function routeIntent(ws, text, state) {
         transcript, duration_sec: null, audio_url: null, raw: { segments: state.voicemailText || [] },
       });
       state.voicemailMode = false; state.voicemailText = [];
-      return speak(ws, `Thanks! Your voicemail has been saved. Anything else I can help with?`);
+      return speak(ws, `Thanks! Your voicemail has been saved. Anything else I can help with?`, state.streamSid);
     } else {
       state.voicemailText = state.voicemailText || [];
       state.voicemailText.push(text);
       return;
     }
   }
-  return speak(ws, `I can help with hours, our service area, booking an appointment, or leaving a voicemail. What would you like to do?`);
+  return speak(ws, `I can help with hours, our service area, booking an appointment, or leaving a voicemail. What would you like to do?`, state.streamSid);
 }
 
 /* ─────────────── Deepgram bridge ─────────────── */
@@ -267,6 +262,9 @@ wss.on("connection", (ws) => {
     if (msg.event === "start") {
       state.callSid   = msg.start?.callSid || null;
       state.streamSid = msg.start?.streamSid || null;
+      state.from      = msg.start?.customParameters?.from || null;
+      state.to        = msg.start?.customParameters?.to || null;
+
       console.log(`[WS] START callSid=${state.callSid} streamSid=${state.streamSid} bidi=${msg.start?.bidirectional}`);
 
       ensureDG();
@@ -274,8 +272,8 @@ wss.on("connection", (ws) => {
       try {
         console.log("[TTS] sending greeting…");
         const tone = makeBeepPcm({ ms: 500, hz: 1000, gain: 0.15 });
-        await streamAudioToTwilio(ws, tone);
-        await speak(ws, `Hi! I'm your AI receptionist at ${BIZ.name}. How can I help you today?`);
+        await streamAudioToTwilio(ws, tone, state.streamSid);
+        await speak(ws, `Hi! I'm your AI receptionist at ${BIZ.name}. How can I help you today?`, state.streamSid);
         console.log("[TTS] greeting done.");
       } catch (e) {
         console.error("[TTS] greeting failed:", e.message);
