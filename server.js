@@ -2,10 +2,9 @@ import express from "express";
 import fetch from "node-fetch";
 import { WebSocketServer } from "ws";
 import WebSocket from "ws";
-import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 
-/*──────────────── CONFIG ────────────────*/
+/* ───────────────── CONFIG ───────────────── */
 const PORT = process.env.PORT || 10000;
 
 const ELEVEN_API_KEY  = process.env.ELEVEN_API_KEY || "";
@@ -20,13 +19,16 @@ const BIZ = {
   bookingEmail: process.env.BIZ_BOOKING_EMAIL || "",
 };
 
+// IMPORTANT: Twilio prefers mulaw on outbound media
+const TWILIO_CODEC = (process.env.TWILIO_CODEC || "mulaw").toLowerCase(); // "mulaw" | "pcm16"
+
 const SAMPLE_RATE = 8000;
-const BYTES_PER_SAMPLE = 2;
+const BYTES_PER_SAMPLE = 2; // for linear PCM
 const FRAME_MS = 20;
 const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS; // 160
 const BYTES_PER_FRAME   = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE; // 320
 
-/*──────────────── Supabase ────────────────*/
+/* ──────────────── Supabase (optional) ─────────────── */
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
 
@@ -37,13 +39,7 @@ const supabase =
       })
     : null;
 
-const supaReady = () => {
-  if (!supabase) {
-    console.warn("⚠️ Supabase not configured; skipping DB writes.");
-    return false;
-  }
-  return true;
-};
+const supaReady = () => !!supabase;
 
 async function saveVoicemail(payload) {
   if (!supaReady()) return;
@@ -57,10 +53,43 @@ async function saveAppointment(payload) {
   if (error) console.error("❌ saveAppointment:", error);
 }
 
-/*──────────────── Audio helpers ──────────*/
-function makeBeepPcm({ hz = 1000, ms = 150, gain = 0.3 } = {}) {
+/* ──────────────── Audio helpers ─────────────── */
+
+// Linear16 sample (Int16) → μ-law byte
+function linear16ToMulawSample(sample) {
+  // Clamp
+  let s = Math.max(-32768, Math.min(32767, sample));
+  const SIGN = s < 0 ? 0x80 : 0x00;
+  if (s < 0) s = -s;
+  // Bias and clip (per G.711 μ-law)
+  s = s + 0x84;
+  if (s > 0x7FFF) s = 0x7FFF;
+
+  // Determine exponent
+  let exponent = 7;
+  for (let expMask = 0x4000; (s & expMask) === 0 && exponent > 0; expMask >>= 1) exponent--;
+
+  // Mantissa
+  const mantissa = (s >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0F;
+  const mulaw = ~(SIGN | (exponent << 4) | mantissa) & 0xFF;
+
+  return mulaw;
+}
+
+// Buffer (linear16) → Buffer (μ-law)
+function linear16ToMulawBuffer(pcmBuf) {
+  const out = Buffer.alloc(pcmBuf.length / 2);
+  for (let i = 0, j = 0; i < pcmBuf.length; i += 2, j++) {
+    const sample = pcmBuf.readInt16LE(i);
+    out[j] = linear16ToMulawSample(sample);
+  }
+  return out;
+}
+
+// 1 kHz beep (linear16)
+function makeBeepPcm({ hz = 1000, ms = 120, gain = 0.25 } = {}) {
   const samples = Math.round((SAMPLE_RATE * ms) / 1000);
-  const buf = Buffer.alloc(samples * BYTES_PER_SAMPLE);
+  const buf = Buffer.alloc(samples * 2);
   for (let i = 0; i < samples; i++) {
     const t = i / SAMPLE_RATE;
     const s = Math.sin(2 * Math.PI * hz * t) * gain;
@@ -69,22 +98,29 @@ function makeBeepPcm({ hz = 1000, ms = 150, gain = 0.3 } = {}) {
   return buf;
 }
 
-async function streamPcmToTwilio(ws, pcm) {
-  let off = 0;
-  while (off < pcm.length) {
-    const end = Math.min(off + BYTES_PER_FRAME, pcm.length);
-    const frame = pcm.slice(off, end);
-    const payload =
-      frame.length === BYTES_PER_FRAME
-        ? frame.toString("base64")
-        : Buffer.concat([frame, Buffer.alloc(BYTES_PER_FRAME - frame.length)]).toString("base64");
+// Send (beep or TTS) to Twilio in real-time frames
+async function streamAudioToTwilio(ws, linearPcm) {
+  const frames = [];
+  for (let off = 0; off < linearPcm.length; off += BYTES_PER_FRAME) {
+    let frame = linearPcm.slice(off, Math.min(off + BYTES_PER_FRAME, linearPcm.length));
+    if (frame.length < BYTES_PER_FRAME) {
+      frame = Buffer.concat([frame, Buffer.alloc(BYTES_PER_FRAME - frame.length)]);
+    }
+    if (TWILIO_CODEC === "mulaw") {
+      frame = linear16ToMulawBuffer(frame); // convert to μ-law
+    }
+    frames.push(frame);
+  }
 
-    ws.send(JSON.stringify({ event: "media", media: { payload } }));
+  console.log(`[TTS] streaming ${frames.length} frames as ${TWILIO_CODEC} …`);
+  for (let i = 0; i < frames.length; i++) {
+    ws.send(JSON.stringify({ event: "media", media: { payload: frames[i].toString("base64") } }));
+    if ((i + 1) % 100 === 0) console.log(`[TTS] sent ${(i + 1)} frames (~${((i + 1) * FRAME_MS) / 1000}s)`);
     await new Promise((r) => setTimeout(r, FRAME_MS));
-    off += BYTES_PER_FRAME;
   }
 }
 
+// ElevenLabs TTS (linear16 8k)
 async function ttsElevenLabsPcm8k(text) {
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
   const res = await fetch(url, {
@@ -105,92 +141,71 @@ async function ttsElevenLabsPcm8k(text) {
     throw new Error(`ElevenLabs TTS failed: ${res.status} ${res.statusText} ${txt}`);
   }
   const pcm = Buffer.from(await res.arrayBuffer());
-  if (pcm.length % BYTES_PER_SAMPLE !== 0) {
-    console.warn(`[WARN] PCM length ${pcm.length} not sample-aligned; Twilio may ignore a tail byte.`);
+  if (pcm.length % 2 !== 0) {
+    console.warn(`[WARN] PCM length ${pcm.length} not sample-aligned; tail byte may be ignored.`);
   }
   return pcm;
 }
 
 async function speak(ws, text) {
+  console.log(`[TTS] reply -> "${text}"`);
   const beep = makeBeepPcm({ ms: 120, hz: 1000, gain: 0.25 });
-  const tts  = await ttsElevenLabsPcm8k(text);
-  await streamPcmToTwilio(ws, Buffer.concat([beep, tts]));
+  const voice = await ttsElevenLabsPcm8k(text);
+  await streamAudioToTwilio(ws, Buffer.concat([beep, voice]));
 }
 
-/*──────────────── Router ────────────────*/
+/* ─────────────── Intent router ─────────────── */
 async function routeIntent(ws, text, state) {
   const lower = text.toLowerCase();
 
   if (/\bhours?\b|\bopen\b|\bclose\b/.test(lower)) {
     return speak(ws, `${BIZ.name} is open ${BIZ.hours}. How can I help you next?`);
   }
-
   if (/\barea\b|\bserve\b|\bcoverage\b|\bwhere\b/.test(lower)) {
     return speak(ws, `We serve ${BIZ.area}. Would you like to book an appointment?`);
   }
-
   if (/\bbook\b|\bappointment\b|\bschedule\b/.test(lower)) {
-    state.booking = state.booking || {};
-    const when = (lower.match(/\b(?:on )?(monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{4}-\d{2}-\d{2}|\d{1,2}(?:st|nd|rd|th)?)(?:.*\d{1,2}(:\d{2})?\s?(am|pm)?)?/i) || [])[0];
     await saveAppointment({
       caller_name: state.callerName || null,
       phone: state.from || null,
       email: null,
       service: "General",
       notes: `Heard: "${text}"`,
-      start_at: new Date().toISOString(), // placeholder
-      raw: { heard: text, when },
+      start_at: new Date().toISOString(),
+      raw: { heard: text },
     });
-    return speak(ws, `Great. I’ve placed a pending appointment${when ? ` for ${when}` : ""}. You’ll get a confirmation shortly. Anything else?`);
+    return speak(ws, `Great. I’ve placed a pending appointment request. You’ll get a confirmation shortly. Anything else?`);
   }
-
   if (/\bvoicemail\b|\bleave (a )?message\b|\bmessage\b/.test(lower)) {
     state.voicemailMode = true;
     return speak(ws, `Sure. After the tone, please leave your message. When you finish, say “done”.`);
   }
-
   if (state.voicemailMode) {
     if (/\bdone\b|\bthat’s all\b|\bthat is all\b/.test(lower)) {
       const transcript = (state.voicemailText || []).join(" ");
       await saveVoicemail({
-        call_sid: state.callSid,
-        from_number: state.from,
-        to_number: state.to,
-        transcript,
-        duration_sec: null,
-        audio_url: null,
-        raw: { segments: state.voicemailText || [] },
+        call_sid: state.callSid, from_number: state.from, to_number: state.to,
+        transcript, duration_sec: null, audio_url: null, raw: { segments: state.voicemailText || [] },
       });
-      state.voicemailMode = false;
-      state.voicemailText = [];
+      state.voicemailMode = false; state.voicemailText = [];
       return speak(ws, `Thanks! Your voicemail has been saved. Anything else I can help with?`);
     } else {
       state.voicemailText = state.voicemailText || [];
       state.voicemailText.push(text);
-      return; // keep collecting
+      return;
     }
   }
-
   return speak(ws, `I can help with hours, our service area, booking an appointment, or leaving a voicemail. What would you like to do?`);
 }
 
-/*──────────────── Deepgram bridge ───────*/
+/* ─────────────── Deepgram bridge ─────────────── */
 function openDeepgramSocket({ onTranscript }) {
-  if (!DEEPGRAM_API_KEY) {
-    console.warn("⚠️ DEEPGRAM_API_KEY missing; STT disabled.");
-    return null;
-  }
+  if (!DEEPGRAM_API_KEY) { console.warn("⚠️ DEEPGRAM_API_KEY missing; STT disabled."); return null; }
 
   const qs = new URLSearchParams({
-    encoding: "linear16",
-    sample_rate: String(SAMPLE_RATE),
-    channels: "1",
-    punctuate: "true",
-    smart_format: "true",
-    interim_results: "false",
-    vad_events: "true",
-    endpointing: "200",
-    // language: "en-US", // add if you need a specific locale
+    encoding: "linear16", sample_rate: String(SAMPLE_RATE),
+    channels: "1", punctuate: "true", smart_format: "true",
+    interim_results: "false", vad_events: "true", endpointing: "200",
   });
 
   const dg = new WebSocket(`wss://api.deepgram.com/v1/listen?${qs.toString()}`, {
@@ -203,19 +218,17 @@ function openDeepgramSocket({ onTranscript }) {
   dg.on("message", (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
-      // Deepgram sends { is_final, channel: { alternatives: [ { transcript } ] } }
       const alt = msg?.channel?.alternatives?.[0];
       const text = alt?.transcript || "";
       const isFinal = !!msg?.is_final;
-
       if (text && isFinal) onTranscript(text);
-    } catch { /* ignore keepalives */ }
+    } catch {}
   });
 
   return dg;
 }
 
-/*──────────────── WebSocket server ───────*/
+/* ─────────────── WS server ─────────────── */
 const app = express();
 const wss = new WebSocketServer({ noServer: true });
 
@@ -223,19 +236,12 @@ wss.on("connection", (ws) => {
   console.log("🔗 WebSocket connected");
 
   const state = {
-    callSid: null,
-    streamSid: null,
-    from: null,
-    to: null,
-    callerName: null,
-    voicemailMode: false,
-    voicemailText: [],
-    rxFrames: 0,
-    dg: null,
-    dgQueue: [], // media frames while Deepgram socket is not yet open
+    callSid: null, streamSid: null, from: null, to: null,
+    callerName: null, voicemailMode: false, voicemailText: [],
+    rxFrames: 0, dg: null, dgQueue: [],
   };
 
-  const ensureDeepgram = () => {
+  const ensureDG = () => {
     if (state.dg || !DEEPGRAM_API_KEY) return;
     state.dg = openDeepgramSocket({
       onTranscript: async (text) => {
@@ -243,19 +249,15 @@ wss.on("connection", (ws) => {
         try { await routeIntent(ws, text, state); } catch (e) { console.error("router error", e); }
       },
     });
-
     if (!state.dg) return;
-
     state.dg.on("open", () => {
-      // flush any buffered inbound frames
       for (const buf of state.dgQueue) state.dg.send(buf);
       state.dgQueue = [];
     });
   };
 
   ws.on("message", async (data) => {
-    let msg;
-    try { msg = JSON.parse(data.toString()); } catch { return; }
+    let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
 
     if (msg.event === "connected") {
       console.log(`[WS] event: { event: 'connected', protocol: '${msg.protocol}', version: '${msg.version}' }`);
@@ -265,18 +267,16 @@ wss.on("connection", (ws) => {
     if (msg.event === "start") {
       state.callSid   = msg.start?.callSid || null;
       state.streamSid = msg.start?.streamSid || null;
-      state.from      = msg.start?.customParameters?.From || null;
-      state.to        = msg.start?.customParameters?.To || null;
-
       console.log(`[WS] START callSid=${state.callSid} streamSid=${state.streamSid} bidi=${msg.start?.bidirectional}`);
 
-      ensureDeepgram();
+      ensureDG();
 
-      // 0.5s connection tone + greeting
       try {
+        console.log("[TTS] sending greeting…");
         const tone = makeBeepPcm({ ms: 500, hz: 1000, gain: 0.15 });
-        await streamPcmToTwilio(ws, tone);
-        await speak(ws, `Hi! I’m your AI receptionist at ${BIZ.name}. How can I help you today?`);
+        await streamAudioToTwilio(ws, tone);
+        await speak(ws, `Hi! I'm your AI receptionist at ${BIZ.name}. How can I help you today?`);
+        console.log("[TTS] greeting done.");
       } catch (e) {
         console.error("[TTS] greeting failed:", e.message);
       }
@@ -285,9 +285,8 @@ wss.on("connection", (ws) => {
 
     if (msg.event === "media") {
       state.rxFrames++;
-      // Forward caller audio to Deepgram (binary 16-bit PCM)
+      const raw = Buffer.from(msg.media.payload, "base64"); // inbound linear16
       if (state.dg) {
-        const raw = Buffer.from(msg.media.payload, "base64"); // 8k linear16 mono
         if (state.dg.readyState === WebSocket.OPEN) state.dg.send(raw);
         else state.dgQueue.push(raw);
       }
@@ -302,22 +301,14 @@ wss.on("connection", (ws) => {
     }
   });
 
-  ws.on("close", () => {
-    try { state.dg?.close(); } catch {}
-    console.log("[WS] CLOSE code=1005 reason=");
-  });
-
+  ws.on("close", () => { try { state.dg?.close(); } catch {}; console.log("[WS] CLOSE code=1005 reason="); });
   ws.on("error", (err) => console.error("[WS] error", err));
 });
 
-/*──────────────── HTTP+Upgrade ───────────*/
-const server = app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
-
+/* ─────────────── HTTP/Upgrade ─────────────── */
+const server = app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT} (TWILIO_CODEC=${TWILIO_CODEC})`));
 server.on("upgrade", (req, socket, head) => {
   if (req.url !== "/stream") { socket.destroy(); return; }
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
-
 app.get("/", (_req, res) => res.status(200).send("OK"));
