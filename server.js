@@ -1,384 +1,519 @@
-// server.js — AI Phone Agent (inbound audio stream) for CleanEasy
-// Runtime: Node 18+
-// Deploy target: Render (or any Node host)
-//
-// Features
-// - Twilio Voice webhook (/voice) returns TwiML that starts a one-way media stream (track="inbound_track").
-// - WebSocket endpoint (/media) receives 8kHz μ-law audio frames from Twilio.
-// - Bridges audio to Deepgram Realtime STT; receives transcripts.
-// - Tiny intent router handles: hours, service area, booking, voicemail (EN/ES).
-// - On detected intent: sends an SMS with the answer/link; logs lead/voicemail to Supabase.
-// - Environment-driven business profile (name, hours, areas, booking URL).
-//
-// Notes
-// - Twilio Media Streams over <Start> <Stream> with track="inbound_track" are *receive-only*.
-//   That means we cannot inject live audio back mid-call from this WebSocket. We reply via SMS
-//   and store/transact server-side actions while the call is ongoing.
-//
-// Required ENV VARS
-// PORT
-// PUBLIC_BASE_URL (e.g. https://your-app.onrender.com)
-// TWILIO_ACCOUNT_SID
-// TWILIO_AUTH_TOKEN
-// TWILIO_MESSAGING_SERVICE_SID (or TWILIO_FROM_NUMBER) — for sending SMS
-// DEEPGRAM_API_KEY
-// SUPABASE_URL
-// SUPABASE_SERVICE_ROLE_KEY
-// BIZ_NAME (e.g., "CleanEasy")
-// BIZ_HOURS (e.g., "Mon–Sat 8am–6pm ET")
-// BIZ_AREA (e.g., "Boston & Greater Boston")
-// BOOKING_URL (e.g., "https://book.cleaneasy.example")
-
-import express from 'express';
-import crypto from 'crypto';
-import twilio from 'twilio';
-import { WebSocketServer } from 'ws';
-import WebSocket from 'ws';
-import fetch from 'node-fetch';
-import { createClient } from '@supabase/supabase-js';
+import express from "express";
+import fetch from "node-fetch";
+import { WebSocketServer } from "ws";
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Config & Clients
+// CONFIG
 // ───────────────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 10000;
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // must be external HTTPS URL
-
-if (!PUBLIC_BASE_URL) {
-  console.warn('[BOOT] PUBLIC_BASE_URL is not set. Twilio will fail to connect to /media.');
-}
-
 const app = express();
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+const PORT = process.env.PORT || 10000;
 
-const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+// ElevenLabs (TTS)
+const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
+const ELEVEN_VOICE_ID =
+  process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL";
+if (!ELEVEN_API_KEY) console.error("❌ ELEVEN_API_KEY is not set");
 
-const supabase = createClient(process.env.SUPABASE_URL || '', process.env.SUPABASE_SERVICE_ROLE_KEY || '');
+// OpenAI (STT)
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+if (!OPENAI_API_KEY) console.error("❌ OPENAI_API_KEY is not set");
 
-// Business profile
+// Business context
 const BIZ = {
-  name: process.env.BIZ_NAME || 'CleanEasy',
-  hours: process.env.BIZ_HOURS || 'Mon–Sat 8am–6pm ET',
-  area: process.env.BIZ_AREA || 'Boston & Greater Boston',
-  bookingUrl: process.env.BOOKING_URL || 'https://example.com/book',
+  name: process.env.BIZ_NAME || "Our Business",
+  hours: process.env.BIZ_HOURS || "Mon–Fri 9am–5pm",
+  area: process.env.BIZ_SERVICE_AREA || "the local area",
+  apptUrl: process.env.APPT_URL || "",
 };
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ───────────────────────────────────────────────────────────────────────────────
-function verifyTwilioSignature(req) {
-  const twilioSignature = req.headers['x-twilio-signature'];
-  if (!twilioSignature) return false;
-  const url = `${PUBLIC_BASE_URL}${req.path}`;
-  const params = req.method === 'POST' ? req.body : {};
-  return twilio.validateRequest(process.env.TWILIO_AUTH_TOKEN, twilioSignature, url, params);
-}
-
-function sms(to, body) {
-  const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
-  const from = process.env.TWILIO_FROM_NUMBER; // fallback if no Messaging Service
-  const payload = messagingServiceSid ? { messagingServiceSid } : { from };
-  return twilioClient.messages.create({ ...payload, to, body });
-}
-
-function nowISO() {
-  return new Date().toISOString();
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// Minimal NLU / Intent Router
-// ───────────────────────────────────────────────────────────────────────────────
-const INTENTS = {
-  HOURS: 'hours',
-  AREA: 'area',
-  BOOKING: 'booking',
-  VOICEMAIL: 'voicemail',
-  NONE: 'none',
+// Twilio REST (for SMS)
+const TWILIO = {
+  sid: process.env.TWILIO_ACCOUNT_SID || "",
+  token: process.env.TWILIO_AUTH_TOKEN || "",
+  from: process.env.TWILIO_FROM || "",
+  mss: process.env.TWILIO_MESSAGING_SERVICE_SID || "",
 };
-
-function detectLanguage(text) {
-  // Naive language hint for EN/ES, just for templates
-  // If text contains common Spanish words -> 'es' else 'en'
-  const esHints = /(horario|hora|abren|cierran|área|zona|servicio|cita|reservar|agendar|correo|mensaje|buzón|grabar|español)/i;
-  return esHints.test(text) ? 'es' : 'en';
+if ((TWILIO.sid && TWILIO.token) && (!TWILIO.from && !TWILIO.mss)) {
+  console.error("❌ Provide TWILIO_FROM or TWILIO_MESSAGING_SERVICE_SID");
 }
 
-function routeIntent(text) {
-  const t = text.toLowerCase();
-  if (/(hour|open|close|when|schedule|time|horario|abren|cierran)/.test(t)) return INTENTS.HOURS;
-  if (/(service area|areas? served|where|cover|zona|área|barrios|vecindarios|servís)/.test(t)) return INTENTS.AREA;
-  if (/(book|appointment|quote|estimate|schedule|reserve|reservar|agendar|cita)/.test(t)) return INTENTS.BOOKING;
-  if (/(voicemail|leave a message|call back|mensaje|buzón|dejar recado)/.test(t)) return INTENTS.VOICEMAIL;
-  return INTENTS.NONE;
-}
+// Optional webhooks
+const BOOKING_WEBHOOK = process.env.BOOKING_WEBHOOK || "";
+const VOICEMAIL_WEBHOOK = process.env.VOICEMAIL_WEBHOOK || "";
 
-function buildReply(intent, lang = 'en') {
-  const L = (en, es) => (lang === 'es' ? es : en);
-  switch (intent) {
-    case INTENTS.HOURS:
-      return L(
-        `${BIZ.name} hours: ${BIZ.hours}. I just texted you the details as well.`,
-        `Horario de ${BIZ.name}: ${BIZ.hours}. También te envié un SMS con los detalles.`
-      );
-    case INTENTS.AREA:
-      return L(
-        `${BIZ.name} serves ${BIZ.area}. I texted you more info.`,
-        `${BIZ.name} atiende ${BIZ.area}. Te envié más información por SMS.`
-      );
-    case INTENTS.BOOKING:
-      return L(
-        `To book, tap the link I texted you: ${BIZ.bookingUrl}. I can also take your info and log a request for a callback.`,
-        `Para reservar, abre el enlace que te envié por SMS: ${BIZ.bookingUrl}. También puedo tomar tus datos y solicitar que te llamemos.`
-      );
-    case INTENTS.VOICEMAIL:
-      return L(
-        `Okay, I\'ll capture your message now. Please say your name, address, and request.`,
-        `De acuerdo, voy a grabar tu mensaje ahora. Por favor di tu nombre, dirección y solicitud.`
-      );
-    default:
-      return L(
-        `I\'m listening. Ask about hours, service area, booking, or leave a message.`,
-        `Te escucho. Pregunta por horario, zona de servicio, reservar, o deja un mensaje.`
-      );
-  }
-}
+// Media format
+const SAMPLE_RATE = 8000;
+const BYTES_PER_SAMPLE = 2;
+const FRAME_MS = 20;
+const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS; // 160
+const BYTES_PER_FRAME = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE; // 320
 
-// Simple slot capture (very naive)
-const leadStateByCall = new Map(); // callSid -> { intent, transcript, voicemailActive, slots, phone }
+// STT batching
+const STT_SLICE_MS = 3000;
+const STT_MIN_BYTES = Math.floor(
+  (SAMPLE_RATE * BYTES_PER_SAMPLE * STT_SLICE_MS) / 1000
+);
 
-function upsertLeadState(callSid, patch) {
-  const prev = leadStateByCall.get(callSid) || { intent: INTENTS.NONE, transcript: '', voicemailActive: false, slots: {}, phone: '' };
-  const next = { ...prev, ...patch };
-  leadStateByCall.set(callSid, next);
-  return next;
-}
-
-async function persistLead(callSid) {
-  const state = leadStateByCall.get(callSid);
-  if (!state) return;
-  const { intent, transcript, slots, phone } = state;
-  try {
-    const { data, error } = await supabase
-      .from('leads')
-      .insert([{ created_at: nowISO(), call_sid: callSid, phone, intent, transcript, slots }])
-      .select();
-    if (error) throw error;
-    console.log('[SUPABASE] lead inserted', data?.[0]?.id);
-  } catch (e) {
-    console.error('[SUPABASE] insert lead failed', e);
-  }
-}
-
-async function persistVoicemail(callSid) {
-  const state = leadStateByCall.get(callSid);
-  if (!state) return;
-  const { transcript, phone } = state;
-  try {
-    const { data, error } = await supabase
-      .from('voicemails')
-      .insert([{ created_at: nowISO(), call_sid: callSid, phone, transcript_text: transcript }])
-      .select();
-    if (error) throw error;
-    console.log('[SUPABASE] voicemail inserted', data?.[0]?.id);
-  } catch (e) {
-    console.error('[SUPABASE] insert voicemail failed', e);
-  }
-}
+// Keepalive
+const KEEPALIVE_EVERY_MS = 4000;
+const KEEPALIVE_FRAMES = 200;
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Twilio Voice Webhook → returns TwiML that starts the Media Stream
+// HELPERS
 // ───────────────────────────────────────────────────────────────────────────────
-app.post('/voice', (req, res) => {
-  // Optional: verify signature for extra security
-  try {
-    if (!verifyTwilioSignature(req)) {
-      console.warn('[SECURITY] Twilio signature verification failed');
-      // You can choose to reject here. For dev, we allow.
+
+function alignToSample(pcm) {
+  const rem = pcm.length % BYTES_PER_SAMPLE;
+  if (rem === 0) return pcm;
+  return Buffer.concat([pcm, Buffer.alloc(BYTES_PER_SAMPLE - rem)]);
+}
+
+async function streamPcmToTwilio(ws, pcmBuffer) {
+  let offset = 0;
+  let frames = 0;
+
+  while (offset < pcmBuffer.length && ws.readyState === ws.OPEN) {
+    const end = Math.min(offset + BYTES_PER_FRAME, pcmBuffer.length);
+    const frame = pcmBuffer.slice(offset, end);
+    const payload =
+      frame.length === BYTES_PER_FRAME
+        ? frame.toString("base64")
+        : Buffer.concat([frame, Buffer.alloc(BYTES_PER_FRAME - frame.length)]).toString("base64");
+
+    ws.send(JSON.stringify({ event: "media", media: { payload } }));
+
+    frames++;
+    if (frames % 100 === 0) {
+      console.log(`[TTS] sent ${frames} frames (~${(frames * FRAME_MS) / 1000}s)`);
     }
-  } catch (e) {
-    console.warn('[SECURITY] Verification error:', e.message);
+    await new Promise((r) => setTimeout(r, FRAME_MS));
+    offset += BYTES_PER_FRAME;
+  }
+}
+
+function sendSilenceFrames(ws, n = KEEPALIVE_FRAMES) {
+  const silence = Buffer.alloc(BYTES_PER_FRAME);
+  const payload = silence.toString("base64");
+  for (let i = 0; i < n && ws.readyState === ws.OPEN; i++) {
+    ws.send(JSON.stringify({ event: "media", media: { payload } }));
+  }
+}
+
+function pcmToWav(pcm, sampleRate = SAMPLE_RATE) {
+  const numChannels = 1;
+  const byteRate = sampleRate * numChannels * BYTES_PER_SAMPLE;
+  const blockAlign = numChannels * BYTES_PER_SAMPLE;
+  const subchunk2Size = pcm.length;
+
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + subchunk2Size, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(subchunk2Size, 40);
+
+  return Buffer.concat([header, pcm]);
+}
+
+async function ttsElevenLabsPcm8k(text) {
+  const res = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVEN_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/pcm",
+      },
+      body: JSON.stringify({
+        text,
+        voice_settings: { stability: 0.4, similarity_boost: 0.7 },
+        output_format: "pcm_8000",
+      }),
+    }
+  );
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`ElevenLabs TTS failed: ${res.status} ${res.statusText} ${body}`);
   }
 
-  const from = req.body.From || '';
-  const callSid = req.body.CallSid || crypto.randomUUID();
+  const pcm = Buffer.from(await res.arrayBuffer());
+  return alignToSample(pcm);
+}
 
-  const greeting = `Thanks for calling ${BIZ.name}. I\'m your AI assistant. I\'ll listen and text you helpful links while we talk.`;
+async function transcribeWithWhisper(pcmSlice) {
+  const wav = pcmToWav(alignToSample(pcmSlice));
+  const form = new FormData();
+  form.append("model", "whisper-1");
+  form.append("file", new Blob([wav], { type: "audio/wav" }), "chunk.wav");
 
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Polly.Joanna">${greeting}</Say>
-  <Start>
-    <Stream url="wss://${new URL(PUBLIC_BASE_URL).host}/media" track="inbound_track" />
-  </Start>
-  <Pause length="60"/>
-  <Say>Goodbye.</Say>
-</Response>`;
+  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: form,
+  });
 
-  // Prime state
-  upsertLeadState(callSid, { phone: from });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Whisper STT failed: ${res.status} ${res.statusText} ${body}`);
+  }
 
-  res.type('text/xml').send(twiml);
-});
+  const json = await res.json();
+  return (json.text || "").trim();
+}
 
-// Health
-app.get('/', (_req, res) => {
-  res.send('OK - AI Agent server');
+// Phone parser / normalizer
+function extractPhone(text) {
+  if (!text) return null;
+  const m = text.replace(/[^\d+]/g, " ").match(/(\+?\d[\d\s\-().]{6,}\d)/);
+  if (!m) return null;
+  const digits = m[1].replace(/[^\d+]/g, "");
+  // Very naive; you can enhance with libphonenumber if you want
+  if (digits.length < 7) return null;
+  return digits.startsWith("+") ? digits : `+1${digits.replace(/^1/, "")}`;
+}
+
+// POST helper
+async function postJson(url, payload) {
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) console.error(`Webhook ${url} failed: ${res.status}`);
+  } catch (e) {
+    console.error(`Webhook ${url} error:`, e.message);
+  }
+}
+
+// Twilio SMS via REST API (no twilio sdk needed)
+async function sendSms({ to, body }) {
+  if (!TWILIO.sid || !TWILIO.token) {
+    console.warn("SMS skipped: Twilio credentials missing");
+    return false;
+  }
+  if (!to) {
+    console.warn("SMS skipped: missing destination phone");
+    return false;
+  }
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO.sid}/Messages.json`;
+
+  const form = new URLSearchParams();
+  form.append("To", to);
+  if (TWILIO.mss) form.append("MessagingServiceSid", TWILIO.mss);
+  else form.append("From", TWILIO.from);
+  form.append("Body", body);
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: "Basic " + Buffer.from(`${TWILIO.sid}:${TWILIO.token}`).toString("base64"),
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: form.toString(),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    console.error("Twilio SMS error:", res.status, res.statusText, txt);
+    return false;
+  }
+  return true;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Intent Router + Flows (booking + voicemail)
+// ───────────────────────────────────────────────────────────────────────────────
+
+function routeIntent(text, ctx) {
+  const t = text.toLowerCase();
+
+  // greetings
+  if (/^(hi|hello|hey)\b/.test(t)) {
+    return `Hi! This is ${BIZ.name}. How can I help you today?`;
+  }
+
+  // hours
+  if (/(hour|open|close|time|until|when.*open|when.*close)/.test(t)) {
+    return `${BIZ.name} is open ${BIZ.hours}.`;
+  }
+
+  // service area
+  if (/(service|serve|area|where|locations?)/.test(t)) {
+    return `We service ${BIZ.area}.`;
+  }
+
+  // booking intent
+  if (/(book|appointment|schedule|estimate|quote)/.test(t)) {
+    ctx.mode = "booking";
+    if (BIZ.apptUrl) {
+      if (ctx.callerPhone) ctx.actions.queueSms = { type: "booking-link" };
+      return ctx.callerPhone
+        ? `Great, I’ll text you our booking link now. If you prefer, tell me a preferred day/time and I’ll note it.`
+        : `Happy to help. What phone number can I text our booking link to?`;
+    }
+    return `Absolutely. Tell me your preferred day/time and your callback number, and I’ll note it for a callback.`;
+  }
+
+  // voicemail intent
+  if (/(voicemail|leave.*message|call.*back|take.*message)/.test(t)) {
+    ctx.mode = "voicemail";
+    return `I can take a message. What's your name, a callback number, and a brief description?`;
+  }
+
+  // mode handlers
+  if (ctx.mode === "booking") {
+    // capture phone if present
+    const phone = extractPhone(text);
+    if (phone) {
+      ctx.callerPhone = phone;
+      if (BIZ.apptUrl) ctx.actions.queueSms = { type: "booking-link" };
+      return `Thanks! I’ve got ${phone}. I’ll text the booking link now. Anything else I can help with?`;
+    }
+    // collect note/time (we just treat as note here)
+    if (text.length > 6) {
+      ctx.booking.note = (ctx.booking.note || "") + " " + text;
+      return `Noted. If you want the link by text, please share the best number.`;
+    }
+  }
+
+  if (ctx.mode === "voicemail") {
+    // accumulate voicemail fields
+    const phone = extractPhone(text);
+    if (phone) ctx.voicemail.phone = phone;
+
+    // naive name heuristic
+    if (!ctx.voicemail.name && /\b(i'?m|this is|my name is)\b/i.test(text)) {
+      const m = text.match(/\b(?:i'?m|this is|my name is)\s+([\w\-'. ]{2,})/i);
+      if (m) ctx.voicemail.name = m[1].trim();
+    }
+
+    // append message
+    ctx.voicemail.message = (ctx.voicemail.message || "") + " " + text;
+
+    // when we have phone + at least some message, submit
+    if (ctx.voicemail.phone && (ctx.voicemail.message || "").length > 20) {
+      ctx.actions.submitVoicemail = true;
+      return `Thanks—I've recorded your message and contact number. We’ll follow up shortly. Anything else I can help with?`;
+    }
+
+    // keep collecting
+    if (!ctx.voicemail.phone) return `Got it. What’s the best callback number?`;
+    return `Thanks—anything else you’d like to add? Say “that’s it” when you’re done.`;
+  }
+
+  // fallback
+  return `Got it. Would you like our hours, service area, or to book an appointment?`;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// WebSocket server (Twilio <Connect><Stream> → wss://.../stream)
+// ───────────────────────────────────────────────────────────────────────────────
+const wss = new WebSocketServer({ noServer: true });
+
+wss.on("connection", (ws) => {
+  console.log("🔗 WebSocket connected");
+
+  const ctx = {
+    callSid: null,
+    streamSid: null,
+
+    rxBytes: 0,
+    rxBuffer: Buffer.alloc(0),
+    sttBusy: false,
+
+    lastTtsAt: 0,
+
+    mode: "idle", // idle | booking | voicemail
+    callerPhone: null,
+
+    booking: { note: "" },
+    voicemail: { name: "", phone: "", message: "" },
+
+    actions: {
+      queueSms: null,        // { type: 'booking-link' }
+      submitVoicemail: false // bool
+    },
+  };
+
+  const keepalive = setInterval(() => {
+    const idle = Date.now() - ctx.lastTtsAt > KEEPALIVE_EVERY_MS - 200;
+    if (idle && ws.readyState === ws.OPEN) {
+      sendSilenceFrames(ws, KEEPALIVE_FRAMES);
+    }
+  }, KEEPALIVE_EVERY_MS);
+
+  async function speak(text) {
+    const pcm = await ttsElevenLabsPcm8k(text);
+    ctx.lastTtsAt = Date.now();
+    await streamPcmToTwilio(ws, pcm);
+  }
+
+  async function afterTurnSideEffects() {
+    // Booking link SMS
+    if (ctx.actions.queueSms?.type === "booking-link") {
+      ctx.actions.queueSms = null;
+      if (BIZ.apptUrl && ctx.callerPhone) {
+        await sendSms({
+          to: ctx.callerPhone,
+          body: `Hi from ${BIZ.name}! Book here: ${BIZ.apptUrl}`,
+        });
+        if (BOOKING_WEBHOOK) {
+          await postJson(BOOKING_WEBHOOK, {
+            callSid: ctx.callSid,
+            phone: ctx.callerPhone,
+            note: ctx.booking.note?.trim() || "",
+            link: BIZ.apptUrl,
+            ts: new Date().toISOString(),
+          });
+        }
+      }
+    }
+
+    // Voicemail submission
+    if (ctx.actions.submitVoicemail) {
+      ctx.actions.submitVoicemail = false;
+      const payload = {
+        callSid: ctx.callSid,
+        name: ctx.voicemail.name || "",
+        phone: ctx.voicemail.phone || ctx.callerPhone || "",
+        message: (ctx.voicemail.message || "").trim(),
+        ts: new Date().toISOString(),
+      };
+      if (VOICEMAIL_WEBHOOK) {
+        await postJson(VOICEMAIL_WEBHOOK, payload);
+      }
+      // confirmation SMS if we have a phone
+      const to = payload.phone || ctx.callerPhone;
+      if (to) {
+        await sendSms({
+          to,
+          body: `Thanks for your message to ${BIZ.name}. We’ll be in touch soon.`,
+        });
+      }
+      // reset voicemail context for safety
+      ctx.mode = "idle";
+      ctx.voicemail = { name: "", phone: "", message: "" };
+    }
+  }
+
+  ws.on("message", async (data) => {
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch {
+      return;
+    }
+
+    if (msg.event === "connected") {
+      console.log(
+        `[WS] event: { event: 'connected', protocol: '${msg.protocol}', version: '${msg.version}' }`
+      );
+      return;
+    }
+
+    if (msg.event === "start") {
+      ctx.callSid = msg.start?.callSid || null;
+      ctx.streamSid = msg.start?.streamSid || null;
+      console.log(
+        `[WS] START callSid=${ctx.callSid} streamSid=${ctx.streamSid} bidi=${msg.start?.bidirectional}`
+      );
+
+      // greet
+      try {
+        await speak(`Hi! I'm your AI receptionist at ${BIZ.name}. How can I help you today?`);
+      } catch (e) {
+        console.error("[TTS] greeting failed:", e.message);
+      }
+      return;
+    }
+
+    if (msg.event === "media") {
+      const chunk = Buffer.from(msg.media.payload, "base64");
+      ctx.rxBytes += chunk.length;
+      ctx.rxBuffer = Buffer.concat([ctx.rxBuffer, chunk]);
+
+      if (!ctx.sttBusy && ctx.rxBuffer.length >= STT_MIN_BYTES) {
+        ctx.sttBusy = true;
+        const slice = ctx.rxBuffer.subarray(0, STT_MIN_BYTES);
+        ctx.rxBuffer = ctx.rxBuffer.subarray(STT_MIN_BYTES);
+
+        (async () => {
+          try {
+            const text = await transcribeWithWhisper(slice);
+            if (text) {
+              console.log(`[STT] "${text}"`);
+
+              // opportunistically capture a phone number anytime it appears
+              const maybe = extractPhone(text);
+              if (maybe) ctx.callerPhone = ctx.callerPhone || maybe;
+
+              const reply = routeIntent(text, ctx);
+              await speak(reply);
+              await afterTurnSideEffects();
+            }
+          } catch (err) {
+            console.error("[STT] error:", err.message);
+          } finally {
+            ctx.sttBusy = false;
+          }
+        })().catch(() => {});
+      }
+      return;
+    }
+
+    if (msg.event === "stop") {
+      console.log(`[WS] STOP (total inbound bytes: ${ctx.rxBytes})`);
+      // best-effort flush
+      if (!ctx.sttBusy && ctx.rxBuffer.length >= 1600) {
+        ctx.sttBusy = true;
+        (async () => {
+          try {
+            const text = await transcribeWithWhisper(ctx.rxBuffer);
+            if (text) console.log(`[STT][final] "${text}"`);
+          } catch {}
+          finally { ctx.sttBusy = false; }
+        })();
+      }
+      return;
+    }
+  });
+
+  ws.on("close", () => {
+    clearInterval(keepalive);
+    console.log("[WS] CLOSE code=1005 reason=");
+  });
+
+  ws.on("error", (err) => {
+    clearInterval(keepalive);
+    console.error("[WS] error", err);
+  });
 });
 
 // ───────────────────────────────────────────────────────────────────────────────
-// WebSocket: /media (Twilio → our server) → Deepgram Realtime bridge
+// HTTP + WS upgrade
 // ───────────────────────────────────────────────────────────────────────────────
 const server = app.listen(PORT, () => {
-  console.log(`[BOOT] Server listening on :${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
 
-const wss = new WebSocketServer({ server, path: '/media' });
-
-wss.on('connection', async (ws, req) => {
-  console.log('[WS] Twilio connected to /media');
-
-  // Create Deepgram realtime connection
-  const dgUrl = 'wss://api.deepgram.com/v1/listen?model=nova-2-general&encoding=mulaw&sample_rate=8000&endpointing=true&vad_turnoff=1000&multichannel=false&punctuate=true&smart_format=true&language=en-US&detect_language=true';
-  const dg = new WebSocket(dgUrl, {
-    headers: { Authorization: `Token ${process.env.DEEPGRAM_API_KEY}` },
-  });
-
-  let callSid = '';
-  let caller = '';
-  let channelReady = false;
-
-  dg.on('open', () => {
-    channelReady = true;
-    console.log('[DG] realtime opened');
-  });
-
-  dg.on('message', async (msg) => {
-    try {
-      const data = JSON.parse(msg.toString());
-      // Deepgram sends transcripts in channel.alternatives
-      const transcript = data?.channel?.alternatives?.[0]?.transcript || '';
-      if (!transcript) return;
-
-      // Accumulate transcript
-      if (callSid) {
-        const lang = detectLanguage(transcript);
-        const intent = routeIntent(transcript);
-        const state = upsertLeadState(callSid, {
-          transcript: (leadStateByCall.get(callSid)?.transcript || '') + ' ' + transcript,
-          intent: intent !== INTENTS.NONE ? intent : (leadStateByCall.get(callSid)?.intent || INTENTS.NONE),
-        });
-
-        // If we just found a decisive intent, act once
-        if (!state._acted && intent !== INTENTS.NONE) {
-          state._acted = true; // mark acted to avoid spamming
-
-          // Compose response + SMS
-          const reply = buildReply(intent, lang);
-          if (caller) {
-            try {
-              await sms(caller, reply);
-              // Bonus: tailored links
-              if (intent === INTENTS.BOOKING) {
-                await sms(caller, `Book here: ${BIZ.bookingUrl}`);
-              }
-            } catch (e) {
-              console.error('[SMS] send failed', e);
-            }
-          }
-
-          // Persist early lead
-          if (intent === INTENTS.BOOKING) {
-            await persistLead(callSid);
-          }
-
-          // Start voicemail capture mode (transcript-only) if requested
-          if (intent === INTENTS.VOICEMAIL) {
-            upsertLeadState(callSid, { voicemailActive: true });
-            if (caller) await sms(caller, 'Beep! I\'m recording your message (transcript). Say your name, address, and request.');
-          }
-        }
-
-        // If voicemail mode, keep accumulating; on long pause, persist
-        if (leadStateByCall.get(callSid)?.voicemailActive) {
-          const current = leadStateByCall.get(callSid)?.transcript || '';
-          if (current.length > 300) {
-            await persistVoicemail(callSid);
-            upsertLeadState(callSid, { voicemailActive: false });
-            if (caller) await sms(caller, 'Got it! Your message has been recorded. We\'ll call you back soon.');
-          }
-        }
-      }
-    } catch (e) {
-      // Deepgram will also send keepalives and metadata; ignore parsing errors gently
-    }
-  });
-
-  dg.on('close', () => console.log('[DG] realtime closed'));
-  dg.on('error', (e) => console.error('[DG] error', e));
-
-  ws.on('message', async (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString());
-      if (msg.event === 'start') {
-        callSid = msg.start.callSid;
-        caller = msg.start.from || '';
-        console.log('[WS] start', { callSid, from: caller });
-      }
-      if (msg.event === 'media') {
-        // Media payload is base64 μ-law @8kHz
-        // Forward to Deepgram when ready
-        if (channelReady) {
-          dg.send(JSON.stringify({ type: 'Binary', audio: msg.media.payload }));
-        }
-      }
-      if (msg.event === 'stop') {
-        console.log('[WS] stop', { callSid });
-        try {
-          await persistLead(callSid);
-          if (leadStateByCall.get(callSid)?.voicemailActive) {
-            await persistVoicemail(callSid);
-          }
-        } catch (_) {}
-        dg.close();
-        ws.close();
-      }
-    } catch (e) {
-      console.error('[WS] parse error', e);
-    }
-  });
-
-  ws.on('close', () => {
-    console.log('[WS] Twilio closed');
-    try { dg.close(); } catch (_) {}
-  });
-
-  ws.on('error', (e) => {
-    console.error('[WS] error', e);
-    try { dg.close(); } catch (_) {}
+server.on("upgrade", (req, socket, head) => {
+  if (req.url !== "/stream") {
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
   });
 });
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Minimal schema helper (optional):
-// Create the following tables in Supabase SQL editor:
-//
-// create table if not exists public.leads (
-//   id bigint generated by default as identity primary key,
-//   created_at timestamptz default now(),
-//   call_sid text,
-//   phone text,
-//   intent text,
-//   transcript text,
-//   slots jsonb
-// );
-//
-// create table if not exists public.voicemails (
-//   id bigint generated by default as identity primary key,
-//   created_at timestamptz default now(),
-//   call_sid text,
-//   phone text,
-//   transcript_text text
-// );
-//
-// Make sure your Service Role key is used only on the server.
-// ───────────────────────────────────────────────────────────────────────────────
+app.get("/", (_req, res) => res.status(200).send("OK"));
