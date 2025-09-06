@@ -1,6 +1,6 @@
 import express from "express";
 import fetch from "node-fetch";
-import { WebSocketServer } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 import { spawn } from "child_process";
 import ffmpegBin from "@ffmpeg-installer/ffmpeg";
 
@@ -180,8 +180,8 @@ async function speak(ws, text, state) {
 function connectDeepgram(state) {
   const url =
     "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&punctuate=true&smart_format=true&interim_results=false";
-  const dg = new (require("ws"))(url, {
-    headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` },
+  const dg = new WebSocket(url, {
+  headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` },
   });
 
   dg.on("open", () => {
