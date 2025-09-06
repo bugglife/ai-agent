@@ -1,336 +1,212 @@
-// server.js — robust TTS: handle u-law, PCM, WAV, MP3 → always stream 8k μ-law to Twilio
-
 import express from "express";
 import fetch from "node-fetch";
 import { WebSocketServer } from "ws";
+import prism from "prism-media";
+import ffbin from "@ffmpeg-installer/ffmpeg";
 
-let lamejs = null;
-try {
-  // optional import; we only load when needed
-  lamejs = await import("lamejs");
-} catch (e) {
-  // fine if not present; we’ll warn only if we actually need MP3 decode
-}
-
+// ───────────────────────────────────────────────────────────────────────────────
+// Config
+// ───────────────────────────────────────────────────────────────────────────────
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY || "";
-const ELEVEN_VOICE_ID =
-  process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL";
-const GREETING_TEXT =
-  process.env.GREETING_TEXT ||
-  "Hi! I'm your AI receptionist at Clean Easy. How can I help you today?";
-const ENABLE_BEEP = (process.env.ENABLE_BEEP || "true").toLowerCase() !== "false";
+const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL";
 
-// Twilio framing: 8k μ-law, 20 ms, 160 bytes
+if (!ELEVEN_API_KEY) console.error("❌ ELEVEN_API_KEY is not set");
+if (!ELEVEN_VOICE_ID) console.error("❌ ELEVEN_VOICE_ID is not set");
+
+// Twilio expects 8kHz, 16-bit PCM mono; 20ms = 160 samples = 320 bytes
 const SAMPLE_RATE = 8000;
+const BYTES_PER_SAMPLE = 2; // 16-bit PCM
 const FRAME_MS = 20;
-const ULAW_BYTES_PER_FRAME = 160;
+const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS; // 160
+const BYTES_PER_FRAME = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE; // 320
 
-// ---------------- Beep (PCM16) → μ-law ----------------
-function makeBeepPcm16(durationMs = 250, freqHz = 1000) {
-  const total = Math.floor((SAMPLE_RATE * durationMs) / 1000);
-  const buf = Buffer.alloc(total * 2);
-  const amp = 0.22 * 32767;
-  for (let i = 0; i < total; i++) {
-    const t = i / SAMPLE_RATE;
-    buf.writeInt16LE(Math.round(amp * Math.sin(2 * Math.PI * freqHz * t)), i * 2);
-  }
-  return buf;
-}
+// ───────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ───────────────────────────────────────────────────────────────────────────────
 
-function ensureLittleEndianPCM16(raw) {
-  const len = raw.length - (raw.length % 2);
-  if (len <= 0) return raw;
-  const sampleN = Math.min(4000, len);
-  let leE = 0, beE = 0;
-  for (let i = 0; i < sampleN; i += 2) {
-    leE += Math.abs(raw.readInt16LE(i));
-    beE += Math.abs(raw.readInt16BE(i));
-  }
-  if (beE > leE * 1.8) {
-    const swapped = Buffer.alloc(len);
-    for (let i = 0; i < len; i += 2) {
-      swapped[i] = raw[i + 1];
-      swapped[i + 1] = raw[i];
+// Send a 0.2s 1kHz beep (3200 bytes total). Sounds crisp and short.
+function sendShortBeep(ws) {
+  const frames = Math.round((0.2 * 1000) / FRAME_MS); // 10 frames
+  const payloads = [];
+  for (let i = 0; i < frames; i++) {
+    const buf = Buffer.alloc(BYTES_PER_FRAME);
+    // simple 1kHz sine @ 8kHz
+    for (let s = 0; s < SAMPLES_PER_FRAME; s++) {
+      const t = (i * SAMPLES_PER_FRAME + s) / SAMPLE_RATE;
+      const sample = Math.sin(2 * Math.PI * 1000 * t) * 0.25; // 25% amplitude
+      buf.writeInt16LE(Math.max(-1, Math.min(1, sample)) * 32767, s * 2);
     }
-    console.log("[PCM] swapped BE→LE");
-    if (raw.length !== len) return Buffer.concat([swapped, Buffer.from([raw[len]])]);
-    return swapped;
+    payloads.push(buf.toString("base64"));
   }
-  return raw;
+  for (const pl of payloads) {
+    ws.send(JSON.stringify({ event: "media", media: { payload: pl } }));
+  }
+  console.log("[BEEP] done.");
 }
 
-// PCM16LE → μ-law (G.711)
-function pcm16ToMulaw(pcm16) {
-  const out = Buffer.alloc(Math.floor(pcm16.length / 2));
-  for (let i = 0, o = 0; i < pcm16.length - 1; i += 2, o++) {
-    let s = pcm16.readInt16LE(i);
-    let sign = (s >> 8) & 0x80;
-    if (sign) s = -s;
-    if (s > 0x1FFF) s = 0x1FFF;
-    s += 0x84;
-    let exp = 7;
-    for (let m = 0x4000; (s & m) === 0 && exp > 0; exp--, m >>= 1) {}
-    const mant = (s >> ((exp === 0) ? 4 : (exp + 3))) & 0x0F;
-    out[o] = ~(sign | (exp << 4) | mant) & 0xFF;
-  }
-  return out;
+// Frame a raw PCM stream (s16le 8k mono) into 20ms packets to Twilio.
+async function streamPcmFrames(ws, readable, label = "TTS") {
+  return new Promise((resolve, reject) => {
+    let carry = Buffer.alloc(0);
+    let sent = 0;
+
+    readable.on("data", (chunk) => {
+      carry = Buffer.concat([carry, chunk]);
+      while (carry.length >= BYTES_PER_FRAME) {
+        const frame = carry.subarray(0, BYTES_PER_FRAME);
+        carry = carry.subarray(BYTES_PER_FRAME);
+        ws.send(JSON.stringify({ event: "media", media: { payload: frame.toString("base64") } }));
+        sent++;
+        if (sent % 100 === 0) {
+          console.log(`[${label}] sent ${sent} frames (~${(sent * FRAME_MS) / 1000}s)`);
+        }
+      }
+    });
+
+    readable.on("end", () => {
+      // pad tail (avoid odd leftover that can click)
+      if (carry.length > 0) {
+        const pad = Buffer.alloc(BYTES_PER_FRAME);
+        carry.copy(pad);
+        ws.send(JSON.stringify({ event: "media", media: { payload: pad.toString("base64") } }));
+        sent++;
+      }
+      console.log(`[${label}] greeting done.`);
+      resolve();
+    });
+
+    readable.on("error", (e) => {
+      reject(e);
+    });
+  });
 }
 
-// simple average downsampler 16k → 8k (telephony-ok)
-function downsample16kTo8k(pcm16_16k) {
-  const out = Buffer.alloc(Math.floor(pcm16_16k.length / 4) * 2);
-  let oi = 0;
-  for (let i = 0; i + 4 <= pcm16_16k.length; i += 4) {
-    const s1 = pcm16_16k.readInt16LE(i);
-    const s2 = pcm16_16k.readInt16LE(i + 2);
-    const avg = (s1 + s2) >> 1;
-    out.writeInt16LE(avg, oi);
-    oi += 2;
-  }
-  return out;
-}
-
-async function streamMulawFrames(ws, streamSid, mulaw, tag = "OUT") {
-  let off = 0, frames = 0;
-  while (off < mulaw.length) {
-    const end = Math.min(off + ULAW_BYTES_PER_FRAME, mulaw.length);
-    let frame = mulaw.slice(off, end);
-    if (frame.length < ULAW_BYTES_PER_FRAME) {
-      const pad = Buffer.alloc(ULAW_BYTES_PER_FRAME, 0xFF);
-      frame.copy(pad, 0);
-      frame = pad;
-    }
-    ws.send(JSON.stringify({
-      event: "media",
-      streamSid,
-      media: { payload: frame.toString("base64") },
-    }));
-    frames++;
-    if (frames % 100 === 0) console.log(`[${tag}] sent ${frames} frames`);
-    await new Promise(r => setTimeout(r, FRAME_MS));
-    off += ULAW_BYTES_PER_FRAME;
-  }
-  console.log(`[${tag}] done`);
-}
-
-// ---------------- WAV parser (PCM16 mono) ----------------
-function parseWavToPcm16(buf) {
-  // minimal RIFF/WAVE parser
-  if (buf.slice(0, 4).toString("ascii") !== "RIFF" || buf.slice(8, 12).toString("ascii") !== "WAVE")
-    throw new Error("Not a RIFF/WAVE file");
-  let pos = 12;
-  let fmt = null, dataPos = -1, dataLen = 0;
-  while (pos + 8 <= buf.length) {
-    const id = buf.slice(pos, pos + 4).toString("ascii");
-    const size = buf.readUInt32LE(pos + 4);
-    pos += 8;
-    if (id === "fmt ") {
-      fmt = {
-        audioFormat: buf.readUInt16LE(pos),
-        numChannels: buf.readUInt16LE(pos + 2),
-        sampleRate: buf.readUInt32LE(pos + 4),
-        byteRate: buf.readUInt32LE(pos + 8),
-        blockAlign: buf.readUInt16LE(pos + 12),
-        bitsPerSample: buf.readUInt16LE(pos + 14),
-      };
-    } else if (id === "data") {
-      dataPos = pos;
-      dataLen = size;
-    }
-    pos += size;
-  }
-  if (!fmt || dataPos < 0) throw new Error("Invalid WAV (missing fmt/data)");
-  if (fmt.audioFormat !== 1) throw new Error("WAV not PCM");
-  if (fmt.numChannels !== 1) throw new Error("WAV must be mono");
-  if (fmt.bitsPerSample !== 16) throw new Error("WAV must be 16-bit");
-  const pcm = buf.slice(dataPos, dataPos + dataLen);
-  return { pcm16: pcm, rate: fmt.sampleRate };
-}
-
-// ---------------- MP3 decode (lamejs) ----------------
-function decodeMp3ToPcm16LE(mp3Buf) {
-  if (!lamejs) throw new Error("MP3 decoder not available (install lamejs)");
-  const { Mp3Decoder } = lamejs.default || lamejs;
-  const dec = new Mp3Decoder();
-  const samples = dec.decode(mp3Buf);
-  // samples is Float32Array (mono) in most builds; convert to PCM16LE
-  const f32 = Array.isArray(samples) ? samples[0] : samples; // ensure mono
-  const pcm = Buffer.alloc(f32.length * 2);
-  for (let i = 0; i < f32.length; i++) {
-    let s = Math.max(-1, Math.min(1, f32[i]));
-    pcm.writeInt16LE((s * 32767) | 0, i * 2);
-  }
-  return { pcm16: pcm, rate: 44100 }; // lamejs often outputs 44.1k
-}
-
-// ---------------- ElevenLabs fetchers ----------------
-async function elCall(output_format, acceptHeader, text) {
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
+// Request ElevenLabs; prefer raw PCM. If we get MP3/container, use FFmpeg.
+async function elevenLabsAsPcmReadable(text) {
+  // 1) Try asking for PCM directly via query param (works on ElevenLabs)
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}?output_format=pcm_8000`;
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "xi-api-key": ELEVEN_API_KEY,
       "Content-Type": "application/json",
-      Accept: acceptHeader,
+      Accept: "*/*"
     },
     body: JSON.stringify({
       text,
-      voice_settings: { stability: 0.4, similarity_boost: 0.7 },
-      output_format,
-    }),
+      voice_settings: { stability: 0.4, similarity_boost: 0.7 }
+    })
   });
-  const ct = res.headers.get("content-type") || "";
-  const buf = Buffer.from(await res.arrayBuffer());
-  return { ok: res.ok, status: res.status, statusText: res.statusText, ct, buf };
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`[TTS] ElevenLabs error ${res.status} ${res.statusText} ${t}`);
+  }
+
+  const ct = (res.headers.get("content-type") || "").toLowerCase();
+  // If Eleven sent raw PCM or octet-stream, just use the body stream.
+  if (ct.includes("audio/pcm") || ct.includes("application/octet-stream")) {
+    console.log(`[TTS] streaming as pcm (ct=${ct || "unknown"}) …`);
+    return res.body; // Readable stream of raw PCM (s16le 8k mono)
+  }
+
+  // MP3 or other container → FFmpeg transcode to raw s16le 8k mono.
+  console.warn(`[TTS] ${ct.includes("audio/mpeg") ? "MP3" : "container"} detected (ct=${ct}); transcoding…`);
+  const ff = new prism.FFmpeg({
+    args: [
+      "-hide_banner",
+      "-loglevel", "error",
+      "-i", "pipe:0",     // input from stdin
+      "-ac", "1",
+      "-ar", String(SAMPLE_RATE),
+      "-f", "s16le",
+      "pipe:1"            // output raw PCM
+    ],
+    shell: false,
+    ffmpegPath: ffbin.path
+  });
+
+  res.body.pipe(ff);
+  return ff;
 }
 
-function magicStr(buf) {
-  const m = buf.slice(0, 4).toString("ascii");
-  if (m === "RIFF") return "RIFF";
-  if (m.startsWith("ID3")) return "ID3";
-  if (m === "OggS") return "OggS";
-  return m;
-}
-
-async function elevenToMulaw(text) {
-  if (!ELEVEN_API_KEY) throw new Error("ELEVEN_API_KEY not set");
-
-  // 1) ask for μ-law directly
-  {
-    const { ok, ct, buf } = await elCall("ulaw_8000", "audio/basic", text);
-    if (ok) {
-      const magic = magicStr(buf);
-      if (magic === "RIFF" || magic === "ID3" || magic === "OggS") {
-        console.warn(`[TTS] μ-law request returned container (ct=${ct}, magic=${magic}).`);
-      } else {
-        console.log(`[TTS] Using μ-law from EL (ct=${ct})`);
-        return buf;
-      }
-    }
-  }
-
-  // 2) try raw PCM 8k
-  {
-    const { ok, ct, buf, status, statusText } = await elCall("pcm_8000", "audio/pcm", text);
-    if (ok) {
-      const magic = magicStr(buf);
-      if (magic !== "RIFF" && magic !== "ID3" && magic !== "OggS") {
-        let pcm = buf;
-        if (pcm.length % 2) pcm = pcm.slice(0, pcm.length - 1);
-        pcm = ensureLittleEndianPCM16(pcm);
-        console.log("[TTS] Got raw PCM 8k → μ-law");
-        return pcm16ToMulaw(pcm);
-      }
-      console.warn(`[TTS] PCM request returned container (ct=${ct}, magic=${magic}).`);
-    } else {
-      console.warn(`[TTS] PCM request failed: ${status} ${statusText}`);
-    }
-  }
-
-  // 3) ask for WAV (container) and parse
-  {
-    const { ok, ct, buf } = await elCall("wav", "audio/wav", text);
-    if (ok && magicStr(buf) === "RIFF") {
-      const { pcm16, rate } = parseWavToPcm16(buf);
-      const pcm8k = rate === 8000 ? pcm16
-                  : rate === 16000 ? downsample16kTo8k(pcm16)
-                  : (() => { throw new Error(`WAV sampleRate ${rate} unsupported`); })();
-      console.log(`[TTS] Decoded WAV (${rate} Hz) → μ-law`);
-      return pcm16ToMulaw(pcm8k);
-    } else {
-      console.warn(`[TTS] WAV request not RIFF (ct=${ct}, magic=${magicStr(buf)})`);
-    }
-  }
-
-  // 4) last resort: MP3 → decode → downsample
-  {
-    const { ok, ct, buf } = await elCall("mp3_64k", "audio/mpeg", text);
-    if (ok && magicStr(buf).startsWith("ID3")) {
-      if (!lamejs) throw new Error("MP3 decode needed but lamejs not installed");
-      const { pcm16, rate } = decodeMp3ToPcm16LE(buf);
-      const pcm8k =
-        rate === 8000 ? pcm16 :
-        rate === 16000 ? downsample16kTo8k(pcm16) :
-        rate === 44100 ? downsample16kTo8k(Buffer.from([])) /* placeholder */ : // simple path covered below
-        pcm16;
-      // simple resample for 44.1k → 8k (nearest step); good enough for telephony short prompts
-      let finalPcm = pcm8k;
-      if (rate !== 8000) {
-        if (rate === 44100) {
-          const ratio = 44100 / 8000;
-          const outLen = Math.floor(pcm16.length / 2 / ratio);
-          finalPcm = Buffer.alloc(outLen * 2);
-          let oi = 0;
-          for (let i = 0; i < outLen; i++) {
-            const si = Math.floor(i * ratio) * 2;
-            if (si + 1 < pcm16.length) finalPcm.writeInt16LE(pcm16.readInt16LE(si), oi);
-            oi += 2;
-          }
-        } else if (rate === 16000) {
-          finalPcm = downsample16kTo8k(pcm16);
-        }
-      }
-      console.log(`[TTS] Decoded MP3 (${rate} Hz) → μ-law`);
-      return pcm16ToMulaw(finalPcm);
-    } else {
-      throw new Error(`[TTS] Unexpected last-resort MP3 response (ct=${ct}, magic=${magicStr(buf)})`);
-    }
-  }
-}
-
-// ---------------- WebSocket server ----------------
+// ───────────────────────────────────────────────────────────────────────────────
+// WebSocket (Twilio <Connect><Stream> → wss://…/stream)
+// ───────────────────────────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", (ws) => {
   console.log("🔗 WebSocket connected");
-  const state = { streamSid: null, inbound: 0 };
+  ws._rx = 0;
+  ws._lastOut = Date.now();
 
-  ws.on("message", async (data) => {
-    let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
+  const keepalive = setInterval(() => {
+    // If we haven’t sent anything in ~2s, send 200ms of silence (10 frames)
+    if (Date.now() - ws._lastOut > 2000) {
+      const silence = Buffer.alloc(BYTES_PER_FRAME, 0);
+      for (let i = 0; i < 10; i++) {
+        ws.send(JSON.stringify({ event: "media", media: { payload: silence.toString("base64") } }));
+      }
+      ws._lastOut = Date.now();
+      console.log("[KEEPALIVE] sent 200ms silence");
+    }
+  }, 1000);
+
+  ws.on("message", async (buf) => {
+    let msg;
+    try { msg = JSON.parse(buf.toString()); } catch { return; }
 
     if (msg.event === "connected") {
       console.log(`[WS] event: { event: 'connected', protocol: '${msg.protocol}', version: '${msg.version}' }`);
     }
 
     if (msg.event === "start") {
-      state.streamSid = msg.start?.streamSid || null;
-      console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${state.streamSid} bidi=${msg.start?.bidirectional}`);
-
+      console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${msg.start?.streamSid} bidi=${msg.start?.bidirectional}`);
       try {
-        if (ENABLE_BEEP) {
-          await streamMulawFrames(ws, state.streamSid, pcm16ToMulaw(makeBeepPcm16()), "BEEP");
-          console.log("[BEEP] done.");
-        }
-        const mulaw = await elevenToMulaw(GREETING_TEXT);
-        await streamMulawFrames(ws, state.streamSid, mulaw, "TTS");
-        console.log("[TTS] done.");
+        // short beep and greeting
+        sendShortBeep(ws);
+        const text = "Hi! I'm your AI receptionist at Clean Easy. How can I help you today?";
+        const pcmReadable = await elevenLabsAsPcmReadable(text);
+        // wrap to track last-out for keepalive suppression while streaming
+        pcmReadable.on("data", () => { ws._lastOut = Date.now(); });
+        await streamPcmFrames(ws, pcmReadable, "TTS");
       } catch (e) {
-        console.error("[TTS] greeting failed:", e.message);
+        console.error("[TTS] greeting failed:", e.message || e);
       }
     }
 
     if (msg.event === "media") {
-      state.inbound++;
-      if (state.inbound % 100 === 0) console.log(`[MEDIA] frames received: ${state.inbound}`);
+      ws._rx++;
+      if (ws._rx % 100 === 0) console.log(`[MEDIA] frames received: ${ws._rx}`);
     }
 
     if (msg.event === "stop") {
-      console.log(`[WS] STOP (total inbound frames: ${state.inbound})`);
+      console.log(`[WS] STOP (total inbound frames: ${ws._rx})`);
     }
   });
 
-  ws.on("close", () => console.log("[WS] CLOSE code=1005 reason="));
-  ws.on("error", (err) => console.error("[WS] error", err));
+  ws.on("close", () => {
+    clearInterval(keepalive);
+    console.log("[WS] CLOSE code=1005 reason=");
+  });
+
+  ws.on("error", (err) => {
+    clearInterval(keepalive);
+    console.error("[WS] error", err);
+  });
 });
 
-// HTTP + WS upgrade
-const server = app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+// HTTP + upgrade
+app.get("/", (_req, res) => res.status(200).send("OK"));
+
+const server = app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
+
 server.on("upgrade", (req, socket, head) => {
   if (req.url !== "/stream") return socket.destroy();
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
-
-app.get("/", (_req, res) => res.status(200).send("OK"));
