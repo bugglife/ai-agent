@@ -5,8 +5,9 @@ import WebSocket, { WebSocketServer } from "ws";
 import fetch from "node-fetch";
 import sgMail from "@sendgrid/mail";
 import { createClient } from "@supabase/supabase-js";
-import prism from "prism-media";
 import ffmpegPathPack from "@ffmpeg-installer/ffmpeg";
+import { Readable } from 'stream';
+
 
 const FFMPG = ffmpegPathPack.path;
 
@@ -189,7 +190,7 @@ async function ttsSay(ws, text) {
 
   const reader = ttsRes.body; // Node 18 web stream
   const readerStream = reader; // already a stream
-  const nodeReadable = prism.util.streamToReadable(readerStream);
+  const nodeReadable = Readable.fromWeb(readerStream);
 
   const pcmReadable = nodeReadable.pipe(transformer);
 
