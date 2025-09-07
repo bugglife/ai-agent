@@ -1,191 +1,333 @@
+// server.js
 import express from "express";
-import fetch from "node-fetch";
 import { WebSocketServer } from "ws";
+import fetch from "node-fetch";
 import { spawn } from "child_process";
-import ffmpegBin from "@ffmpeg-installer/ffmpeg";
+import ffmpegPath from "@ffmpeg-installer/ffmpeg";
+import { createClient } from "@supabase/supabase-js";
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Config
-// ───────────────────────────────────────────────────────────────────────────────
-const app = express();
+/* ──────────────────────────────────────────────────────────────────────────
+   ENV & CONSTANTS
+────────────────────────────────────────────────────────────────────────── */
 const PORT = process.env.PORT || 10000;
+const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY || "";
+const ELEVEN_VOICE_ID =
+  process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL";
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || "";
 
-const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL";
+const BIZ_NAME = process.env.BIZ_NAME || "Clean Easy";
+const BIZ_HOURS =
+  process.env.BIZ_HOURS ||
+  "Mon–Fri 9am–6pm, Sat 10am–2pm, closed Sunday.";
+const BIZ_SERVICE_AREA =
+  process.env.BIZ_SERVICE_AREA || "Downtown, Midtown and Westside.";
 
-// pcm16 | mulaw  (set in Render env)
-const MEDIA_FORMAT = (process.env.TWILIO_MEDIA_FORMAT || "pcm16").toLowerCase();
-
-if (!ELEVEN_API_KEY) console.error("❌ ELEVEN_API_KEY is not set");
-if (!ELEVEN_VOICE_ID) console.error("❌ ELEVEN_VOICE_ID is not set");
-if (!["pcm16", "mulaw"].includes(MEDIA_FORMAT)) {
-  console.warn(`⚠️ Unknown TWILIO_MEDIA_FORMAT='${MEDIA_FORMAT}', defaulting to pcm16`);
-}
-
-// Common timing
+// Twilio Media WS is 8kHz, mono. We are standardizing on μ-law end-to-end.
 const SAMPLE_RATE = 8000;
+const BYTES_PER_ULAW_FRAME = 160; // 20ms of μ-law @ 8kHz → 160 samples → 160 bytes
 const FRAME_MS = 20;
 
-// Frame sizing per format
-const BYTES_PER_SAMPLE_PCM16 = 2;
-const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS; // 160 samples @ 8k, 20ms
-const BYTES_PER_FRAME_PCM16 = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE_PCM16; // 320
-const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1; // 160 (8-bit)
+/* ──────────────────────────────────────────────────────────────────────────
+   SUPABASE
+────────────────────────────────────────────────────────────────────────── */
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_SERVICE_ROLE) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
+}
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Utilities (beep generators in the chosen format)
-// ───────────────────────────────────────────────────────────────────────────────
-function makeBeepPcm16(ms = 200, hz = 1000) {
-  const samples = Math.floor((SAMPLE_RATE * ms) / 1000);
-  const buf = Buffer.alloc(samples * BYTES_PER_SAMPLE_PCM16);
-  for (let i = 0; i < samples; i++) {
-    const t = i / SAMPLE_RATE;
-    const s = Math.round(0.18 * 32767 * Math.sin(2 * Math.PI * hz * t));
-    buf.writeInt16LE(s, i * 2);
+/* ──────────────────────────────────────────────────────────────────────────
+   UTIL: base64 chunk sender (μ-law frames)
+────────────────────────────────────────────────────────────────────────── */
+async function streamMulawToTwilio(ws, ulawBuf, label = "TTS") {
+  let offset = 0;
+  let frames = 0;
+  while (offset < ulawBuf.length && ws.readyState === ws.OPEN) {
+    const end = Math.min(offset + BYTES_PER_ULAW_FRAME, ulawBuf.length);
+    const chunk = ulawBuf.slice(offset, end);
+
+    // Pad tail to full 20ms if needed
+    let payload;
+    if (chunk.length < BYTES_PER_ULAW_FRAME) {
+      const padded = Buffer.alloc(BYTES_PER_ULAW_FRAME, 0x7f); // μ-law silence
+      chunk.copy(padded, 0);
+      payload = padded.toString("base64");
+    } else {
+      payload = chunk.toString("base64");
+    }
+
+    ws.send(JSON.stringify({ event: "media", media: { payload } }));
+    frames++;
+    if (frames % 100 === 0) {
+      console.log(`[${label}] sent ${frames} frames (~${(frames * FRAME_MS) / 1000}s)`);
+    }
+    await new Promise((r) => setTimeout(r, FRAME_MS));
+    offset += BYTES_PER_ULAW_FRAME;
+  }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   BEEP: synthesize a short 1 kHz μ-law beep (250ms)
+────────────────────────────────────────────────────────────────────────── */
+function pcmSampleToUlaw(pcm) {
+  // 16-bit PCM to μ-law (approx, G.711)
+  const BIAS = 0x84;
+  let sign = (pcm >> 8) & 0x80;
+  if (sign !== 0) pcm = -pcm;
+  if (pcm > 32635) pcm = 32635;
+  pcm += BIAS;
+  let exponent = 7;
+  for (let expMask = 0x4000; (pcm & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+  let mantissa = (pcm >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0F;
+  const ulaw = ~(sign | (exponent << 4) | mantissa) & 0xFF;
+  return ulaw;
+}
+
+function makeBeepUlaw(ms = 250, freq = 1000) {
+  const totalSamples = Math.floor((SAMPLE_RATE * ms) / 1000);
+  const buf = Buffer.alloc(totalSamples);
+  for (let n = 0; n < totalSamples; n++) {
+    // 16-bit sine @ -6 dBFS
+    const t = n / SAMPLE_RATE;
+    const pcm = Math.floor(0.5 * 32767 * Math.sin(2 * Math.PI * freq * t));
+    buf[n] = pcmSampleToUlaw(pcm);
   }
   return buf;
 }
+const BEEP_ULAW = makeBeepUlaw(180); // short & polite :)
 
-// µ-law companding tables (fast)
-function linearToMulawSample(s) {
-  // s: signed 16-bit PCM
-  const BIAS = 0x84;
-  const CLIP = 32635;
-  let sign = (s >> 8) & 0x80;
-  if (sign) s = -s;
-  if (s > CLIP) s = CLIP;
-  s = s + BIAS;
-  let exponent = 7;
-  for (let expMask = 0x4000; (s & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
-  const mantissa = (s >> (exponent + 3)) & 0x0f;
-  let ulaw = ~(sign | (exponent << 4) | mantissa);
-  return ulaw & 0xff;
-}
-
-function makeBeepMulaw(ms = 200, hz = 1000) {
-  // create in PCM then compand
-  const pcm = makeBeepPcm16(ms, hz);
-  const out = Buffer.alloc(pcm.length / 2);
-  for (let i = 0, j = 0; i < pcm.length; i += 2, j++) {
-    const s = pcm.readInt16LE(i);
-    out[j] = linearToMulawSample(s);
-  }
-  return out;
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// Transcoding helpers (ElevenLabs → desired format)
-// ───────────────────────────────────────────────────────────────────────────────
-async function ttsElevenLabsRaw(text) {
+/* ──────────────────────────────────────────────────────────────────────────
+   TTS (ElevenLabs) → always end up μ-law/8k mono
+   - If Eleven returns MP3/other, we transcode with ffmpeg to μ-law.
+   - Cache greeting μ-law in-memory to skip ffmpeg per call
+────────────────────────────────────────────────────────────────────────── */
+let GREETING_CACHE = null;
+async function ttsToUlaw(text) {
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "xi-api-key": ELEVEN_API_KEY,
       "Content-Type": "application/json",
-      Accept: "audio/mpeg", // get MP3/wrapped audio, we will transcode
+      Accept: "audio/mpeg", // their API often returns MP3 container even if we ask for PCM
     },
     body: JSON.stringify({
       text,
       voice_settings: { stability: 0.4, similarity_boost: 0.7 },
+      // If your plan supports raw PCM, set: output_format: "pcm_8000"
     }),
   });
   if (!res.ok) {
-    const err = await res.text().catch(() => "");
-    throw new Error(`ElevenLabs TTS failed: ${res.status} ${res.statusText} ${err}`);
+    const e = await res.text().catch(() => "");
+    throw new Error(`[TTS] HTTP ${res.status} ${res.statusText} ${e}`);
   }
-  return Buffer.from(await res.arrayBuffer());
+  const inBuf = Buffer.from(await res.arrayBuffer());
+
+  // Transcode to μ-law/8k/mono via ffmpeg
+  return await transcodeToUlaw(inBuf);
 }
 
-function ffmpegTranscode(inputBuf, args) {
+async function transcodeToUlaw(inputBuffer) {
   return new Promise((resolve, reject) => {
+    // ffmpeg -i pipe:0 -f mulaw -ar 8000 -ac 1 pipe:1
+    const ff = spawn(ffmpegPath.path, [
+      "-hide_banner",
+      "-loglevel", "error",
+      "-i", "pipe:0",
+      "-f", "mulaw",
+      "-ar", `${SAMPLE_RATE}`,
+      "-ac", "1",
+      "pipe:1",
+    ]);
     const chunks = [];
-    const ff = spawn(ffmpegBin.path, args);
-    ff.stdin.on("error", () => {}); // ignore EPIPE
     ff.stdout.on("data", (d) => chunks.push(d));
-    ff.stderr.on("data", (d) => console.error("[ffmpeg]", d.toString().trim()));
-    ff.on("close", (code) => (code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`ffmpeg exited ${code}`))));
-    ff.stdin.end(inputBuf);
+    ff.stderr.on("data", (d) => {
+      // Keep quiet unless truly fails; ffmpeg prints progress on stderr
+    });
+    ff.on("error", reject);
+    ff.on("close", (code) => {
+      if (code === 0) {
+        resolve(Buffer.concat(chunks));
+      } else {
+        reject(new Error(`[TTS] ffmpeg exited ${code}`));
+      }
+    });
+    ff.stdin.end(inputBuffer);
   });
 }
 
-async function ttsToPcm16(text) {
-  const input = await ttsElevenLabsRaw(text);
-  console.log("[TTS] Received MP3 container. Transcoding → PCM16/8k/mono");
-  let out = await ffmpegTranscode(input, [
-    "-hide_banner", "-nostdin", "-loglevel", "error",
-    "-i", "pipe:0",
-    "-ac", "1",
-    "-ar", "8000",
-    "-f", "s16le",
-    "-acodec", "pcm_s16le",
-    "pipe:1",
-  ]);
-  // sample-align
-  if (out.length % 2 !== 0) out = out.slice(0, out.length - 1);
-  return out;
+/* ──────────────────────────────────────────────────────────────────────────
+   Deepgram live WS (μ-law/8k/mono) + simple intent router & VAD
+────────────────────────────────────────────────────────────────────────── */
+function connectDeepgram(onTranscript, onOpen, onClose) {
+  if (!DEEPGRAM_API_KEY) return null;
+
+  const url =
+    "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2&punctuate=true&interim_results=true&vad_events=true";
+  const dg = new (require("ws"))(url, {
+    headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` },
+  });
+
+  dg.on("open", () => {
+    console.log("[DG] connected");
+    onOpen && onOpen();
+  });
+
+  dg.on("message", (msg) => {
+    try {
+      const data = JSON.parse(msg.toString());
+      if (data.type === "transcript" && data.channel?.alternatives?.length) {
+        const alt = data.channel.alternatives[0];
+        const transcript = alt.transcript || "";
+        const isFinal = !!data.is_final;
+        if (transcript) onTranscript(transcript, isFinal);
+      }
+    } catch (e) {
+      // ignore parse errors
+    }
+  });
+
+  dg.on("close", (code) => {
+    console.log("[DG] close", code);
+    onClose && onClose(code);
+  });
+
+  dg.on("error", (e) => console.error("[DG] error", e));
+  return dg;
 }
 
-async function ttsToMulaw(text) {
-  const input = await ttsElevenLabsRaw(text);
-  console.log("[TTS] Received MP3 container. Transcoding → µ-law/8k/mono");
-  return await ffmpegTranscode(input, [
-    "-hide_banner", "-nostdin", "-loglevel", "error",
-    "-i", "pipe:0",
-    "-ac", "1",
-    "-ar", "8000",
-    "-f", "mulaw",
-    "-acodec", "pcm_mulaw",
-    "pipe:1",
-  ]);
+// Per-call brain state
+function makeBrain() {
+  return {
+    stage: "greeting", // collecting_name / collecting_date / idle / voicemail
+    lastUserSpeechTs: Date.now(),
+    bargeIn: true,
+    booking: { name: "", date: "", phone: "" },
+  };
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Outbound streaming (Twilio)
-// ───────────────────────────────────────────────────────────────────────────────
-async function streamFrames(ws, raw) {
-  const bytesPerFrame =
-    MEDIA_FORMAT === "mulaw" ? BYTES_PER_FRAME_MULAW : BYTES_PER_FRAME_PCM16;
+function routeIntent(text) {
+  const t = text.toLowerCase();
+  if (/(hours?|open|close|when)/.test(t)) return { intent: "hours" };
+  if (/(area|serve|service area|where|locations?)/.test(t)) return { intent: "service_area" };
+  if (/(book|schedule|appointment|quote|estimate)/.test(t)) return { intent: "book" };
+  if (/(leave.*message|voicemail|record)/.test(t)) return { intent: "voicemail" };
+  return { intent: "chit_chat" };
+}
 
-  let offset = 0;
-  let frames = 0;
-
-  while (offset < raw.length && ws.readyState === ws.OPEN) {
-    const end = Math.min(offset + bytesPerFrame, raw.length);
-    let frame = raw.slice(offset, end);
-
-    // pad last fragment to whole frame
-    if (frame.length < bytesPerFrame) {
-      const padded = Buffer.alloc(bytesPerFrame);
-      frame.copy(padded, 0);
-      frame = padded;
-    }
-
-    ws.send(
-      JSON.stringify({
-        event: "media",
-        streamSid: ws._streamSid,
-        media: { payload: frame.toString("base64") },
-      })
-    );
-
-    frames++;
-    if (frames % 100 === 0) {
-      console.log(`[TTS] sent ${frames} frames (~${(frames * FRAME_MS) / 1000}s)`);
-    }
-
-    await new Promise((r) => setTimeout(r, FRAME_MS));
-    offset += bytesPerFrame;
+async function handleIntent(brain, intent, say) {
+  switch (intent) {
+    case "hours":
+      await say(`Our hours are ${BIZ_HOURS}`);
+      brain.stage = "idle";
+      break;
+    case "service_area":
+      await say(`We currently serve ${BIZ_SERVICE_AREA}`);
+      brain.stage = "idle";
+      break;
+    case "book":
+      brain.stage = "collecting_name";
+      await say("Great! I can help with that. What name should I put it under?");
+      break;
+    case "voicemail":
+      brain.stage = "voicemail";
+      await say("Okay. I’ll start recording after the tone. Leave your message and hang up when done.");
+      break;
+    default:
+      // light small talk
+      await say("I can help with hours, our service area, booking an appointment, or taking a message. What would you like?");
+      brain.stage = "idle";
   }
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// WebSocket (Twilio <Connect><Stream> → wss://…/stream)
-// ───────────────────────────────────────────────────────────────────────────────
+/* ──────────────────────────────────────────────────────────────────────────
+   Voicemail file helper (save μ-law stream → WAV in Supabase storage)
+────────────────────────────────────────────────────────────────────────── */
+async function saveVoicemailToSupabase(ulawPath, meta) {
+  if (!supabase) return;
+  const outPath = `${ulawPath}.wav`;
+
+  // Wrap μ-law raw into WAV
+  await new Promise((resolve, reject) => {
+    const ff = spawn(ffmpegPath.path, [
+      "-f", "mulaw",
+      "-ar", `${SAMPLE_RATE}`,
+      "-ac", "1",
+      "-i", ulawPath,
+      "-c:a", "pcm_s16le",
+      outPath,
+    ]);
+    ff.on("close", (c) => (c === 0 ? resolve() : reject(new Error("ffmpeg wrap failed"))));
+  });
+
+  // Upload
+  const bucket = "voicemails"; // create this bucket in Supabase → Storage
+  const fileName = `vm_${Date.now()}.wav`;
+  const arrayBuf = await fsPromises.readFile(outPath);
+  const { data, error } = await supabase.storage
+    .from(bucket)
+    .upload(fileName, arrayBuf, { contentType: "audio/wav", upsert: false });
+  if (error) {
+    console.error("[VM] upload failed:", error);
+    return;
+  }
+  const { data: pub } = supabase.storage.from(bucket).getPublicUrl(fileName);
+  // Record a row for easy dashboard
+  await supabase.from("voicemails").insert([{ url: pub.publicUrl, meta }]).catch(() => {});
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   HTTP + WS SERVER
+────────────────────────────────────────────────────────────────────────── */
+const app = express();
+app.get("/", (_req, res) => res.status(200).send("OK"));
+app.get("/version", (_req, res) => {
+  res.json({ name: "twilio-media-bridge", version: "brain-1", time: new Date().toISOString() });
+});
+
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", (ws) => {
-  console.log("🔗 WebSocket connected");
+  const call = {
+    brain: makeBrain(),
+    deepgram: null,
+    greetingDone: false,
+    rxFrames: 0,
+    // voicemail buffer file (if stage switches to voicemail)
+    voicemailFile: null,
+    voicemailStream: null,
+    sendLock: false,
+  };
+
+  // Utility to TTS+send (with μ-law)
+  const say = async (text) => {
+    try {
+      const ulaw = await ttsToUlaw(text);
+      await streamMulawToTwilio(ws, ulaw, "TTS");
+    } catch (e) {
+      console.error("[TTS] failed:", e.message);
+    }
+  };
+
+  const startDeepgram = () => {
+    if (!DEEPGRAM_API_KEY || call.deepgram) return;
+    call.deepgram = connectDeepgram(
+      async (transcript, isFinal) => {
+        call.brain.lastUserSpeechTs = Date.now();
+        // Barge-in: if user speaks while we were about to say something, we simply react
+        if (isFinal) {
+          console.log("[STT]", transcript);
+          const { intent } = routeIntent(transcript);
+          await handleIntent(call.brain, intent, say);
+        }
+      },
+      null,
+      () => (call.deepgram = null)
+    );
+  };
+
+  const greetingText = `Hi! I'm your AI receptionist at ${BIZ_NAME}. How can I help you today?`;
 
   ws.on("message", async (data) => {
     let msg;
@@ -196,54 +338,117 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.event === "connected") {
-      console.log(
-        `[WS] event: { event: 'connected', protocol: '${msg.protocol}', version: '${msg.version}' }`
-      );
+      console.log(`[WS] event: connected proto=${msg.protocol} v=${msg.version}`);
     }
 
     if (msg.event === "start") {
-      ws._streamSid = msg.start?.streamSid;
-      console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${ws._streamSid}`);
+      console.log(
+        `[WS] START callSid=${msg.start?.callSid} streamSid=${msg.start?.streamSid}`
+      );
 
+      // 1) Short polite beep
+      await streamMulawToTwilio(ws, BEEP_ULAW, "BEEP");
+
+      // 2) Greeting (cached)
       try {
-        // 1) Beep in the chosen format so you instantly know the format matches
-        if (MEDIA_FORMAT === "mulaw") {
-          await streamFrames(ws, makeBeepMulaw(180, 950));
-        } else {
-          await streamFrames(ws, makeBeepPcm16(180, 950));
+        if (!GREETING_CACHE) {
+          console.log("[TTS] streaming greeting as mulaw…");
+          const ulaw = await ttsToUlaw(greetingText);
+          GREETING_CACHE = ulaw;
         }
-        console.log("[BEEP] done.");
-
-        // 2) Greeting
-        console.log(`[TTS] streaming greeting as ${MEDIA_FORMAT}…`);
-        const text = "Hi! I'm your AI receptionist at Clean Easy. How can I help you today?";
-        const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text) : await ttsToPcm16(text);
-        await streamFrames(ws, buf);
-        console.log("[TTS] done.");
+        await streamMulawToTwilio(ws, GREETING_CACHE, "TTS");
+        call.greetingDone = true;
       } catch (e) {
         console.error("[TTS] greeting failed:", e.message);
       }
+
+      // 3) Start Deepgram (barge-in ready now)
+      startDeepgram();
+
+      // 4) VAD idle checker: if no speech 20s after greeting → offer voicemail
+      const idleCheck = setInterval(async () => {
+        if (ws.readyState !== ws.OPEN) return clearInterval(idleCheck);
+        const idleFor = Date.now() - call.brain.lastUserSpeechTs;
+        if (idleFor > 20000 && call.brain.stage === "idle") {
+          call.brain.stage = "voicemail";
+          await say("If you’d like, I can take a quick voicemail. Start speaking after the tone.");
+          await streamMulawToTwilio(ws, BEEP_ULAW, "BEEP");
+        }
+      }, 2500);
     }
 
     if (msg.event === "media") {
-      ws._rx = (ws._rx || 0) + 1;
-      if (ws._rx % 100 === 0) console.log(`[MEDIA] frames received: ${ws._rx}`);
+      call.rxFrames++;
+      const b64 = msg.media?.payload || "";
+      if (!b64) return;
+
+      // Forward inbound μ-law frames to Deepgram
+      if (call.deepgram && call.deepgram.readyState === call.deepgram.OPEN) {
+        try {
+          call.deepgram.send(
+            JSON.stringify({
+              type: "InputAudioBuffer.Append",
+              audio: b64,
+            })
+          );
+        } catch {}
+      }
+
+      // If in voicemail stage → write to temp μ-law file
+      if (call.brain.stage === "voicemail") {
+        const buf = Buffer.from(b64, "base64");
+        if (!call.voicemailFile) {
+          const { mkdtempSync, writeFileSync } = await import("fs");
+          const { tmpdir } = await import("os");
+          const { join } = await import("path");
+          const dir = mkdtempSync(join(tmpdir(), "vm-"));
+          call.voicemailFile = join(dir, "message.ulaw");
+          writeFileSync(call.voicemailFile, buf);
+        } else {
+          const { appendFileSync } = await import("fs");
+          appendFileSync(call.voicemailFile, buf);
+        }
+      }
     }
 
     if (msg.event === "stop") {
-      console.log(`[WS] STOP (total inbound frames: ${ws._rx || 0})`);
+      console.log(`[WS] STOP (total inbound frames: ${call.rxFrames})`);
+      try {
+        call.deepgram && call.deepgram.close();
+      } catch {}
     }
   });
 
-  ws.on("close", () => console.log("[WS] CLOSE code=1005 reason="));
+  ws.on("close", async () => {
+    console.log("[WS] CLOSE");
+
+    // If we recorded a voicemail file, wrap & store it
+    if (call.voicemailFile && supabase) {
+      try {
+        await saveVoicemailToSupabase(call.voicemailFile, {
+          name: call.brain.booking.name || null,
+          phone: call.brain.booking.phone || null,
+          ts: new Date().toISOString(),
+        });
+      } catch (e) {
+        console.error("[VM] finalize failed:", e.message);
+      }
+    }
+  });
+
   ws.on("error", (err) => console.error("[WS] error", err));
 });
 
-const server = app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
-
+/* ──────────────────────────────────────────────────────────────────────────
+   UPGRADE HANDLER
+────────────────────────────────────────────────────────────────────────── */
+const server = app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
 server.on("upgrade", (req, socket, head) => {
-  if (req.url !== "/stream") return socket.destroy();
+  if (req.url !== "/stream") {
+    socket.destroy();
+    return;
+  }
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
-
-app.get("/", (_req, res) => res.status(200).send("OK"));
