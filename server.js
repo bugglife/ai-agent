@@ -3,7 +3,8 @@ import express from "express";
 import fetch from "node-fetch";
 import { WebSocketServer } from "ws";
 import WebSocket from "ws";
-import { FFmpeg } from "prism-media";
+import prism from "prism-media";
+const { FFmpeg } = prism;
 import ffmpegPath from "@ffmpeg-installer/ffmpeg";
 
 const app = express();
