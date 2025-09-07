@@ -2,7 +2,8 @@
 import express from "express";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
-import { twiml as TwiML } from "twilio";
+import Twilio from "twilio";
+const { twiml } = Twilio;
 import fetch from "node-fetch";
 import prism from "prism-media";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
@@ -166,7 +167,7 @@ app.post("/voice", (req, res) => {
   if (!PUBLIC_URL) {
     console.error("❌ PUBLIC_URL is not set. Twilio cannot reach your WS.");
   }
-  const response = new TwiML.VoiceResponse();
+  const response = new twiml.VoiceResponse();
   const connect = response.connect();
   connect.stream({ url: `${PUBLIC_URL.replace(/\/$/, "")}/media` });
   res.type("text/xml").send(response.toString());
