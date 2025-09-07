@@ -128,37 +128,55 @@ function sendMark(ws, name) {
   ws.send(JSON.stringify({ event: 'mark', mark: { name } }));
 }
 
-// -------------------------
-// ElevenLabs TTS + FFmpeg transcoding (no prism-media)
-// -------------------------
+
+/**
+ * Fetch ElevenLabs MP3 audio and return a **Node.js Readable** stream.
+ * Works whether `fetch` gives us a Web ReadableStream or a Node stream (Gunzip).
+ */
 async function fetchElevenLabs(text) {
   if (!ELEVEN_KEY || !ELEVEN_VOICE) {
     const err = new Error('ELEVENLABS_API_KEY / VOICE_ID not set');
     err.code = 'NO_TTS_CONFIG';
     throw err;
   }
+
   const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE}`, {
     method: 'POST',
     headers: {
       'xi-api-key': ELEVEN_KEY,
       'Accept': 'audio/mpeg',
       'Content-Type': 'application/json',
+      // ask for identity encoding to reduce chances of a Gunzip wrapper
+      'Accept-Encoding': 'identity',
     },
     body: JSON.stringify({
       text,
       model_id: 'eleven_multilingual_v2',
-      voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+      voice_settings: { stability: 0.5, similarity_boost: 0.75 },
     }),
   });
 
   if (!r.ok) {
     const details = await r.text().catch(() => '');
-    const msg = `ElevenLabs error ${r.status}: ${details}`;
-    throw new Error(msg);
+    throw new Error(`ElevenLabs error ${r.status}: ${details}`);
   }
-  // Convert Web ReadableStream -> Node stream
-  return Readable.fromWeb(r.body);
+
+  // Normalize to a Node.js Readable:
+  const b = r.body;
+
+  // Web ReadableStream (has getReader)
+  if (b && typeof b.getReader === 'function') {
+    return Readable.fromWeb(b);
+  }
+
+  // Node.js Readable (Gunzip, etc.) – just return it directly
+  if (b && typeof b.pipe === 'function') {
+    return b;
+  }
+
+  throw new Error('Unexpected response body type from ElevenLabs');
 }
+
 
 /**
  * Fetch TTS (MP3) and transcode to 8kHz mono frames with ffmpeg, then
