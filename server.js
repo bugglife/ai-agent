@@ -1,250 +1,306 @@
-// server.js
+/**
+ * server.js — Twilio media bridge with ElevenLabs TTS (streamed),
+ * FFmpeg → PCM16 (8k/mono) via prism-media, optional alerts, and helper routes.
+ *
+ * Required env vars:
+ *  - PORT=10000 (or your choice)
+ *  - ELEVEN_API_KEY=...
+ *  - ELEVEN_VOICE_ID=Rachel    (or a concrete voice ID; “Rachel” works fine too)
+ *  - ALERT_EMAIL_TO=ops@bookcleaneasy.com       (comma-separated is OK)
+ *  - ALERT_EMAIL_FROM=alerts@bookcleaneasy.com  (a sender on your authenticated domain)
+ *  - SENDGRID_API_KEY=...
+ *  - (Optional) BIZ_NAME="Clean Easy"  BIZ_HOURS="Mon–Fri 9–5"  SERVICE_AREA="..."
+ *  - (Optional for /voicemails/latest) SUPABASE_URL=...  SUPABASE_ANON_KEY=...
+ *
+ * package.json deps:
+ *  {
+ *    "type": "module",
+ *    "engines": { "node": ">=18 <23" },
+ *    "dependencies": {
+ *      "@supabase/supabase-js": "^2.45.4",
+ *      "@sendgrid/mail": "^8.1.0",
+ *      "express": "^4.19.2",
+ *      "prism-media": "^1.3.5",
+ *      "ws": "^8.17.1"
+ *    }
+ *  }
+ */
+
 import express from 'express';
-import { WebSocketServer } from 'ws';
-import fetch from 'node-fetch';
-import { Readable } from 'stream';
-import { spawn } from 'child_process';
+import WebSocket, { WebSocketServer } from 'ws';
+import prism from 'prism-media';
+import sgMail from '@sendgrid/mail';
+import { createClient } from '@supabase/supabase-js';
 
-// -------------------------
-// Config
-// -------------------------
+// ---------- Config & helpers ----------
+
 const PORT = process.env.PORT || 10000;
-const ELEVEN_KEY = process.env.ELEVENLABS_API_KEY || '';
-const ELEVEN_VOICE = process.env.ELEVENLABS_VOICE_ID || '';
-const AUDIO_FORMAT = (process.env.TWILIO_AUDIO_FORMAT || 'mulaw').toLowerCase(); // 'mulaw' or 'pcm16'
-const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
 
-// frame sizing @ 8kHz, 20ms per frame
-const FRAME_BYTES = AUDIO_FORMAT === 'mulaw' ? 160 : 320; // mulaw=160, pcm16=320
+const BIZ_NAME = process.env.BIZ_NAME || 'Clean Easy';
+const DEFAULT_GREETING =
+  process.env.GREETING_TEXT ||
+  `Hi! I’m your AI receptionist at ${BIZ_NAME}. How can I help you today?`;
 
-// -------------------------
-// (Optional) SendGrid alerts
-// -------------------------
-let sendAlertEmail = async (subject, body) => {
-  if (!process.env.SENDGRID_API_KEY || !process.env.ALERT_EMAIL_TO || !process.env.ALERT_EMAIL_FROM) {
-    console.warn('[ALERT] skipped (missing SENDGRID config):', subject);
-    return;
-  }
-  const { default: sgMail } = await import('@sendgrid/mail');
-  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY || '';
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || 'Rachel';
+
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || '';
+const ALERT_EMAIL_FROM = process.env.ALERT_EMAIL_FROM || '';
+const ALERT_EMAIL_TO = (process.env.ALERT_EMAIL_TO || '').split(',').map(s => s.trim()).filter(Boolean);
+
+// simple logger
+const log = (tag, msg) => console.log(`${new Date().toISOString()} [${tag}] ${msg}`);
+
+// optional SendGrid init
+if (SENDGRID_API_KEY) {
+  sgMail.setApiKey(SENDGRID_API_KEY);
+}
+
+async function sendAlertEmail(subject, body) {
   try {
-    await sgMail.send({
-      to: process.env.ALERT_EMAIL_TO,
-      from: { email: process.env.ALERT_EMAIL_FROM, name: process.env.ALERT_EMAIL_NAME || 'CleanEasy Alerts' },
-      subject: subject || 'Voice Agent Alert',
-      text: typeof body === 'string' ? body : JSON.stringify(body, null, 2),
-    });
-    console.log('[ALERT] email sent:', subject);
+    if (!SENDGRID_API_KEY || !ALERT_EMAIL_FROM || ALERT_EMAIL_TO.length === 0) return;
+    const msg = {
+      to: ALERT_EMAIL_TO,
+      from: ALERT_EMAIL_FROM,
+      subject,
+      text: body || subject,
+    };
+    await sgMail.send(msg);
+    log('ALERT', `email sent: ${subject}`);
   } catch (err) {
-    console.error('[ALERT] send failed:', err?.response?.body || err);
+    log('ALERT', `send failed: ${err.message}`);
   }
-};
-
-// -------------------------
-// HTTP server + health/debug
-// -------------------------
-const app = express();
-app.get('/', (_, res) => res.send('Media bridge running'));
-app.get('/debug/say', async (req, res) => {
-  const text = req.query.q || 'This is a debug test.';
-  // no WebSocket here; just validate we can fetch TTS successfully
-  try {
-    await fetchElevenLabs(text); // if this fails, it throws
-    res.send('TTS fetch OK (audio not played here)');
-  } catch (e) {
-    res.status(500).send('TTS fetch failed: ' + (e?.message || e));
-  }
-});
-const server = app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
-
-// -------------------------
-// WebSocket for Twilio Media Streams
-// -------------------------
-const wss = new WebSocketServer({ server });
-
-wss.on('connection', (ws) => {
-  console.log('🔗 stream connected');
-
-  ws.on('message', async (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-    if (msg.event === 'connected') {
-      console.log('[WS] connected proto=Call v=', msg.protocol);
-      return;
-    }
-
-    if (msg.event === 'start') {
-      const callSid = msg?.start?.callSid;
-      const streamSid = msg?.start?.streamSid;
-      console.log('[WS] START callSid=', callSid, ' streamSid=', streamSid);
-
-      // Send a short "beep" (optional)
-      try { await ttsSay(ws, ''); } catch {}
-
-      // Greeting
-      const greeting = "Hi! I’m your AI receptionist at Clean Easy. How can I help you today?";
-      console.log('[TTS] ->', greeting);
-      try {
-        await ttsSay(ws, greeting);
-      } catch (e) {
-        console.error('[TTS] greeting failed:', e?.message || e);
-        await sendAlertEmail('[ERROR] TTS greeting', e?.message || String(e));
-      }
-      return;
-    }
-
-    if (msg.event === 'media') {
-      // inbound audio frames from Twilio arrive here if you want to pump to STT
-      // msg.media.payload is base64 mulaw PCM from Twilio
-      return;
-    }
-
-    if (msg.event === 'stop') {
-      console.log('[WS] STOP (rx frames:', msg?.stop?.tracksReceived || 'n/a', ')');
-      return;
-    }
-  });
-
-  ws.on('close', () => console.log('[WS] CLOSE'));
-});
-
-// -------------------------
-// Twilio helpers: send audio back to caller
-// -------------------------
-function sendFrameToTwilio(ws, rawFrameBuffer) {
-  // rawFrameBuffer is either 160 bytes (mulaw) or 320 bytes (pcm16)
-  const payload = rawFrameBuffer.toString('base64');
-  const msg = JSON.stringify({
-    event: 'media',
-    media: { payload }
-  });
-  ws.send(msg);
 }
 
-function sendMark(ws, name) {
-  ws.send(JSON.stringify({ event: 'mark', mark: { name } }));
+// optional Supabase
+let supabase = null;
+if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
+  supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 }
 
+// Precompute 200ms of PCM16 silence at 8 kHz (0x00 bytes)
+const SILENCE_200MS = Buffer.alloc(0.2 * 8000 * 2); // 3200 bytes
+const SILENCE_200MS_B64 = SILENCE_200MS.toString('base64');
+
+function sendSilence(ws) {
+  ws.send(JSON.stringify({ event: 'media', media: { payload: SILENCE_200MS_B64 } }));
+}
+
+// Text override for the next call via /debug
+let nextGreetingOverride = null;
+
+// ---------- ElevenLabs streaming TTS -> PCM16 (8k/mono) ----------
 
 /**
- * Fetch ElevenLabs MP3 audio and return a **Node.js Readable** stream.
- * Works whether `fetch` gives us a Web ReadableStream or a Node stream (Gunzip).
+ * Fetch a streaming MP3 from ElevenLabs for “text”.
+ * Returns a Node Readable stream (audio/mpeg).
  */
-async function fetchElevenLabs(text) {
-  if (!ELEVEN_KEY || !ELEVEN_VOICE) {
-    const err = new Error('ELEVENLABS_API_KEY / VOICE_ID not set');
-    err.code = 'NO_TTS_CONFIG';
-    throw err;
-  }
+async function fetchElevenLabsStream(text) {
+  if (!ELEVEN_API_KEY) throw new Error('ELEVEN_API_KEY missing');
 
-  const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE}`, {
+  // Using the “stream” endpoint for lowest latency
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(
+    ELEVEN_VOICE_ID
+  )}/stream?optimize_streaming_latency=3&output_format=mp3_22050_32`;
+
+  const resp = await fetch(url, {
     method: 'POST',
     headers: {
-      'xi-api-key': ELEVEN_KEY,
-      'Accept': 'audio/mpeg',
+      'xi-api-key': ELEVEN_API_KEY,
       'Content-Type': 'application/json',
-      // ask for identity encoding to reduce chances of a Gunzip wrapper
-      'Accept-Encoding': 'identity',
+      Accept: 'audio/mpeg',
     },
     body: JSON.stringify({
       text,
-      model_id: 'eleven_multilingual_v2',
+      // Add style options if desired:
+      model_id: 'eleven_monolingual_v1',
       voice_settings: { stability: 0.5, similarity_boost: 0.75 },
     }),
   });
 
-  if (!r.ok) {
-    const details = await r.text().catch(() => '');
-    throw new Error(`ElevenLabs error ${r.status}: ${details}`);
+  if (!resp.ok || !resp.body) {
+    const textErr = await resp.text().catch(() => '');
+    throw new Error(`ElevenLabs ${resp.status} ${resp.statusText}: ${textErr}`);
   }
 
-  // Normalize to a Node.js Readable:
-  const b = r.body;
-
-  // Web ReadableStream (has getReader)
-  if (b && typeof b.getReader === 'function') {
-    return Readable.fromWeb(b);
-  }
-
-  // Node.js Readable (Gunzip, etc.) – just return it directly
-  if (b && typeof b.pipe === 'function') {
-    return b;
-  }
-
-  throw new Error('Unexpected response body type from ElevenLabs');
+  // Node Readable stream
+  return resp.body;
 }
 
-
 /**
- * Fetch TTS (MP3) and transcode to 8kHz mono frames with ffmpeg, then
- * send 20ms frames back to Twilio via the websocket.
+ * Speak “text” to the Twilio media WS by:
+ *   MP3 (ElevenLabs) -> FFmpeg (prism-media) -> PCM16 8k mono
+ *   and sending base64 frames to WS.
  */
 async function ttsSay(ws, text) {
-  // If text is empty we can optionally play a 50ms beep using ffmpeg tone
-  if ((text || '').trim().length === 0) {
-    await toneBeep(ws, 450, 0.05); // 450 Hz for 50ms
-    return;
+  log('TTS', `-> ${text}`);
+
+  try {
+    const mp3Stream = await fetchElevenLabsStream(text);
+
+    // FFmpeg transform: MP3 -> signed 16-bit PCM, 8kHz, mono
+    const ffmpeg = new prism.FFmpeg({
+      args: [
+        '-analyzeduration',
+        '0',
+        '-loglevel',
+        '0',
+        '-i',
+        'pipe:0',
+        '-f',
+        's16le',
+        '-ar',
+        '8000',
+        '-ac',
+        '1',
+      ],
+    });
+
+    const pcmStream = mp3Stream.pipe(ffmpeg);
+
+    // As PCM chunks arrive, base64 them into Twilio “media” events
+    pcmStream.on('data', (chunk) => {
+      const b64 = chunk.toString('base64');
+      ws.send(JSON.stringify({ event: 'media', media: { payload: b64 } }));
+    });
+
+    return await new Promise((resolve, reject) => {
+      pcmStream.on('end', () => {
+        log('TTS', 'done.');
+        resolve();
+      });
+      pcmStream.on('error', (err) => {
+        log('TTS', `pipeline error: ${err.message}`);
+        reject(err);
+      });
+      mp3Stream.on('error', (err) => {
+        log('TTS', `stream fetch error: ${err.message}`);
+        reject(err);
+      });
+    });
+  } catch (err) {
+    log('TTS', `greeting failed: ${err.message}`);
+    await sendAlertEmail('[ERROR] TTS greeting', err.message);
+  }
+}
+
+// ---------- Express HTTP + WS ----------
+
+const app = express();
+app.use(express.json());
+
+// health
+app.get('/health', (_, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+
+// Set the next call’s greeting to arbitrary text (for quick tests)
+app.post('/debug', (req, res) => {
+  const { text } = req.body || {};
+  if (!text || typeof text !== 'string') {
+    return res.status(400).json({ ok: false, error: 'Provide { "text": "..." }' });
+  }
+  nextGreetingOverride = text.slice(0, 800);
+  log('DEBUG', `next greeting override set (${nextGreetingOverride.length} chars)`);
+  res.json({ ok: true });
+});
+
+// Retrieve latest voicemail (requires Supabase + your “voicemails” table).
+app.get('/voicemails/latest', async (_, res) => {
+  if (!supabase) return res.status(501).json({ ok: false, error: 'Supabase not configured' });
+  try {
+    const { data, error } = await supabase
+      .from('voicemails')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) throw error;
+    res.json({ ok: true, voicemail: data || null });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Start HTTP server
+const server = app.listen(PORT, () => log('HTTP', `Server running on port ${PORT}`));
+
+// WS server for Twilio media stream (no path constraints; Twilio connects to your WS URL)
+const wss = new WebSocketServer({ server });
+
+wss.on('connection', (ws) => {
+  const id = Math.random().toString(36).slice(2, 7);
+  log(id, '🔗 WebSocket connected');
+
+  let streamSid = null;
+  let keepAliveTimer = null;
+  let rxFrames = 0;
+
+  function startKeepAlive() {
+    stopKeepAlive();
+    keepAliveTimer = setInterval(() => {
+      sendSilence(ws);
+      log(id, '[KEEPALIVE] sent 200ms silence (~4s)');
+    }, 4000);
   }
 
-  const mp3Stream = await fetchElevenLabs(text);
+  function stopKeepAlive() {
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+  }
 
-  // Compose ffmpeg args based on requested output format
-  const outFmt = AUDIO_FORMAT === 'mulaw' ? 'mulaw' : 's16le';
-  const args = [
-    '-hide_banner', '-loglevel', 'error',
-    '-i', 'pipe:0',
-    '-ar', '8000',
-    '-ac', '1',
-    '-f', outFmt,
-    'pipe:1'
-  ];
+  ws.on('message', async (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
 
-  const ff = spawn(FFMPEG, args);
-  mp3Stream.pipe(ff.stdin);
+    switch (msg.event) {
+      case 'connected':
+        log(id, `[WS] event: connected (protocol: '${msg.protocol}', version: '${msg.version}')`);
+        break;
 
-  ff.stdout.on('data', (chunk) => {
-    for (let off = 0; off + FRAME_BYTES <= chunk.length; off += FRAME_BYTES) {
-      const frame = chunk.subarray(off, off + FRAME_BYTES);
-      sendFrameToTwilio(ws, frame);
+      case 'start':
+        streamSid = msg.start?.streamSid;
+        log(id, `[WS] START callSid=${msg.start?.callSid} streamSid=${streamSid}`);
+        // kick off greeting
+        try {
+          const text = nextGreetingOverride || DEFAULT_GREETING;
+          nextGreetingOverride = null;
+          startKeepAlive();
+          await ttsSay(ws, text);
+        } catch (err) {
+          log(id, `[TTS] greeting error: ${err.message}`);
+        }
+        break;
+
+      case 'media':
+        rxFrames += 1;
+        if (rxFrames % 100 === 0) {
+          log(id, `[MEDIA] rx frames: ${rxFrames}`);
+        }
+        // If you want STT, forward msg.media.payload (base64 PCM16 8k) to your STT engine here.
+        break;
+
+      case 'stop':
+        log(id, `[WS] STOP (rx=${rxFrames})`);
+        stopKeepAlive();
+        break;
+
+      default:
+        // ignore others (mark/clear/whatever)
+        break;
     }
   });
 
-  ff.on('close', (code) => {
-    if (code !== 0) {
-      const msg = `[TTS] ffmpeg exited ${code}`;
-      console.error(msg);
-      sendAlertEmail('[ERROR] ffmpeg TTS', msg).catch(() => {});
-    }
-    // optional: mark end-of-utterance
-    try { sendMark(ws, 'tts_end'); } catch {}
+  ws.on('close', () => {
+    stopKeepAlive();
+    log(id, '[WS] CLOSE');
   });
 
-  ff.stderr.on('data', d => console.error('[ffmpeg]', d.toString()));
-}
-
-/**
- * Tiny utility to generate a short beep using ffmpeg’s sine filter.
- */
-async function toneBeep(ws, hz = 440, seconds = 0.05) {
-  const outFmt = AUDIO_FORMAT === 'mulaw' ? 'mulaw' : 's16le';
-  const args = [
-    '-hide_banner', '-loglevel', 'error',
-    '-f', 'lavfi', '-i', `sine=frequency=${hz}:sample_rate=8000:duration=${seconds}`,
-    '-ar', '8000', '-ac', '1',
-    '-f', outFmt, 'pipe:1'
-  ];
-  const ff = spawn(FFMPEG, args);
-
-  let buffers = [];
-  ff.stdout.on('data', (chunk) => buffers.push(chunk));
-  ff.on('close', () => {
-    const buff = Buffer.concat(buffers);
-    for (let off = 0; off + FRAME_BYTES <= buff.length; off += FRAME_BYTES) {
-      sendFrameToTwilio(ws, buff.subarray(off, off + FRAME_BYTES));
-    }
+  ws.on('error', (err) => {
+    stopKeepAlive();
+    log(id, `[WS] ERROR ${err.message}`);
   });
-  ff.stderr.on('data', d => console.error('[ffmpeg beep]', d.toString()));
-}
+});
