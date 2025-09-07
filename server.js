@@ -7,7 +7,6 @@ import fetch from "node-fetch";
 import { spawn } from "child_process";
 import ffmpegPath from "@ffmpeg-installer/ffmpeg";
 import { createClient } from "@supabase/supabase-js";
-import sgMail from "@sendgrid/mail";
 import Twilio from "twilio";
 
 // ───────────────────────────────────────────────────────────────────────────────
