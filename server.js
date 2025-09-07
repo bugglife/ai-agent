@@ -6,105 +6,98 @@ import { WebSocketServer } from "ws";
 import prism from "prism-media";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 
-// ───────────────────────────────────────────────────────────────
-// CONFIG
-// ───────────────────────────────────────────────────────────────
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// ElevenLabs (TTS)
+// Config
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
 const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL";
-if (!ELEVEN_API_KEY) console.error("❌ ELEVEN_API_KEY is not set");
+const BIZ = { name: process.env.BIZ_NAME || "Clean Easy" };
 
-// OpenAI / Deepgram (STT)
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
-if (!OPENAI_API_KEY) console.error("❌ OPENAI_API_KEY is not set");
-if (!DEEPGRAM_API_KEY) console.error("❌ DEEPGRAM_API_KEY is not set");
+if (!ELEVEN_API_KEY) console.error("❌ ELEVEN_API_KEY missing");
 
-// Business context
-const BIZ = {
-  name: process.env.BIZ_NAME || "Clean Easy",
-};
+// ──────────────────────────────────────────────
+// Helpers
+// ──────────────────────────────────────────────
 
-// ───────────────────────────────────────────────────────────────
-// HELPERS
-// ───────────────────────────────────────────────────────────────
-
-// Convert ElevenLabs MP3 stream → PCM16/8k/mono with ffmpeg
-function mp3ToPcm16Transformer() {
+// ffmpeg transformer MP3 → PCM16/8k/mono
+function mp3ToPCM16() {
   return new prism.FFmpeg({
     ffmpegPath: ffmpegInstaller.path,
     args: [
-      "-hide_banner", "-loglevel", "error",
+      "-hide_banner",
+      "-loglevel", "error",
       "-f", "mp3", "-i", "pipe:0",
       "-ac", "1",
       "-ar", "8000",
-      "-f", "s16le", "pipe:1"
+      "-f", "s16le",
+      "pipe:1"
     ]
   });
 }
 
-// Example TTS fetch from ElevenLabs
+// Call ElevenLabs → returns ReadableStream (MP3)
 async function elevenLabsTTS(text) {
-  const response = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
+  const resp = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream`,
     {
       method: "POST",
       headers: {
         "xi-api-key": ELEVEN_API_KEY,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        text,
-        voice_settings: { stability: 0.5, similarity_boost: 0.8 }
-      })
+      body: JSON.stringify({ text })
     }
   );
 
-  if (!response.ok) {
-    throw new Error(`[TTS] ElevenLabs error: ${response.statusText}`);
+  if (!resp.ok) {
+    throw new Error(`TTS error: ${resp.status} ${await resp.text()}`);
   }
 
-  return response.body; // returns a Readable stream (MP3)
+  return resp.body; // Node.js Readable (MP3)
 }
 
-// ───────────────────────────────────────────────────────────────
-// WEBSOCKET SERVER (for Twilio Media Streams)
-// ───────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────
+// WebSocket: Twilio Media Stream
+// ──────────────────────────────────────────────
 const wss = new WebSocketServer({ noServer: true });
 
-wss.on("connection", (ws) => {
+wss.on("connection", async (ws) => {
   console.log("📞 WebSocket connected");
 
-  // Example greeting when call connects
-  elevenLabsTTS(`Hi! I'm your AI receptionist at ${BIZ.name}. How can I help you today?`)
-    .then((mp3Stream) => {
-      const transformer = mp3ToPcm16Transformer();
-      mp3Stream.pipe(transformer).on("data", (chunk) => {
-        // Send PCM16 to Twilio (wrap in Twilio media message)
-        ws.send(JSON.stringify({
+  try {
+    // Greeting
+    const mp3Stream = await elevenLabsTTS(
+      `Hi! I’m your AI receptionist at ${BIZ.name}. How can I help you today?`
+    );
+
+    const ffmpeg = mp3ToPCM16();
+
+    mp3Stream.pipe(ffmpeg).on("data", (chunk) => {
+      ws.send(
+        JSON.stringify({
           event: "media",
-          media: {
-            payload: chunk.toString("base64")
-          }
-        }));
-      });
-    })
-    .catch((err) => console.error("[TTS ERROR]", err));
+          media: { payload: chunk.toString("base64") }
+        })
+      );
+    });
+
+    ffmpeg.on("end", () => {
+      console.log("✅ Greeting finished");
+    });
+  } catch (err) {
+    console.error("❌ Greeting failed:", err);
+  }
 });
 
-// ───────────────────────────────────────────────────────────────
-// EXPRESS SETUP
-// ───────────────────────────────────────────────────────────────
-app.get("/", (req, res) => {
-  res.send("✅ Server is running");
-});
+// ──────────────────────────────────────────────
+// Express
+// ──────────────────────────────────────────────
+app.get("/", (req, res) => res.send("✅ Server is running"));
 
-const server = app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+const server = app.listen(PORT, () =>
+  console.log(`🚀 Server running on port ${PORT}`)
+);
 
 server.on("upgrade", (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => {
