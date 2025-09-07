@@ -1,6 +1,6 @@
 import express from "express";
 import fetch from "node-fetch";
-import { WebSocketServer } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 import { spawn } from "child_process";
 import ffmpegBin from "@ffmpeg-installer/ffmpeg";
 
@@ -157,8 +157,6 @@ async function streamFrames(ws, raw) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Simple intent router (expand later)
-// ───────────────────────────────────────────────────────────────────────────────
 function routeIntent(text) {
   const q = text.toLowerCase();
   if (q.includes("hour") || q.includes("open") || q.includes("close")) {
@@ -176,9 +174,7 @@ function connectDeepgram(onTranscript) {
     return null;
   }
   const url = `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&punctuate=true&vad_events=true&endpointing=true`;
-  const dg = new (require("ws"))(url, {
-    headers: { Authorization: `Token ${DG_KEY}` },
-  });
+  const dg = new WebSocket(url, { headers: { Authorization: `Token ${DG_KEY}` } });
 
   dg.on("open", () => console.log("[DG] connected"));
   dg.on("message", (d) => {
@@ -205,12 +201,10 @@ wss.on("connection", (ws) => {
   ws._rx = 0;
   ws._speaking = false;
 
-  // Deepgram session for this call
   const dg = connectDeepgram(async (finalText) => {
     console.log(`[ASR] ${finalText}`);
-    if (ws._speaking) return; // ignore while we are talking
+    if (ws._speaking) return;
 
-    // craft reply and speak
     const reply = routeIntent(finalText);
     ws._speaking = true;
     try {
@@ -235,12 +229,10 @@ wss.on("connection", (ws) => {
       ws._streamSid = msg.start?.streamSid;
       console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${ws._streamSid}`);
 
-      // 1) Beep so we know format is correct
       if (MEDIA_FORMAT === "mulaw") await streamFrames(ws, makeBeepMulaw());
       else await streamFrames(ws, makeBeepPcm16());
       console.log("[BEEP] done.");
 
-      // 2) Greeting
       try {
         console.log(`[TTS] streaming greeting as ${MEDIA_FORMAT}…`);
         const text = "Hi! I'm your AI receptionist at Clean Easy. How can I help you today?";
@@ -253,7 +245,6 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.event === "media") {
-      // forward inbound audio to Deepgram (as PCM16)
       ws._rx++;
       if (ws._rx % 100 === 0) console.log(`[MEDIA] frames received: ${ws._rx}`);
       if (dg && dg.readyState === dg.OPEN && !ws._speaking) {
@@ -269,9 +260,7 @@ wss.on("connection", (ws) => {
     }
   });
 
-  ws.on("close", () => {
-    console.log("[WS] CLOSE code=1005");
-  });
+  ws.on("close", () => console.log("[WS] CLOSE code=1005"));
   ws.on("error", (err) => console.error("[WS] error", err));
 });
 
