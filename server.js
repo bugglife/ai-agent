@@ -11,6 +11,59 @@ import sgMail from "@sendgrid/mail";
 import Twilio from "twilio";
 
 // ───────────────────────────────────────────────────────────────────────────────
+// SendGrid alert helper (voicemail/errors/ops notifications)
+// ───────────────────────────────────────────────────────────────────────────────
+import sgMail from "@sendgrid/mail";
+if (process.env.SENDGRID_API_KEY) {
+  try {
+    sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+  } catch (_) {}
+}
+
+async function sendAlertEmail({
+  subject,
+  text,
+  html,          // optional; if omitted we’ll fall back to text
+  to = process.env.ALERT_EMAIL_TO,
+}) {
+  if (!process.env.SENDGRID_API_KEY) {
+    console.warn("[ALERT] SENDGRID_API_KEY missing; skipping email.");
+    return;
+  }
+  if (!to || !process.env.ALERT_EMAIL_FROM) {
+    console.warn("[ALERT] ALERT_EMAIL_TO or ALERT_EMAIL_FROM missing; skipping email.");
+    return;
+  }
+
+  const msg = {
+    to,
+    from: {
+      email: process.env.ALERT_EMAIL_FROM,         // ex: alerts@bookcleaneasy.com
+      name: "CleanEasy Alerts",                    // display name
+    },
+    replyTo: process.env.ALERT_EMAIL_REPLY_TO || "support@bookcleaneasy.com",
+    subject,
+    // Prefer text for deliverability; include simple HTML if provided
+    text: text || (html ? html.replace(/<[^>]+>/g, " ") : ""),
+    html: html || `<pre style="font-family:ui-monospace, Menlo, monospace; white-space:pre-wrap">${(text||"").replace(/&/g,"&amp;").replace(/</g,"&lt;")}</pre>`,
+    trackingSettings: {
+      clickTracking: { enable: false, enableText: false },
+      openTracking: { enable: true },
+    },
+    mailSettings: {
+      sandboxMode: { enable: false },
+    },
+  };
+
+  try {
+    await sgMail.send(msg);
+    console.log("[ALERT] Email sent:", subject);
+  } catch (err) {
+    console.error("[ALERT] SendGrid failed:", err?.response?.body || err?.message || err);
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
 // ENV / CONFIG
 // ───────────────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 10000;
