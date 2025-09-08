@@ -4,9 +4,9 @@ import WebSocket, { WebSocketServer } from "ws";
 import { spawn } from "child_process";
 import ffmpegBin from "@ffmpeg-installer/ffmpeg";
 
-/* ──────────────────────────────────────────────────────────────────────────
-   Config
-   ────────────────────────────────────────────────────────────────────────── */
+// ───────────────────────────────────────────────────────────────────────────────
+// Config
+// ───────────────────────────────────────────────────────────────────────────────
 const app = express();
 const PORT = process.env.PORT || 10000;
 
@@ -20,7 +20,7 @@ if (!["pcm16", "mulaw"].includes(MEDIA_FORMAT)) {
   console.warn(`⚠️ Unknown TWILIO_MEDIA_FORMAT='${MEDIA_FORMAT}', defaulting to pcm16`);
 }
 
-/* Timing / frame sizes */
+// Timing / frame sizes
 const SAMPLE_RATE = 8000;
 const FRAME_MS = 20;
 const BYTES_PER_SAMPLE_PCM16 = 2;
@@ -28,13 +28,9 @@ const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS; // 160 @ 8kHz, 20ms
 const BYTES_PER_FRAME_PCM16 = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE_PCM16; // 320
 const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1; // 160
 
-/* Dialog timing */
-const BARGE_IN_HOLD_MS = 1200;  // ignore ASR for this long after we finish speaking
-const REASK_COOLDOWN_MS = 5000; // don't repeat the same question faster than this
-
-/* ──────────────────────────────────────────────────────────────────────────
-   Utilities (beeps + μ-law compand/decompand)
-   ────────────────────────────────────────────────────────────────────────── */
+// ───────────────────────────────────────────────────────────────────────────────
+// Utilities (beeps + μ-law compand/decompand)
+// ───────────────────────────────────────────────────────────────────────────────
 function makeBeepPcm16(ms = 180, hz = 950) {
   const samples = Math.floor((SAMPLE_RATE * ms) / 1000);
   const buf = Buffer.alloc(samples * BYTES_PER_SAMPLE_PCM16);
@@ -74,7 +70,7 @@ function makeBeepMulaw(ms = 180, hz = 950) {
   return out;
 }
 
-/* Decode incoming Twilio frame → PCM16 (Deepgram needs linear16) */
+// Decode incoming Twilio frame → PCM16 (Deepgram needs linear16)
 function inboundToPCM16(buf) {
   if (MEDIA_FORMAT === "pcm16") return buf; // already LE s16
   // μ-law → PCM16
@@ -85,9 +81,9 @@ function inboundToPCM16(buf) {
   return out;
 }
 
-/* ──────────────────────────────────────────────────────────────────────────
-   TTS via ElevenLabs (MP3) → ffmpeg → target format buffer
-   ────────────────────────────────────────────────────────────────────────── */
+// ───────────────────────────────────────────────────────────────────────────────
+// TTS via ElevenLabs (MP3) → ffmpeg → target format buffer
+// ───────────────────────────────────────────────────────────────────────────────
 async function ttsElevenLabsRaw(text) {
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
   const res = await fetch(url, {
@@ -104,6 +100,7 @@ async function ttsElevenLabsRaw(text) {
   }
   return Buffer.from(await res.arrayBuffer());
 }
+
 function ffmpegTranscode(inputBuf, args) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -115,6 +112,7 @@ function ffmpegTranscode(inputBuf, args) {
     ff.stdin.end(inputBuf);
   });
 }
+
 async function ttsToPcm16(text) {
   const input = await ttsElevenLabsRaw(text);
   console.log("[TTS] Received MP3. → PCM16/8k/mono");
@@ -136,9 +134,7 @@ async function ttsToMulaw(text) {
   ]);
 }
 
-/* ──────────────────────────────────────────────────────────────────────────
-   Outbound streaming (Twilio frames)
-   ────────────────────────────────────────────────────────────────────────── */
+// Stream TTS frames out to Twilio
 async function streamFrames(ws, raw) {
   const bytesPerFrame = MEDIA_FORMAT === "mulaw" ? BYTES_PER_FRAME_MULAW : BYTES_PER_FRAME_PCM16;
   let offset = 0, frames = 0;
@@ -158,165 +154,149 @@ async function streamFrames(ws, raw) {
   }
 }
 
-/* ──────────────────────────────────────────────────────────────────────────
-   Conversation helpers (FSM, parsing, availability)
-   ────────────────────────────────────────────────────────────────────────── */
-
-function basePrompt() {
-  return "I can help with pricing, booking, and availability. What would you like to do?";
-}
-
-function parseDateTime(text) {
-  // days
-  const dayMap = {
-    sunday: 0, monday: 1, tuesday: 2, wednesday: 3,
-    thursday: 4, friday: 5, saturday: 6,
-  };
-  const lower = text.toLowerCase();
-  let dayIdx = null;
-  for (const d in dayMap) {
-    if (lower.includes(d)) { dayIdx = dayMap[d]; break; }
-  }
-  // time: "2", "2pm", "2:30", "14:00"
-  const m = lower.match(/(\b\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
-  if (!m && dayIdx == null) return null;
-
-  let h = m ? parseInt(m[1], 10) : null;
-  let min = m && m[2] ? parseInt(m[2], 10) : 0;
-  const ap = m && m[3] ? m[3] : null;
-
-  if (h != null) {
-    if (ap === "pm" && h < 12) h += 12;
-    if (ap === "am" && h === 12) h = 0;
-    if (!ap && h <= 7) h += 12; // "2" → assume afternoon
-  }
-
-  return { dayIdx, hour: h, minute: min };
-}
-
-// Replace this with your real availability system later
-function checkAvailability({ dayIdx, hour, minute }) {
-  // assume slots every hour 9–5 except lunch at 12
-  const hh = hour ?? 9;
-  const slots = [];
-  for (let i = 9; i <= 17; i++) if (i !== 12) slots.push(`${i % 12 || 12}:00`);
-  const requested = `${(hh % 12) || 12}:${(minute ?? 0).toString().padStart(2, "0")}`;
-  const ok = slots.includes(`${(hh % 12) || 12}:00`);
-  return {
-    ok,
-    requested,
-    suggestions: ok ? [requested] : slots.slice(0, 3),
-  };
-}
-
+// Small helper that wraps TTS + stream + speaking gate
 async function speak(ws, text) {
+  if (ws._speaking) return;
   ws._speaking = true;
   try {
     const out = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text) : await ttsToPcm16(text);
     await streamFrames(ws, out);
+  } catch (e) {
+    console.error("[TTS] speak failed:", e.message);
   } finally {
     ws._speaking = false;
-    ws._asrHoldUntil = Date.now() + BARGE_IN_HOLD_MS;
   }
 }
 
-function shouldReask(ws, promptKey) {
+// ───────────────────────────────────────────────────────────────────────────────
+// Company FAQ + Booking-focused flow
+// ───────────────────────────────────────────────────────────────────────────────
+const COMPANY = {
+  name: "Clean Easy",
+  phone: "(555) 123-4567",
+  email: "hello@bookcleaneasy.com",
+  website: "bookcleaneasy.com",
+  hours: "We’re open 8 AM–6 PM Monday–Friday, and 9 AM–2 PM on Saturday.",
+  area: "We serve the greater metro area within a 25-minute drive.",
+  guarantee: "If anything was missed, let us know within 24 hours and we’ll make it right.",
+  cancellation: "Please give 24 hours notice to avoid a cancellation fee.",
+  supplies: "Our teams bring supplies and equipment. If you prefer eco-friendly products, just ask.",
+  pets: "We’re pet-friendly. Please secure pets if they’re anxious around vacuums.",
+  services: "Standard, Deep, and Move-in/Move-out cleanings.",
+  duration: "Most homes take 2–4 hours depending on size and condition.",
+  prep: "Please tidy up surfaces and pick up items from floors so we can focus on cleaning.",
+  payment: "We accept major credit cards and payment is due at the time of service."
+};
+
+const FAQS = [
+  { triggers: ["hour","open","close","time"], answer: () => COMPANY.hours },
+  { triggers: ["call","phone","number","contact"], answer: () => `You can reach us at ${COMPANY.phone}.` },
+  { triggers: ["email","mail"], answer: () => `Our email is ${COMPANY.email}.` },
+  { triggers: ["where","area","serve","service area","coverage"], answer: () => COMPANY.area },
+  { triggers: ["guarantee","warranty","quality"], answer: () => COMPANY.guarantee },
+  { triggers: ["cancel","cancellation","reschedule","rescheduling"], answer: () => COMPANY.cancellation },
+  { triggers: ["supply","supplies","equipment","products"], answer: () => COMPANY.supplies },
+  { triggers: ["pet","dog","cat","animal"], answer: () => COMPANY.pets },
+  { triggers: ["service","what do you do","deep","move"], answer: () => COMPANY.services },
+  { triggers: ["how long","duration","time take","hours take"], answer: () => COMPANY.duration },
+  { triggers: ["prep","prepare","before","ready"], answer: () => COMPANY.prep },
+  { triggers: ["pay","payment","card","credit"], answer: () => COMPANY.payment },
+  { triggers: ["website","site"], answer: () => `You can also visit ${COMPANY.website}.` },
+];
+
+function answerFromKB(text) {
+  const q = text.toLowerCase();
+  for (const item of FAQS) {
+    if (item.triggers.some(t => q.includes(t))) {
+      return typeof item.answer === "function" ? item.answer(q) : item.answer;
+    }
+  }
+  return null;
+}
+
+// naive date/time recognizer to move the flow forward (no external libs)
+function detectDateTime(text) {
+  const q = text.toLowerCase();
+  const hasDay =
+    /(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow)/.test(q) ||
+    /\b(0?[1-9]|1[0-2])\/([0-2]?[0-9]|3[01])\b/.test(q) || // 3/14
+    /\b([0-2]?[0-9])-(0?[1-9]|1[0-2])\b/.test(q);          // 14-3
+
+  const timeMatch = q.match(/\b([0-1]?[0-9]|2[0-3])(:[0-5][0-9])?\s?(am|pm)?\b/);
+  if (hasDay && timeMatch) return true;
+  // “this saturday at 2” style
+  if (/(saturday|sunday|monday|tuesday|wednesday|thursday|friday)\s+at\s+([0-1]?[0-9]|2[0-3])/.test(q)) return true;
+  return false;
+}
+
+function basePrompt() {
+  return "I can help you book an appointment and answer questions about Clean Easy. What can I help with?";
+}
+
+// prevent rapid re-asks
+function shouldReask(ws, key, ms = 6000) {
   const now = Date.now();
-  if (ws._lastPromptKey !== promptKey) return true;
-  return (now - (ws._lastPromptAt || 0)) > REASK_COOLDOWN_MS;
+  if (ws._lastPromptKey === key && ws._lastPromptAt && now - ws._lastPromptAt < ms) return false;
+  ws._lastPromptKey = key;
+  ws._lastPromptAt = now;
+  return true;
 }
 
 async function handleUtterance(ws, txt) {
-  // basic guard: ignore speech while we're within the post-TTS hold
-  if ((ws._asrHoldUntil || 0) > Date.now()) return;
-
   const q = txt.toLowerCase();
 
-  // If we aren't in a flow yet, route high-level intent
+  // 1) FAQ first
+  const kb = answerFromKB(q);
+  if (kb) {
+    await speak(ws, kb + " Would you like to book an appointment?");
+    return;
+  }
+
+  // Ensure ctx exists
+  ws._ctx = ws._ctx || { flow: null, awaiting: null, datetime: null };
+
+  // 2) New intent → booking by default
   if (!ws._ctx.flow) {
-    if (q.includes("price")) {
-      ws._ctx.flow = "pricing";
-      await speak(ws, "For standard cleanings we start at one hundred fifty dollars. Would you like to check availability?");
-      return;
-    }
-    if (q.includes("book") || q.includes("availability") || q.includes("available")) {
+    if (q.includes("book") || q.includes("availability") || q.includes("available") || q.includes("appointment")) {
       ws._ctx.flow = "availability";
       ws._ctx.awaiting = "datetime";
       if (shouldReask(ws, "ask-dt")) {
-        ws._lastPromptKey = "ask-dt"; ws._lastPromptAt = Date.now();
         await speak(ws, "Sure—what date and time are you looking for?");
       }
       return;
     }
-    if (q.includes("hour") || q.includes("open") || q.includes("close")) {
-      await speak(ws, "We’re open eight a m to six p m Monday through Friday, and nine a m to two p m on Saturday. Would you like to check availability?");
-      return;
-    }
+    // No intent → prompt
     await speak(ws, basePrompt());
     return;
   }
 
-  // Availability flow
+  // 3) Booking flow (very light)
   if (ws._ctx.flow === "availability") {
     if (ws._ctx.awaiting === "datetime") {
-      const dt = parseDateTime(q);
-      if (!dt) {
-        if (shouldReask(ws, "ask-dt")) {
-          ws._lastPromptKey = "ask-dt"; ws._lastPromptAt = Date.now();
-          await speak(ws, "Got it. Could you share the date and time you're looking for? For example, Saturday at two p m.");
-        }
-        return;
-      }
-      ws._ctx.request = dt;
-      const result = checkAvailability(dt);
-      if (result.ok) {
+      if (detectDateTime(q)) {
+        ws._ctx.datetime = txt;
         ws._ctx.awaiting = null;
-        await speak(ws, `We have availability at ${result.requested}. Would you like me to reserve that slot?`);
-        ws._ctx.awaiting = "confirm";
+        // You can plug a real availability check here later
+        await speak(ws, `Great. We likely have availability ${txt}. I can pencil this in and a teammate will confirm shortly. Anything else I can help with?`);
+        // reset flow so conversation can continue
+        ws._ctx = { flow: null, awaiting: null, datetime: null };
         return;
       } else {
-        ws._ctx.awaiting = "choice";
-        await speak(ws, `I don’t have that exact time free. I can offer ${result.suggestions.join(", ")}. Which works best?`);
-        return;
-      }
-    }
-
-    if (ws._ctx.awaiting === "choice") {
-      const dt = parseDateTime(q);
-      if (dt) {
-        const result = checkAvailability(dt);
-        if (result.ok) {
-          ws._ctx.awaiting = "confirm";
-          await speak(ws, `Great, ${result.requested} works. Should I book it?`);
-          return;
+        if (shouldReask(ws, "ask-dt")) {
+          await speak(ws, "Got it. Could you share the date and time you prefer? For example, Saturday at 2 PM.");
         }
+        return;
       }
-      // fallback pick first suggestion verbally
-      await speak(ws, "I can do two p m, three p m, or four p m. Which would you prefer?");
-      return;
-    }
-
-    if (ws._ctx.awaiting === "confirm") {
-      if (q.includes("yes") || q.includes("book") || q.includes("sure") || q.includes("confirm")) {
-        await speak(ws, "All set. I’ve reserved that slot. Anything else I can help with?");
-        ws._ctx = {}; // reset flow
-      } else if (q.includes("no") || q.includes("cancel")) {
-        ws._ctx = {};
-        await speak(ws, "No problem. Anything else I can help with?");
-      } else {
-        await speak(ws, "Should I go ahead and book that time?");
-      }
-      return;
     }
   }
 
-  // If we fall through, give the base prompt to keep the conversation going
+  // 4) Fallback
   await speak(ws, basePrompt());
 }
 
-/* ──────────────────────────────────────────────────────────────────────────
-   Deepgram realtime: forward inbound audio, get transcripts
-   ────────────────────────────────────────────────────────────────────────── */
+// ───────────────────────────────────────────────────────────────────────────────
+// Deepgram realtime: forward inbound audio, get transcripts
+// ───────────────────────────────────────────────────────────────────────────────
 function connectDeepgram(onTranscript) {
   if (!DG_KEY) {
     console.warn("⚠️ DEEPGRAM_API_KEY missing — STT disabled.");
@@ -340,24 +320,27 @@ function connectDeepgram(onTranscript) {
   return dg;
 }
 
-/* ──────────────────────────────────────────────────────────────────────────
-   WebSocket (Twilio <Stream> → wss://…/stream)
-   ────────────────────────────────────────────────────────────────────────── */
+// ───────────────────────────────────────────────────────────────────────────────
+// WebSocket (Twilio <Stream> → wss://…/stream)
+// ───────────────────────────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", (ws) => {
   console.log("🔗 WebSocket connected");
   ws._rx = 0;
   ws._speaking = false;
-  ws._asrHoldUntil = 0;
-  ws._ctx = {}; // conversation state
-  ws._lastPromptKey = null;
+  ws._ctx = { flow: null, awaiting: null, datetime: null };
   ws._lastPromptAt = 0;
+  ws._lastPromptKey = "";
 
   const dg = connectDeepgram(async (finalText) => {
     console.log(`[ASR] ${finalText}`);
-    if (ws._speaking) return;
-    await handleUtterance(ws, finalText);
+    if (ws._speaking) return; // don't ASR-while-speaking to reduce barge-in
+    try {
+      await handleUtterance(ws, finalText);
+    } catch (e) {
+      console.error("[FLOW] error:", e.message);
+    }
   });
 
   ws.on("message", async (data) => {
@@ -377,9 +360,8 @@ wss.on("connection", (ws) => {
       console.log("[BEEP] done.");
 
       try {
-        console.log(`[TTS] streaming greeting as ${MEDIA_FORMAT}…`);
-        const text = "Hi! I'm your AI receptionist at Clean Easy. How can I help you today?";
-        await speak(ws, text);
+        console.log(`[TTS] greeting… (${MEDIA_FORMAT})`);
+        await speak(ws, "Hi! I’m your AI receptionist at Clean Easy. I can help you book an appointment and answer questions. What can I help with?");
       } catch (e) {
         console.error("[TTS] greeting failed:", e.message);
       }
@@ -388,7 +370,7 @@ wss.on("connection", (ws) => {
     if (msg.event === "media") {
       ws._rx++;
       if (ws._rx % 100 === 0) console.log(`[MEDIA] frames received: ${ws._rx}`);
-      if (dg && dg.readyState === dg.OPEN && !ws._speaking && (ws._asrHoldUntil || 0) <= Date.now()) {
+      if (dg && dg.readyState === dg.OPEN && !ws._speaking) {
         const b = Buffer.from(msg.media.payload, "base64");
         const pcm16 = inboundToPCM16(b);
         dg.send(pcm16);
@@ -405,9 +387,9 @@ wss.on("connection", (ws) => {
   ws.on("error", (err) => console.error("[WS] error", err));
 });
 
-/* ──────────────────────────────────────────────────────────────────────────
-   HTTP: health + debug speak
-   ────────────────────────────────────────────────────────────────────────── */
+// ───────────────────────────────────────────────────────────────────────────────
+// HTTP: health + debug speak
+// ───────────────────────────────────────────────────────────────────────────────
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/debug/say", async (req, res) => {
   try {
@@ -420,7 +402,7 @@ app.get("/debug/say", async (req, res) => {
   }
 });
 
-/* ────────────────────────────────────────────────────────────────────────── */
+// ───────────────────────────────────────────────────────────────────────────────
 const server = app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 server.on("upgrade", (req, socket, head) => {
   if (req.url !== "/stream") return socket.destroy();
