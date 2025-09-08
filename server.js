@@ -1,9 +1,9 @@
 import express from "express";
 import fetch from "node-fetch";
 import { WebSocketServer } from "ws";
-import WebSocket from "ws";
 import { spawn } from "child_process";
 import ffmpegBin from "@ffmpeg-installer/ffmpeg";
+import { createClient } from "@supabase/supabase-js";
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Config
@@ -13,17 +13,25 @@ const PORT = process.env.PORT || 10000;
 
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
 const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL";
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
-
-// pcm16 | mulaw  (set in Render env)
 const MEDIA_FORMAT = (process.env.TWILIO_MEDIA_FORMAT || "pcm16").toLowerCase();
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
+
+const BOOKING_DURATION_MIN = parseInt(process.env.BOOKING_DURATION_MIN || "120", 10);
+const TIMEZONE = process.env.TIMEZONE || "UTC";
 
 if (!ELEVEN_API_KEY) console.error("❌ ELEVEN_API_KEY is not set");
 if (!ELEVEN_VOICE_ID) console.error("❌ ELEVEN_VOICE_ID is not set");
-if (!DEEPGRAM_API_KEY) console.error("❌ DEEPGRAM_API_KEY is not set");
 if (!["pcm16", "mulaw"].includes(MEDIA_FORMAT)) {
   console.warn(`⚠️ Unknown TWILIO_MEDIA_FORMAT='${MEDIA_FORMAT}', defaulting to pcm16`);
 }
+
+if (!SUPABASE_URL) console.error("❌ SUPABASE_URL not set");
+if (!SUPABASE_SERVICE_ROLE) console.error("❌ SUPABASE_SERVICE_ROLE not set");
+
+// Supabase (server-side)
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
 
 // Common timing
 const SAMPLE_RATE = 8000;
@@ -36,9 +44,9 @@ const BYTES_PER_FRAME_PCM16 = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE_PCM16; // 320
 const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1; // 160 (8-bit)
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Utilities (beep generators & μ-law helpers)
+// Utilities (beep generators in the chosen format)
 // ───────────────────────────────────────────────────────────────────────────────
-function makeBeepPcm16(ms = 180, hz = 950) {
+function makeBeepPcm16(ms = 200, hz = 1000) {
   const samples = Math.floor((SAMPLE_RATE * ms) / 1000);
   const buf = Buffer.alloc(samples * BYTES_PER_SAMPLE_PCM16);
   for (let i = 0; i < samples; i++) {
@@ -49,7 +57,7 @@ function makeBeepPcm16(ms = 180, hz = 950) {
   return buf;
 }
 
-// μ-law compand/expand
+// µ-law companding tables (fast)
 function linearToMulawSample(s) {
   const BIAS = 0x84;
   const CLIP = 32635;
@@ -63,7 +71,9 @@ function linearToMulawSample(s) {
   let ulaw = ~(sign | (exponent << 4) | mantissa);
   return ulaw & 0xff;
 }
-function pcm16ToMulaw(pcm) {
+
+function makeBeepMulaw(ms = 200, hz = 1000) {
+  const pcm = makeBeepPcm16(ms, hz);
   const out = Buffer.alloc(pcm.length / 2);
   for (let i = 0, j = 0; i < pcm.length; i += 2, j++) {
     const s = pcm.readInt16LE(i);
@@ -71,30 +81,9 @@ function pcm16ToMulaw(pcm) {
   }
   return out;
 }
-function mulawToPcm16(ulaw) {
-  // Fast μ-law decode to PCM16
-  const MULAW_MAX = 0x1fff;
-  const MULAW_BIAS = 33;
-  const out = Buffer.alloc(ulaw.length * 2);
-  for (let i = 0, j = 0; i < ulaw.length; i++, j += 2) {
-    let u = ~ulaw[i] & 0xff;
-    let sign = (u & 0x80) ? -1 : 1;
-    let exponent = (u >> 4) & 0x07;
-    let mantissa = u & 0x0f;
-    let sample = ((mantissa << 3) + MULAW_BIAS) << exponent;
-    sample = sign * sample;
-    if (sample > 32767) sample = 32767;
-    if (sample < -32768) sample = -32768;
-    out.writeInt16LE(sample, j);
-  }
-  return out;
-}
-function makeBeepMulaw(ms = 180, hz = 950) {
-  return pcm16ToMulaw(makeBeepPcm16(ms, hz));
-}
 
 // ───────────────────────────────────────────────────────────────────────────────
-// TTS: ElevenLabs → (PCM16 | μ-law) via ffmpeg
+// Transcoding helpers (ElevenLabs → desired format)
 // ───────────────────────────────────────────────────────────────────────────────
 async function ttsElevenLabsRaw(text) {
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
@@ -116,6 +105,7 @@ async function ttsElevenLabsRaw(text) {
   }
   return Buffer.from(await res.arrayBuffer());
 }
+
 function ffmpegTranscode(inputBuf, args) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -127,6 +117,7 @@ function ffmpegTranscode(inputBuf, args) {
     ff.stdin.end(inputBuf);
   });
 }
+
 async function ttsToPcm16(text) {
   const input = await ttsElevenLabsRaw(text);
   console.log("[TTS] Received MP3 container. Transcoding → PCM16/8k/mono");
@@ -142,9 +133,10 @@ async function ttsToPcm16(text) {
   if (out.length % 2 !== 0) out = out.slice(0, out.length - 1);
   return out;
 }
+
 async function ttsToMulaw(text) {
   const input = await ttsElevenLabsRaw(text);
-  console.log("[TTS] Received MP3 container. Transcoding → μ-law/8k/mono");
+  console.log("[TTS] Received MP3 container. Transcoding → µ-law/8k/mono");
   return await ffmpegTranscode(input, [
     "-hide_banner", "-nostdin", "-loglevel", "error",
     "-i", "pipe:0",
@@ -157,7 +149,7 @@ async function ttsToMulaw(text) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Outbound streaming helper (Twilio)
+// Outbound streaming (Twilio)
 // ───────────────────────────────────────────────────────────────────────────────
 async function streamFrames(ws, raw) {
   const bytesPerFrame =
@@ -194,155 +186,287 @@ async function streamFrames(ws, raw) {
   }
 }
 
-// A tiny queue so TTS never overlaps
-function say(ws, text) {
-  if (!ws._ttsQueue) ws._ttsQueue = Promise.resolve();
-  ws._ttsQueue = ws._ttsQueue.then(async () => {
-    console.log("[TTS] ->", text);
+// ───────────────────────────────────────────────────────────────────────────────
+// Availability helpers (Supabase)
+// ───────────────────────────────────────────────────────────────────────────────
+
+// Resolve casual date strings ("today", "tomorrow", "saturday", "10/12") to a YYYY-MM-DD (local).
+function resolveDate(dateStr) {
+  const s = (dateStr || "").toLowerCase().trim();
+  const now = new Date();
+  const dowMap = {
+    sunday: 0, sun: 0,
+    monday: 1, mon: 1,
+    tuesday: 2, tue: 2, tues: 2,
+    wednesday: 3, wed: 3,
+    thursday: 4, thu: 4, thurs: 4,
+    friday: 5, fri: 5,
+    saturday: 6, sat: 6,
+  };
+
+  if (s === "today") return toYMD(now);
+  if (s === "tomorrow") return toYMD(addDays(now, 1));
+
+  if (dowMap[s] !== undefined) {
+    const target = nextWeekday(now, dowMap[s]);
+    return toYMD(target);
+  }
+
+  // mm/dd
+  const m = s.match(/\b(\d{1,2})\/(\d{1,2})\b/);
+  if (m) {
+    const mm = parseInt(m[1], 10) - 1;
+    const dd = parseInt(m[2], 10);
+    const d = new Date(now.getFullYear(), mm, dd);
+    return toYMD(d);
+  }
+
+  // If not recognized, return null
+  return null;
+}
+
+function toYMD(d) {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function addDays(d, n) {
+  const x = new Date(d);
+  x.setDate(x.getDate() + n);
+  return x;
+}
+
+function nextWeekday(from, targetDow) {
+  const d = new Date(from);
+  const cur = d.getDay();
+  let delta = targetDow - cur;
+  if (delta <= 0) delta += 7;
+  d.setDate(d.getDate() + delta);
+  return d;
+}
+
+// Build start/end timestamps (UTC ISO) for a requested date+time, using BOOKING_DURATION_MIN
+function buildSlotRange(dateStr, timeStr) {
+  const ymd = resolveDate(dateStr);
+  if (!ymd || !timeStr) return null;
+
+  // timeStr like "14:00" (24h)
+  const [hh, mm] = timeStr.split(":").map((n) => parseInt(n, 10));
+  const local = new Date(`${ymd}T${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00`);
+  const start = new Date(local.getTime());
+  const end = new Date(local.getTime() + BOOKING_DURATION_MIN * 60 * 1000);
+
+  return { startISO: start.toISOString(), endISO: end.toISOString(), localStart: local };
+}
+
+// Query Supabase to see if there’s any overlapping appointment (booked/hold)
+async function isSlotAvailable(startISO, endISO) {
+  const { data, error } = await supabase
+    .from("appointments")
+    .select("id, starts_at, ends_at, status")
+    .or("status.eq.booked,status.eq.hold")
+    .lt("starts_at", endISO)
+    .gt("ends_at", startISO);
+
+  if (error) {
+    console.error("[AVAILABILITY] Supabase error:", error);
+    // Fail open (say “we’ll check and get back to you”) – but here we just return false.
+    return { ok: false, reason: "db_error" };
+  }
+  const conflict = (data || []).length > 0;
+  return { ok: true, available: !conflict };
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Dialog Manager helpers (parsing, speaking, debounce)
+// ───────────────────────────────────────────────────────────────────────────────
+async function speak(ws, text) {
+  try {
     const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text) : await ttsToPcm16(text);
     await streamFrames(ws, buf);
-  }).catch((e) => console.error("[TTS] error in queue:", e.message));
-  return ws._ttsQueue;
+  } catch (e) {
+    console.error("[TTS] speak error:", e.message);
+  }
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// ASR: Deepgram realtime (we forward Twilio audio → DG; handle transcripts)
-// ───────────────────────────────────────────────────────────────────────────────
-function connectDeepgram(ws) {
-  if (!DEEPGRAM_API_KEY) return;
+function parseDateTime(utterance) {
+  const text = (utterance || "").toLowerCase().trim();
 
-  const url = "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000";
-  const dg = new WebSocket(url, {
-    headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` },
-  });
+  const dayRe =
+    /\b(today|tomorrow|mon(day)?|tue(s(day)?)?|wed(nesday)?|thu(rs(day)?)?|fri(day)?|sat(urday)?|sun(day)?|\d{1,2}\/\d{1,2})\b/i;
+  const mDate = text.match(dayRe);
 
-  dg.on("open", () => console.log("[DG] connected"));
-  dg.on("close", () => console.log("[DG] close"));
-  dg.on("error", (err) => console.error("[DG] error", err));
+  const timeRe = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i;
+  const mTime = text.match(timeRe);
 
-  dg.on("message", (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      const alt = msg.channel?.alternatives?.[0];
-      const text = (alt?.transcript || "").trim();
-      const isFinal = !!msg.is_final;
-      if (!text) return;
-      if (isFinal) {
-        console.log("[ASR]", text);
-        onUserText(ws, text.toLowerCase());
-      }
-    } catch {}
-  });
+  let dateStr = mDate ? mDate[0] : null;
 
-  ws._dg = dg;
+  let timeStr = null;
+  if (mTime) {
+    let h = parseInt(mTime[1], 10);
+    let min = mTime[2] ? parseInt(mTime[2], 10) : 0;
+    const ap = mTime[3]?.toLowerCase();
+
+    if (ap === "pm" && h < 12) h += 12;
+    if (ap === "am" && h === 12) h = 0;
+
+    if (!ap && h <= 7) h += 12;
+
+    timeStr = `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+  }
+
+  return { dateStr, timeStr };
 }
 
-// feed Twilio media into DG (convert μ-law → pcm16 when needed)
-function sendAudioToDG(ws, base64Payload) {
-  if (!ws._dg || ws._dg.readyState !== WebSocket.OPEN) return;
-  const raw = Buffer.from(base64Payload, "base64");
-  const pcm = MEDIA_FORMAT === "mulaw" ? mulawToPcm16(raw) : raw; // pcm16 passes through
-  ws._dg.send(pcm);
+function detectIntent(text) {
+  const t = (text || "").toLowerCase();
+  if (/\b(hours?|closing|open)\b/.test(t)) return "ask_hours";
+  if (/\b(available|availability|book|schedule|appointment)\b/.test(t)) return "availability";
+  if (/\b(prices?|pricing|cost|rate)\b/.test(t)) return "pricing";
+  if (/\b(yes|correct|that works|sounds good|okay|ok)\b/.test(t)) return "affirm";
+  if (/\b(no|not really|change|different|actually)\b/.test(t)) return "negate";
+  return "unknown";
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Dialogue Manager – super simple rules + slots
-// ───────────────────────────────────────────────────────────────────────────────
-function initState(ws) {
+function initDM(ws) {
   ws._dm = {
-    step: "idle",
-    slots: { date: null, time: null, bedrooms: null },
-    lastActAt: Date.now(),
+    state: "idle",
+    slots: { date: null, time: null },
+    _debounceTimer: null,
+    _lastPartial: "",
   };
 }
-function onUserText(ws, text) {
-  ws._dm.lastActAt = Date.now();
 
-  // quick intent guessers
-  const has = (k) => text.includes(k);
-  const intent =
-    has("hour") || has("open") || has("close") ? "hours" :
-    has("price") || has("pricing") || has("cost") ? "pricing" :
-    has("availability") || has("available") || has("slot") ? "availability" :
-    has("book") || has("schedule") || has("appointment") ? "booking" :
-    has("bye") || has("goodbye") || has("thank") ? "goodbye" :
-    "other";
+function handleTranscript(ws, rawText, isFinal = false) {
+  if (!ws?._dm) initDM(ws);
+  const text = (rawText || "").trim();
+  if (!text) return;
 
-  console.log("[DM] intent=", intent, "step=", ws._dm.step);
+  const DEBOUNCE_MS = 1000;
+  if (ws._dm._debounceTimer) clearTimeout(ws._dm._debounceTimer);
 
-  // Simple slot filling for availability
-  const maybeDate = text.match(/\b(mon|tue|wed|thu|fri|sat|sun|today|tomorrow|\d{1,2}\/\d{1,2})\b/i);
-  const maybeTime = text.match(/\b(\d{1,2}(:\d{2})?\s?(am|pm)?)\b/i);
+  if (isFinal) {
+    processUserText(ws, text);
+  } else {
+    ws._dm._lastPartial = text;
+    ws._dm._debounceTimer = setTimeout(() => {
+      processUserText(ws, ws._dm._lastPartial);
+      ws._dm._lastPartial = "";
+    }, DEBOUNCE_MS);
+  }
+}
 
-  if (ws._dm.step === "awaiting_availability_details") {
-    if (maybeDate && !ws._dm.slots.date) ws._dm.slots.date = maybeDate[0];
-    if (maybeTime && !ws._dm.slots.time) ws._dm.slots.time = maybeTime[0];
+async function processUserText(ws, text) {
+  console.log("[ASR]", text);
 
-    if (ws._dm.slots.date && ws._dm.slots.time) {
-      say(ws, `Great. We have openings around ${ws._dm.slots.time} on ${ws._dm.slots.date}. Would you like me to book that for you?`);
-      ws._dm.step = "offer_booking";
-      return;
-    }
-    say(ws, "Got it. Could you share the date and time you're looking for?");
+  const intent = detectIntent(text);
+  const { dateStr, timeStr } = parseDateTime(text);
+
+  if (dateStr) ws._dm.slots.date = dateStr;
+  if (timeStr) ws._dm.slots.time = timeStr;
+
+  if (intent === "ask_hours") {
+    await speak(ws, "We're open Monday through Saturday, 8 a.m. to 6 p.m. How can I help you today?");
+    ws._dm.state = "idle";
     return;
   }
 
-  if (ws._dm.step === "offer_booking") {
-    if (has("yes") || has("yeah") || has("book")) {
-      say(ws, "Awesome — I’ll text you a confirmation link to finalize the booking. Is that okay?");
-      ws._dm.step = "confirm_sms";
+  if (ws._dm.state === "idle" && intent === "availability") {
+    ws._dm.state = "awaiting_availability_details";
+    ws._dm.slots = { date: null, time: null };
+    await speak(ws, "Sure, what date and time are you looking for?");
+    return;
+  }
+
+  if (ws._dm.state === "awaiting_availability_details") {
+    const haveDate = !!ws._dm.slots.date;
+    const haveTime = !!ws._dm.slots.time;
+
+    if (haveDate && haveTime) {
+      ws._dm.state = "confirm_availability";
+      const nice = `${ws._dm.slots.date} at ${ws._dm.slots.time.replace(":00", "")}`;
+      await speak(ws, `Just to confirm, you're looking for ${nice}, right?`);
       return;
     }
-    if (has("no")) {
-      say(ws, "No problem. Anything else I can help with — pricing, availability, or booking?");
-      ws._dm.step = "idle";
+
+    if (!haveDate && !haveTime) {
+      await speak(ws, "I caught part of that. Could you please share both the date and the time?");
+      return;
+    }
+    if (!haveDate) {
+      await speak(ws, "Got it. And what date did you have in mind?");
+      return;
+    }
+    if (!haveTime) {
+      await speak(ws, "Thanks. What time works best?");
       return;
     }
   }
 
-  if (ws._dm.step === "confirm_sms") {
-    if (has("yes")) {
-      say(ws, "Perfect. I’ve sent the link. Thanks for calling Clean Easy!");
-      ws._dm.step = "idle";
+  if (ws._dm.state === "confirm_availability") {
+    if (intent === "affirm") {
+      // Real check here
+      const slot = buildSlotRange(ws._dm.slots.date, ws._dm.slots.time);
+      if (!slot) {
+        ws._dm.state = "awaiting_availability_details";
+        await speak(ws, "I’m sorry, I didn’t quite catch the date and time. Could you repeat them?");
+        return;
+      }
+
+      const { startISO, endISO, localStart } = slot;
+      console.log("[AVAILABILITY] Checking", startISO, "→", endISO);
+
+      const chk = await isSlotAvailable(startISO, endISO);
+      if (!chk.ok) {
+        await speak(ws, "I’m having trouble checking right now. Can I text you a confirmation in a moment?");
+        ws._dm.state = "idle";
+        return;
+      }
+
+      if (chk.available) {
+        const localNice = localStart.toLocaleString("en-US", { timeZone: TIMEZONE, weekday: "long", month: "long", day: "numeric", hour: "numeric", minute: "2-digit" });
+        await speak(ws, `Great news — we have availability on ${localNice}. Would you like me to book it?`);
+        ws._dm.state = "idle"; // keep simple; next step would be booking flow
+      } else {
+        await speak(ws, "It looks like that time is taken. Would you like me to check earlier or later the same day?");
+        ws._dm.state = "awaiting_availability_details";
+        // keep their date; clear time so we ask for a new time
+        ws._dm.slots.time = null;
+      }
       return;
     }
-    if (has("no")) {
-      say(ws, "Alright — we can complete it over the phone later. Anything else I can help with?");
-      ws._dm.step = "idle";
-      return;
-    }
-  }
 
-  // Top-level intents
-  switch (intent) {
-    case "hours":
-      say(ws, "We’re open Monday through Saturday, 8 a.m. to 6 p.m., and Sundays 10 to 4.");
-      break;
-
-    case "pricing":
-      say(ws, "Standard home cleanings start at one hundred twenty nine dollars for up to two bedrooms. Deep cleanings start at one ninety nine.");
-      break;
-
-    case "availability":
-      ws._dm.step = "awaiting_availability_details";
+    if (intent === "negate") {
+      ws._dm.state = "awaiting_availability_details";
       ws._dm.slots = { date: null, time: null };
-      say(ws, "Sure — what date and time are you looking for?");
-      break;
+      await speak(ws, "No problem. What date and time are you looking for?");
+      return;
+    }
 
-    case "booking":
-      ws._dm.step = "offer_booking";
-      say(ws, "Great — I can hold a spot for you. Would you like me to book the next available appointment?");
-      break;
+    // If user replaced date/time during confirm step, accept and reconfirm
+    if (ws._dm.slots.date && ws._dm.slots.time) {
+      const nice = `${ws._dm.slots.date} at ${ws._dm.slots.time.replace(":00", "")}`;
+      await speak(ws, `Thanks! So ${nice}. Would you like me to check availability?`);
+      ws._dm.state = "confirm_availability";
+      return;
+    }
 
-    case "goodbye":
-      say(ws, "Thanks for calling Clean Easy. Have a great day!");
-      break;
-
-    default:
-      // gentle fallback with options
-      say(ws, "I can help with pricing, availability, or booking. Which would you like?");
-      break;
+    await speak(ws, "Sorry, I didn't catch that. Is the date and time I mentioned okay?");
+    return;
   }
+
+  if (ws._dm.state === "idle") {
+    if (intent === "pricing") {
+      await speak(ws, "Standard cleanings start at one hundred twenty dollars. Would you like a quote?");
+      return;
+    }
+    await speak(ws, "I can help with pricing, availability, or booking. What would you like to do?");
+    return;
+  }
+
+  await speak(ws, "Could you say that again?");
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -352,43 +476,56 @@ const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", (ws) => {
   console.log("🔗 WebSocket connected");
-  initState(ws);
+  initDM(ws);
 
   ws.on("message", async (data) => {
     let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(data.toString()); } catch { return; }
 
     if (msg.event === "connected") {
-      console.log(
-        `[WS] event: connected proto=${msg.protocol} v=${msg.version}`
-      );
+      console.log(`[WS] event: { event: 'connected', protocol: '${msg.protocol}', version: '${msg.version}' }`);
     }
 
     if (msg.event === "start") {
       ws._streamSid = msg.start?.streamSid;
       console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${ws._streamSid}`);
 
-      // connect ASR
-      connectDeepgram(ws);
+      try {
+        if (MEDIA_FORMAT === "mulaw") {
+          await streamFrames(ws, makeBeepMulaw(180, 950));
+        } else {
+          await streamFrames(ws, makeBeepPcm16(180, 950));
+        }
+        console.log("[BEEP] done.");
 
-      // Format beep so we instantly know format is correct
-      const beep = MEDIA_FORMAT === "mulaw" ? makeBeepMulaw() : makeBeepPcm16();
-      await streamFrames(ws, beep);
-      console.log("[BEEP] done.");
-
-      // Greeting
-      say(ws, "Hi! I’m your A I receptionist at Clean Easy. How can I help you today?");
+        console.log(`[TTS] streaming greeting as ${MEDIA_FORMAT}…`);
+        const text = "Hi! I'm your AI receptionist at Clean Easy. How can I help you today?";
+        const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text) : await ttsToPcm16(text);
+        await streamFrames(ws, buf);
+        console.log("[TTS] done.");
+      } catch (e) {
+        console.error("[TTS] greeting failed:", e.message);
+      }
     }
 
     if (msg.event === "media") {
       ws._rx = (ws._rx || 0) + 1;
       if (ws._rx % 100 === 0) console.log(`[MEDIA] frames received: ${ws._rx}`);
-      // forward to Deepgram
-      if (msg.media?.payload) sendAudioToDG(ws, msg.media.payload);
+    }
+
+    // Accept transcripts from different shapes
+    const dgAlt = msg?.speech?.alternatives?.[0];
+    const dgText = dgAlt?.transcript;
+    const dgFinal = (msg?.speech?.is_final ?? undefined);
+
+    const genericText = msg?.transcript || msg?.text || msg?.asr;
+    const genericFinal = msg?.is_final ?? msg?.final ?? false;
+
+    const textCandidate = dgText || genericText;
+    const isFinal = (dgFinal !== undefined) ? dgFinal : genericFinal;
+
+    if (textCandidate) {
+      handleTranscript(ws, textCandidate, !!isFinal);
     }
 
     if (msg.event === "stop") {
@@ -397,7 +534,7 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    if (ws._dg && ws._dg.readyState === WebSocket.OPEN) ws._dg.close();
+    if (ws._dm?._debounceTimer) clearTimeout(ws._dm._debounceTimer);
     console.log("[WS] CLOSE code=1005 reason=");
   });
   ws.on("error", (err) => console.error("[WS] error", err));
