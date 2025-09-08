@@ -509,7 +509,6 @@ server.on("upgrade", (req, socket, head) => {
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
 
-import fetch from "node-fetch";
 import { WebSocketServer } from "ws";
 import { spawn } from "child_process";
 import ffmpegBin from "@ffmpeg-installer/ffmpeg";
