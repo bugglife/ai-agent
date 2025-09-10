@@ -28,6 +28,10 @@ const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS; // 160 @ 8kHz, 20ms
 const BYTES_PER_FRAME_PCM16 = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE_PCM16; // 320
 const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1; // 160
 
+// ASR behavior
+const ASR_PARTIAL_PROMOTE_MS = 1200;   // promote latest partial to "final" if ASR goes idle
+const NO_INPUT_REPROMPT_MS = 7000;     // reprompt if caller silent this long
+
 // ───────────────────────────────────────────────────────────────────────────────
 // Utilities (beeps + μ-law compand/decompand)
 // ───────────────────────────────────────────────────────────────────────────────
@@ -134,7 +138,9 @@ async function ttsToMulaw(text) {
   ]);
 }
 
-// Stream TTS frames out to Twilio
+// ───────────────────────────────────────────────────────────────────────────────
+// Outbound streaming (Twilio frames)
+// ───────────────────────────────────────────────────────────────────────────────
 async function streamFrames(ws, raw) {
   const bytesPerFrame = MEDIA_FORMAT === "mulaw" ? BYTES_PER_FRAME_MULAW : BYTES_PER_FRAME_PCM16;
   let offset = 0, frames = 0;
@@ -154,150 +160,31 @@ async function streamFrames(ws, raw) {
   }
 }
 
-// Small helper that wraps TTS + stream + speaking gate
-async function speak(ws, text) {
-  if (ws._speaking) return;
-  ws._speaking = true;
-  try {
-    const out = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text) : await ttsToPcm16(text);
-    await streamFrames(ws, out);
-  } catch (e) {
-    console.error("[TTS] speak failed:", e.message);
-  } finally {
-    ws._speaking = false;
+// ───────────────────────────────────────────────────────────────────────────────
+// Simple intent routing
+// ───────────────────────────────────────────────────────────────────────────────
+function normalize(s) {
+  return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function routeIntent(text) {
+  const q = normalize(text);
+  if (q.includes("hour") || q.includes("open") || q.includes("close")) {
+    return "We’re open 8 AM to 6 PM Monday through Friday, and 9 AM to 2 PM on Saturday.";
   }
+  if (q.includes("book") || q.includes("appointment") || q.includes("schedule")) {
+    return "Sure—what date and time are you looking for? Please say something like Saturday at 2 PM.";
+  }
+  if (q.includes("availability") || q.includes("available")) {
+    return "Happy to check—what date and time would you like?";
+  }
+  return "I can help with booking and general questions. What would you like to do?";
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Company FAQ + Booking-focused flow
+// Deepgram realtime with partial buffering + idle promotion
 // ───────────────────────────────────────────────────────────────────────────────
-const COMPANY = {
-  name: "Clean Easy",
-  phone: "(555) 123-4567",
-  email: "hello@bookcleaneasy.com",
-  website: "bookcleaneasy.com",
-  hours: "We’re open 8 AM–6 PM Monday–Friday, and 9 AM–2 PM on Saturday.",
-  area: "We serve the greater metro area within a 25-minute drive.",
-  guarantee: "If anything was missed, let us know within 24 hours and we’ll make it right.",
-  cancellation: "Please give 24 hours notice to avoid a cancellation fee.",
-  supplies: "Our teams bring supplies and equipment. If you prefer eco-friendly products, just ask.",
-  pets: "We’re pet-friendly. Please secure pets if they’re anxious around vacuums.",
-  services: "Standard, Deep, and Move-in/Move-out cleanings.",
-  duration: "Most homes take 2–4 hours depending on size and condition.",
-  prep: "Please tidy up surfaces and pick up items from floors so we can focus on cleaning.",
-  payment: "We accept major credit cards and payment is due at the time of service."
-};
-
-const FAQS = [
-  { triggers: ["hour","open","close","time"], answer: () => COMPANY.hours },
-  { triggers: ["call","phone","number","contact"], answer: () => `You can reach us at ${COMPANY.phone}.` },
-  { triggers: ["email","mail"], answer: () => `Our email is ${COMPANY.email}.` },
-  { triggers: ["where","area","serve","service area","coverage"], answer: () => COMPANY.area },
-  { triggers: ["guarantee","warranty","quality"], answer: () => COMPANY.guarantee },
-  { triggers: ["cancel","cancellation","reschedule","rescheduling"], answer: () => COMPANY.cancellation },
-  { triggers: ["supply","supplies","equipment","products"], answer: () => COMPANY.supplies },
-  { triggers: ["pet","dog","cat","animal"], answer: () => COMPANY.pets },
-  { triggers: ["service","what do you do","deep","move"], answer: () => COMPANY.services },
-  { triggers: ["how long","duration","time take","hours take"], answer: () => COMPANY.duration },
-  { triggers: ["prep","prepare","before","ready"], answer: () => COMPANY.prep },
-  { triggers: ["pay","payment","card","credit"], answer: () => COMPANY.payment },
-  { triggers: ["website","site"], answer: () => `You can also visit ${COMPANY.website}.` },
-];
-
-function answerFromKB(text) {
-  const q = text.toLowerCase();
-  for (const item of FAQS) {
-    if (item.triggers.some(t => q.includes(t))) {
-      return typeof item.answer === "function" ? item.answer(q) : item.answer;
-    }
-  }
-  return null;
-}
-
-// naive date/time recognizer to move the flow forward (no external libs)
-function detectDateTime(text) {
-  const q = text.toLowerCase();
-  const hasDay =
-    /(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow)/.test(q) ||
-    /\b(0?[1-9]|1[0-2])\/([0-2]?[0-9]|3[01])\b/.test(q) || // 3/14
-    /\b([0-2]?[0-9])-(0?[1-9]|1[0-2])\b/.test(q);          // 14-3
-
-  const timeMatch = q.match(/\b([0-1]?[0-9]|2[0-3])(:[0-5][0-9])?\s?(am|pm)?\b/);
-  if (hasDay && timeMatch) return true;
-  // “this saturday at 2” style
-  if (/(saturday|sunday|monday|tuesday|wednesday|thursday|friday)\s+at\s+([0-1]?[0-9]|2[0-3])/.test(q)) return true;
-  return false;
-}
-
-function basePrompt() {
-  return "I can help you book an appointment and answer questions about Clean Easy. What can I help with?";
-}
-
-// prevent rapid re-asks
-function shouldReask(ws, key, ms = 6000) {
-  const now = Date.now();
-  if (ws._lastPromptKey === key && ws._lastPromptAt && now - ws._lastPromptAt < ms) return false;
-  ws._lastPromptKey = key;
-  ws._lastPromptAt = now;
-  return true;
-}
-
-async function handleUtterance(ws, txt) {
-  const q = txt.toLowerCase();
-
-  // 1) FAQ first
-  const kb = answerFromKB(q);
-  if (kb) {
-    await speak(ws, kb + " Would you like to book an appointment?");
-    return;
-  }
-
-  // Ensure ctx exists
-  ws._ctx = ws._ctx || { flow: null, awaiting: null, datetime: null };
-
-  // 2) New intent → booking by default
-  if (!ws._ctx.flow) {
-    if (q.includes("book") || q.includes("availability") || q.includes("available") || q.includes("appointment")) {
-      ws._ctx.flow = "availability";
-      ws._ctx.awaiting = "datetime";
-      if (shouldReask(ws, "ask-dt")) {
-        await speak(ws, "Sure—what date and time are you looking for?");
-      }
-      return;
-    }
-    // No intent → prompt
-    await speak(ws, basePrompt());
-    return;
-  }
-
-  // 3) Booking flow (very light)
-  if (ws._ctx.flow === "availability") {
-    if (ws._ctx.awaiting === "datetime") {
-      if (detectDateTime(q)) {
-        ws._ctx.datetime = txt;
-        ws._ctx.awaiting = null;
-        // You can plug a real availability check here later
-        await speak(ws, `Great. We likely have availability ${txt}. I can pencil this in and a teammate will confirm shortly. Anything else I can help with?`);
-        // reset flow so conversation can continue
-        ws._ctx = { flow: null, awaiting: null, datetime: null };
-        return;
-      } else {
-        if (shouldReask(ws, "ask-dt")) {
-          await speak(ws, "Got it. Could you share the date and time you prefer? For example, Saturday at 2 PM.");
-        }
-        return;
-      }
-    }
-  }
-
-  // 4) Fallback
-  await speak(ws, basePrompt());
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// Deepgram realtime: forward inbound audio, get transcripts
-// ───────────────────────────────────────────────────────────────────────────────
-function connectDeepgram(onTranscript) {
+function connectDeepgram(onFinal, onAnyTranscript) {
   if (!DG_KEY) {
     console.warn("⚠️ DEEPGRAM_API_KEY missing — STT disabled.");
     return null;
@@ -305,18 +192,66 @@ function connectDeepgram(onTranscript) {
   const url = `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&punctuate=true&vad_events=true&endpointing=true`;
   const dg = new WebSocket(url, { headers: { Authorization: `Token ${DG_KEY}` } });
 
+  let lastPartial = "";
+  let partialTimer = null;
+
+  function promotePartial(reason = "idle") {
+    if (!lastPartial) return;
+    const promoted = lastPartial.trim();
+    lastPartial = "";
+    if (partialTimer) { clearTimeout(partialTimer); partialTimer = null; }
+    if (promoted) {
+      console.log(`[ASR promote:${reason}] ${promoted}`);
+      onFinal(promoted);
+    }
+  }
+
   dg.on("open", () => console.log("[DG] connected"));
+
   dg.on("message", (d) => {
     try {
       const msg = JSON.parse(d.toString());
-      if (msg.channel?.alternatives?.[0]?.transcript && (msg.is_final || msg.speech_final)) {
-        const txt = msg.channel.alternatives[0].transcript.trim();
-        if (txt) onTranscript(txt);
+
+      // Log VAD-ish events if present
+      if (msg.type === "SpeechStarted" || msg.type === "SpeechEnded") {
+        console.log(`[DG] ${msg.type}`);
       }
-    } catch {}
+
+      const alt = msg.channel?.alternatives?.[0];
+      const transcript = alt?.transcript?.trim() || "";
+
+      // Callback on ANY transcript (for resetting no-input timer)
+      if (transcript) onAnyTranscript?.(transcript);
+
+      // Final path
+      if (transcript && (msg.is_final || msg.speech_final)) {
+        if (partialTimer) { clearTimeout(partialTimer); partialTimer = null; }
+        lastPartial = "";
+        console.log(`[ASR] ${transcript}`);
+        onFinal(transcript);
+        return;
+      }
+
+      // Partial path
+      if (transcript) {
+        lastPartial = transcript;
+        console.log(`[ASR~] ${lastPartial}`);
+        // reset promote timer
+        if (partialTimer) clearTimeout(partialTimer);
+        partialTimer = setTimeout(() => promotePartial("timeout"), ASR_PARTIAL_PROMOTE_MS);
+      }
+    } catch {
+      // ignore parse errors
+    }
   });
-  dg.on("close", () => console.log("[DG] close"));
+
+  dg.on("close", () => {
+    console.log("[DG] close");
+    // If DG closes with a buffered partial, promote it so we don't miss the user's last words
+    promotePartial("dg_close");
+  });
   dg.on("error", (e) => console.error("[DG] error", e.message));
+
   return dg;
 }
 
@@ -329,19 +264,44 @@ wss.on("connection", (ws) => {
   console.log("🔗 WebSocket connected");
   ws._rx = 0;
   ws._speaking = false;
-  ws._ctx = { flow: null, awaiting: null, datetime: null };
-  ws._lastPromptAt = 0;
-  ws._lastPromptKey = "";
 
-  const dg = connectDeepgram(async (finalText) => {
-    console.log(`[ASR] ${finalText}`);
-    if (ws._speaking) return; // don't ASR-while-speaking to reduce barge-in
-    try {
-      await handleUtterance(ws, finalText);
-    } catch (e) {
-      console.error("[FLOW] error:", e.message);
-    }
-  });
+  let noInputTimer = null;
+  const resetNoInputTimer = () => {
+    if (noInputTimer) clearTimeout(noInputTimer);
+    noInputTimer = setTimeout(async () => {
+      if (ws._speaking) return;
+      ws._speaking = true;
+      try {
+        const prompt = "Are you still there? I can help with booking or any questions.";
+        const out = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(prompt) : await ttsToPcm16(prompt);
+        await streamFrames(ws, out);
+      } catch (e) {
+        console.error("[TTS] reprompt failed:", e.message);
+      } finally {
+        ws._speaking = false;
+        resetNoInputTimer();
+      }
+    }, NO_INPUT_REPROMPT_MS);
+  };
+
+  const dg = connectDeepgram(
+    async (finalText) => {
+      if (ws._speaking) return; // respect turn-taking
+      const reply = routeIntent(finalText);
+      ws._speaking = true;
+      try {
+        const out = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(reply) : await ttsToPcm16(reply);
+        await streamFrames(ws, out);
+      } catch (e) {
+        console.error("[TTS] reply failed:", e.message);
+      } finally {
+        ws._speaking = false;
+        resetNoInputTimer();
+      }
+    },
+    // onAnyTranscript: reset the no-input timer even on partials
+    () => resetNoInputTimer()
+  );
 
   ws.on("message", async (data) => {
     let msg;
@@ -355,16 +315,24 @@ wss.on("connection", (ws) => {
       ws._streamSid = msg.start?.streamSid;
       console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${ws._streamSid}`);
 
+      // Beep (format sanity)
       if (MEDIA_FORMAT === "mulaw") await streamFrames(ws, makeBeepMulaw());
       else await streamFrames(ws, makeBeepPcm16());
       console.log("[BEEP] done.");
 
+      // Greeting
       try {
-        console.log(`[TTS] greeting… (${MEDIA_FORMAT})`);
-        await speak(ws, "Hi! I’m your AI receptionist at Clean Easy. I can help you book an appointment and answer questions. What can I help with?");
+        console.log(`[TTS] streaming greeting as ${MEDIA_FORMAT}…`);
+        const text = "Hi! I'm your AI receptionist at Clean Easy. I can help with booking or answer questions. What would you like to do?";
+        const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text) : await ttsToPcm16(text);
+        await streamFrames(ws, buf);
+        console.log("[TTS] done.");
       } catch (e) {
         console.error("[TTS] greeting failed:", e.message);
       }
+
+      // start no-input clock after greeting
+      resetNoInputTimer();
     }
 
     if (msg.event === "media") {
@@ -380,10 +348,14 @@ wss.on("connection", (ws) => {
     if (msg.event === "stop") {
       console.log(`[WS] STOP (total inbound frames: ${ws._rx || 0})`);
       if (dg && dg.readyState === dg.OPEN) dg.close();
+      if (noInputTimer) clearTimeout(noInputTimer);
     }
   });
 
-  ws.on("close", () => console.log("[WS] CLOSE code=1005"));
+  ws.on("close", () => {
+    console.log("[WS] CLOSE code=1005");
+    if (noInputTimer) clearTimeout(noInputTimer);
+  });
   ws.on("error", (err) => console.error("[WS] error", err));
 });
 
