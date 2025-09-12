@@ -28,40 +28,72 @@ const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS; // 160 @ 8kHz, 20ms
 const BYTES_PER_FRAME_PCM16 = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE_PCM16; // 320
 const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1; // 160
 
-// Conversational timing (tuned to be less eager)
-const ASR_PARTIAL_PROMOTE_MS = 2000;   // promote latest partial to "final" if ASR goes idle
-const NO_INPUT_FIRST_MS = 15000;        // first turn inactivity before reprompt
-const NO_INPUT_REPROMPT_MS = 12000;     // subsequent inactivity before reprompt
-const POST_TTS_GRACE_MS = 1800;         // pause after we speak; don't barge in
+// Conversational timing (gentler behavior)
+const ASR_PARTIAL_PROMOTE_MS = 2000;
+const NO_INPUT_FIRST_MS = 15000;
+const NO_INPUT_REPROMPT_MS = 12000;
+const POST_TTS_GRACE_MS = 1800;
 
 // ───────────────────────────────────────────────────────────────────────────────
-// COMPANY KNOWLEDGE BASE
+// SERVICE AREAS (edit this list to match your coverage)
+// ───────────────────────────────────────────────────────────────────────────────
+const SERVICE_AREAS = [
+  "Boston","Cambridge","Somerville","Brookline","Newton","Watertown","Arlington",
+  "Belmont","Medford","Waltham","Needham","Wellesley","Dedham","Quincy"
+];
+
+// helpers for text normalization / matching
+function normalize(s){ return s.toLowerCase().replace(/[^a-z0-9\s]/g," ").replace(/\s+/g," ").trim(); }
+function tokenSet(s){ return new Set(normalize(s).split(" ").filter(Boolean)); }
+function findCityInText(text){
+  const q = normalize(text);
+  for (const city of SERVICE_AREAS){
+    const c = city.toLowerCase();
+    if (q.includes(c)) return { city, known:true };
+  }
+  // heuristics: capitalized single word that might be a city (from raw text)
+  const guess = (text.match(/\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)?\b/g) || [])
+    .filter(w => !SERVICE_AREAS.includes(w));
+  if (guess.length) return { city:guess[0], known:false };
+  return null;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// COMPANY KNOWLEDGE BASE + SMALL TALK
 // ───────────────────────────────────────────────────────────────────────────────
 const KB = [
-  { id:"hours", keys:["hours","open","close","time","when","business hours","what time"],
-    answer:"We’re open 8 AM to 6 PM Monday through Friday, and 9 AM to 2 PM on Saturday. We’re closed on Sundays." },
+  { id:"hours", keys:["hours","open","close","time","business hours","when"],
+    answer:"We’re open 8 AM to 8 PM Monday through Saturday, and 12 PM to 8 PM on Sunday." },
   { id:"address", keys:["address","location","where","located","office","storefront"],
-    answer:"Clean Easy is based in the local area and we come to you. If you need to mail anything, just ask and we’ll text you the best mailing address." },
+    answer:"Clean Easy is based in the local area and we come to you. If you need a mailing address, I can text it to you." },
   { id:"phone", keys:["phone","number","call back","contact"],
-    answer:"You can call or text this number anytime. If we miss you, we’ll respond as soon as we’re free." },
+    answer:"You can call or text this number anytime. I'll always be here to help." },
   { id:"services", keys:["service","services","deep clean","standard clean","move out","move-in","post construction","airbnb","office","commercial","recurring","one time"],
     answer:"We offer standard and deep cleans, move-in/move-out, short-term rental turnovers, post-construction, and office cleanings. One-time or recurring—weekly, bi-weekly, or monthly." },
   { id:"pricing", keys:["price","pricing","cost","quote","estimate","how much","rates"],
-    answer:"Pricing depends on home size and condition. We’ll give you a quick quote over the phone or by text. Deep cleans and move-out cleans take longer and are priced accordingly." },
+    answer:"Pricing depends on home size and condition. Deep cleans and move-out cleans take longer and are priced accordingly. I can give you a quick quote over the phone or by text." },
   { id:"supplies", keys:["supplies","bring supplies","equipment","vacuum","products","eco","green"],
     answer:"We bring all the supplies and equipment. If you prefer eco-friendly products, let us know—we’re happy to accommodate." },
   { id:"duration", keys:["how long","duration","time it takes","how many hours","finish"],
-    answer:"A typical standard clean takes 2–3 hours for an average home, while deep cleans take longer. We’ll tailor it to the size and condition of your space." },
+    answer:"A typical standard clean takes 2–3 hours for an average home, while deep cleans take longer. We’ll tailor it to your space." },
   { id:"guarantee", keys:["guarantee","quality","not satisfied","reclean","warranty"],
     answer:"We stand by our work. If anything was missed, let us know within 24 hours and we’ll make it right." },
   { id:"cancellation", keys:["cancel","reschedule","late fee","policy","no show"],
-    answer:"Plans change—no problem. Please give us 24 hours’ notice to cancel or reschedule to avoid a late cancellation fee." },
+    answer:"No problem—please give us 24 hours’ notice to cancel or reschedule to avoid a late cancellation fee." },
   { id:"payment", keys:["pay","payment","card","cash","zelle","venmo","invoice","deposit"],
     answer:"We accept major cards and contactless payments. If you prefer cash or Zelle, just let us know when booking." },
-  { id:"service_area", keys:["area","serve","coverage","where do you clean","city","neighborhood"],
-    answer:"We serve the surrounding metro area. Tell me your city or zip code and I’ll confirm availability." },
   { id:"booking", keys:["book","appointment","schedule","availability","available","when can you come"],
     answer:"Happy to help with booking. What date and time would you like? You can say something like “Saturday at 2 PM.”" },
+];
+
+// Polite / conversational small talk
+const SMALL_TALK = [
+  { keys:["hi","hello","hey"], answer:"Hi there! I’m the Clean Easy assistant. How can I help—booking or any questions?" },
+  { keys:["how are you","how's it going","how are u"], answer:"I’m doing well—thanks for asking! How can I help you today?" },
+  { keys:["who are you","what are you","are you a robot","your name"], answer:"I’m Clean Easy’s AI receptionist. I can answer questions and help you book a cleaning." },
+  { keys:["thank you","thanks","appreciate it"], answer:"You’re very welcome! Anything else I can help with?" },
+  { keys:["bye","goodbye","talk later","see you"], answer:"Thanks for calling Clean Easy. Have a great day!" },
+  { keys:["can you repeat","say that again","repeat that","what did you say"], answer:"Sure—let me repeat. I can help with booking or any questions. What would you like to do?" },
 ];
 
 const SYNONYMS = {
@@ -72,8 +104,11 @@ const SYNONYMS = {
   where:["located","location","address"]
 };
 
-function normalize(s){return s.toLowerCase().replace(/[^a-z0-9\s]/g," ").replace(/\s+/g," ").trim();}
-function explodeSynonyms(tokens){const out=new Set(tokens);for(const t of tokens){const syn=SYNONYMS[t];if(syn) syn.forEach(s=>out.add(s));}return [...out];}
+function explodeSynonyms(tokens){
+  const out=new Set(tokens);
+  for(const t of tokens){ const syn=SYNONYMS[t]; if(syn) syn.forEach(s=>out.add(s));}
+  return [...out];
+}
 function scoreKB(query){
   const q=normalize(query); const qTokens=explodeSynonyms(q.split(" "));
   let best={id:null,score:0,answer:null};
@@ -88,7 +123,15 @@ function scoreKB(query){
   }
   return best;
 }
-function answerFromKB(text){const best=scoreKB(text);return best.score>=2.0?best.answer:null;}
+function answerFromKB(text){ const best=scoreKB(text); return best.score>=2 ? best.answer : null; }
+
+function answerSmallTalk(text){
+  const q = normalize(text);
+  for(const row of SMALL_TALK){
+    if (row.keys.some(k => q.includes(normalize(k)))) return row.answer;
+  }
+  return null;
+}
 
 // ───────────────────────────────────────────────────────────────────────────────
 // TTS (ElevenLabs) → ffmpeg
@@ -151,11 +194,31 @@ async function streamFrames(ws,raw){
 // Conversational logic
 // ───────────────────────────────────────────────────────────────────────────────
 function replyFor(text){
-  const kb = answerFromKB(text); if(kb) return kb;
-  const q=normalize(text);
-  if(q.includes("hour")||q.includes("open")||q.includes("close")) return answerFromKB("hours");
-  if(q.includes("book")||q.includes("appointment")||q.includes("schedule")) return "Great—what date and time would you like?";
-  if(q.includes("availability")||q.includes("available")) return "Happy to check—what date and time are you looking for?";
+  // 1) Small talk first
+  const small = answerSmallTalk(text);
+  if (small) return small;
+
+  // 2) Service area check (Newton, Brookline, …)
+  const city = findCityInText(text);
+  if (city){
+    if (city.known){
+      return `Yes, we serve ${city.city} and the surrounding area. Would you like to book a time?`;
+    }
+    return `We’re expanding our coverage. What’s the ZIP code for ${city.city}? I can confirm availability.`;
+  }
+
+  // 3) Knowledge base
+  const kb = answerFromKB(text);
+  if (kb) return kb;
+
+  // 4) Lightweight routing hints
+  const q = normalize(text);
+  if(q.includes("book")||q.includes("appointment")||q.includes("schedule"))
+    return "Great—what date and time would you like?";
+  if(q.includes("availability")||q.includes("available"))
+    return "Happy to check—what date and time are you looking for?";
+
+  // 5) Default
   return "I can help with booking and general questions. What would you like to do?";
 }
 
@@ -209,7 +272,7 @@ wss.on("connection",(ws)=>{
   console.log("🔗 WebSocket connected");
   ws._rx=0;
   ws._speaking=false;
-  ws._graceUntil=0;          // time until which we ignore ASR/reprompts
+  ws._graceUntil=0;
   let firstTurn=true;
 
   let noInputTimer=null;
@@ -235,7 +298,7 @@ wss.on("connection",(ws)=>{
   const dg=connectDeepgram(
     async (finalText)=>{
       if(ws._speaking) return;
-      if(Date.now()<ws._graceUntil) return; // still in grace; ignore stale finals
+      if(Date.now()<ws._graceUntil) return;
       const reply=replyFor(finalText);
       ws._speaking=true;
       try{
@@ -249,7 +312,7 @@ wss.on("connection",(ws)=>{
         resetNoInputTimer();
       }
     },
-    ()=>{ if(Date.now()>=ws._graceUntil) resetNoInputTimer(); } // any transcript resets, unless in grace
+    ()=>{ if(Date.now()>=ws._graceUntil) resetNoInputTimer(); }
   );
 
   ws.on("message", async (data)=>{
@@ -274,7 +337,7 @@ wss.on("connection",(ws)=>{
         await streamFrames(ws,buf);
       }catch(e){ console.error("[TTS] greeting failed:",e.message); }
       finally{
-        ws._graceUntil=Date.now()+POST_TTS_GRACE_MS; // grace after greeting
+        ws._graceUntil=Date.now()+POST_TTS_GRACE_MS;
         firstTurn=true;
         resetNoInputTimer();
       }
