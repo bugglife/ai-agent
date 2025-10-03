@@ -4,8 +4,6 @@ import fetch from "node-fetch";
 import WebSocket, { WebSocketServer } from "ws";
 import { spawn } from "child_process";
 import ffmpegBin from "@ffmpeg-installer/ffmpeg";
-import nodemailer from "nodemailer"; // email alerts (sendmail by default)
-import twilio from "twilio";         // sms alerts (optional)
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Config
@@ -46,6 +44,35 @@ const POST_TTS_GRACE_MS = 1800;
 
 // Optional: kill idle sockets
 const MAX_IDLE_MS = 5 * 60 * 1000; // 5 min
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Optional alert libraries (lazy/optional import so deploy doesn't fail)
+// ───────────────────────────────────────────────────────────────────────────────
+let _mailer = null;
+async function getMailer() {
+  if (_mailer !== null) return _mailer;
+  try {
+    const mod = await import("nodemailer");
+    _mailer = mod.default.createTransport({ sendmail: true });
+  } catch {
+    console.warn("[ALERT] nodemailer not installed; email alerts disabled");
+    _mailer = false;
+  }
+  return _mailer;
+}
+
+let _twilio = null;
+async function getTwilio() {
+  if (_twilio !== null) return _twilio;
+  try {
+    const mod = await import("twilio");
+    _twilio = new mod.default(TWILIO_SID, TWILIO_TOKEN);
+  } catch {
+    console.warn("[ALERT] twilio not installed; SMS alerts disabled");
+    _twilio = false;
+  }
+  return _twilio;
+}
 
 // ───────────────────────────────────────────────────────────────────────────────
 // SERVICE AREAS
@@ -91,7 +118,7 @@ const KB = [
     answer:"We stand by our work. If anything was missed, let us know within 24 hours and we’ll make it right." },
   { id:"cancellation", keys:["cancel","reschedule","late fee","policy","no show"],
     answer:"No problem—please give us 24 hours’ notice to cancel or reschedule to avoid a late cancellation fee." },
-  // UPDATED PAYMENT ENTRY
+  // UPDATED payment entry
   { id:"payment", keys:["pay","payment","card","cash","zelle","venmo","invoice","deposit"],
     answer:"We accept all major credit cards, amazon pay, cash app pay, affirm and klarna." },
   { id:"booking", keys:["book","appointment","schedule","availability","available","when can you come"],
@@ -218,29 +245,33 @@ async function ttsRateLimit() {
 
 async function alertFuseTrip(reason) {
   console.error(`[ALERT] TTS disabled: ${reason}`);
-  // Email (sendmail). Swap to SMTP config if you prefer.
+
   if (ALERT_EMAIL) {
     try {
-      const transport = nodemailer.createTransport({ sendmail: true });
-      await transport.sendMail({
-        from: "ai-agent@server",
-        to: ALERT_EMAIL,
-        subject: "[ALERT] TTS Fuse Tripped",
-        text: `TTS disabled for ${TTS_DISABLE_WINDOW_MS/60000} minutes.\nReason: ${reason}\nTime: ${new Date().toISOString()}`
-      });
+      const transport = await getMailer();
+      if (transport) {
+        await transport.sendMail({
+          from: "ai-agent@server",
+          to: ALERT_EMAIL,
+          subject: "[ALERT] TTS Fuse Tripped",
+          text: `TTS disabled for ${TTS_DISABLE_WINDOW_MS/60000} minutes.\nReason: ${reason}\nTime: ${new Date().toISOString()}`
+        });
+      }
     } catch (e) {
       console.error("[ALERT] email failed:", e.message);
     }
   }
-  // SMS via Twilio
+
   if (ALERT_SMS && TWILIO_SID && TWILIO_TOKEN && TWILIO_FROM) {
     try {
-      const client = twilio(TWILIO_SID, TWILIO_TOKEN);
-      await client.messages.create({
-        body: `TTS disabled for ${TTS_DISABLE_WINDOW_MS/60000}m. Reason: ${reason}`,
-        from: TWILIO_FROM,
-        to: ALERT_SMS
-      });
+      const client = await getTwilio();
+      if (client) {
+        await client.messages.create({
+          body: `TTS disabled for ${TTS_DISABLE_WINDOW_MS/60000}m. Reason: ${reason}`,
+          from: TWILIO_FROM,
+          to: ALERT_SMS
+        });
+      }
     } catch (e) {
       console.error("[ALERT] sms failed:", e.message);
     }
@@ -293,12 +324,8 @@ async function ttsElevenLabsRaw(text) {
   cacheCleanup();
 
   const cached = ttsCache.get(key);
-  if (cached && Date.now() - cached.ts <= TTS_CACHE_TTL_MS) {
-    return cached.buf;
-  }
-  if (ttsInflight.has(key)) {
-    return ttsInflight.get(key);
-  }
+  if (cached && Date.now() - cached.ts <= TTS_CACHE_TTL_MS) return cached.buf;
+  if (ttsInflight.has(key)) return ttsInflight.get(key);
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
   let attempt = 0;
