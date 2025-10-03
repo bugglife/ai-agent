@@ -395,4 +395,174 @@ function connectDeepgram(onFinal,onAnyTranscript){
   dg.on("message",(d)=>{
     try{
       const msg=JSON.parse(d.toString());
-      const alt=msg.channel?.alter
+      const alt=msg.channel?.alternatives?.[0];
+      const transcript=alt?.transcript?.trim()||"";
+
+      if(transcript) onAnyTranscript?.(transcript);
+
+      if(transcript && (msg.is_final||msg.speech_final)){
+        if(partialTimer){clearTimeout(partialTimer); partialTimer=null;}
+        lastPartial=""; console.log(`[ASR] ${transcript}`); onFinal(transcript); return;
+      }
+      if(transcript){
+        lastPartial=transcript; console.log(`[ASR~] ${lastPartial}`);
+        if(partialTimer) clearTimeout(partialTimer);
+        partialTimer=setTimeout(()=>promotePartial("timeout"),ASR_PARTIAL_PROMOTE_MS);
+      }
+    }catch{}
+  });
+  dg.on("close",()=>{console.log("[DG] close"); promotePartial("dg_close");});
+  dg.on("error",(e)=>console.error("[DG] error",e.message));
+  return dg;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// WebSocket (Twilio <Stream> → wss://…/stream) with auth + reprompt caps
+// ───────────────────────────────────────────────────────────────────────────────
+const wss = new WebSocketServer({ noServer: true });
+
+wss.on("connection",(ws)=>{
+  console.log("🔗 WebSocket connected");
+  ws._rx=0;
+  ws._speaking=false;
+  ws._graceUntil=0;
+  let firstTurn=true;
+
+  let repromptCount=0;
+  const MAX_REPROMPTS=3;
+
+  let noInputTimer=null;
+  const startNoInputTimer = (ms)=>{
+    if(noInputTimer) clearTimeout(noInputTimer);
+    noInputTimer=setTimeout(async ()=>{
+      if(ws._speaking || Date.now()<ws._graceUntil) return;
+      if(!ttsIsEnabled()){
+        console.warn("[TTS] skipped reprompt (gate disabled)");
+        startNoInputTimer(NO_INPUT_REPROMPT_MS*2);
+        return;
+      }
+      if(repromptCount>=MAX_REPROMPTS){
+        console.warn("[TTS] reprompt cap reached; no further reprompts on this connection");
+        return;
+      }
+      ws._speaking=true;
+      try{
+        const prompt="Are you still there? I can help with booking or any questions.";
+        const out = MEDIA_FORMAT==="mulaw"?await ttsToMulaw(prompt):await ttsToPcm16(prompt);
+        repromptCount++;
+        await streamFrames(ws,out);
+      }catch(e){ console.error("[TTS] reprompt failed:",e.message); }
+      finally{
+        ws._speaking=false;
+        ws._graceUntil=Date.now()+POST_TTS_GRACE_MS;
+        startNoInputTimer(NO_INPUT_REPROMPT_MS);
+      }
+    }, ms);
+  };
+  const resetNoInputTimer = ()=> startNoInputTimer(firstTurn?NO_INPUT_FIRST_MS:NO_INPUT_REPROMPT_MS);
+
+  const connectedAt = Date.now();
+  const idleTicker = setInterval(()=>{
+    if(Date.now() - connectedAt > MAX_IDLE_MS){
+      try { ws.close(); } catch {}
+    }
+  }, 30000);
+
+  const dg=connectDeepgram(
+    async (finalText)=>{
+      if(ws._speaking) return;
+      if(Date.now()<ws._graceUntil) return;
+      const reply=replyFor(finalText);
+      ws._speaking=true;
+      try{
+        if(!ttsIsEnabled()) throw new Error("TTS disabled by safety fuse");
+        const out = MEDIA_FORMAT==="mulaw"?await ttsToMulaw(reply):await ttsToPcm16(reply);
+        await streamFrames(ws,out);
+      }catch(e){ console.error("[TTS] reply failed:",e.message); }
+      finally{
+        ws._speaking=false;
+        ws._graceUntil=Date.now()+POST_TTS_GRACE_MS;
+        firstTurn=false;
+        resetNoInputTimer();
+      }
+    },
+    ()=>{ if(Date.now()>=ws._graceUntil) resetNoInputTimer(); }
+  );
+
+  ws.on("message", async (data)=>{
+    let msg; try{ msg=JSON.parse(data.toString()); }catch{ return; }
+
+    if(msg.event==="connected"){
+      console.log(`[WS] event: connected proto=${msg.protocol} v=${msg.version}`);
+    }
+
+    if(msg.event==="start"){
+      ws._streamSid=msg.start?.streamSid;
+      console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${ws._streamSid}`);
+
+      if(MEDIA_FORMAT==="mulaw") await streamFrames(ws,makeBeepMulaw());
+      else await streamFrames(ws,makeBeepPcm16());
+      console.log("[BEEP] done.");
+
+      try{
+        console.log(`[TTS] streaming greeting as ${MEDIA_FORMAT}…`);
+        if(!ttsIsEnabled()) throw new Error("TTS disabled by safety fuse");
+        const text="Hi! I'm your AI receptionist at Clean Easy. I can help with booking or answer questions. What would you like to do?";
+        const buf = MEDIA_FORMAT==="mulaw"?await ttsToMulaw(text):await ttsToPcm16(text);
+        await streamFrames(ws,buf);
+      }catch(e){ console.error("[TTS] greeting failed:",e.message); }
+      finally{
+        ws._graceUntil=Date.now()+POST_TTS_GRACE_MS;
+        firstTurn=true;
+        resetNoInputTimer();
+      }
+    }
+
+    if(msg.event==="media"){
+      ws._rx++;
+      if(ws._rx%100===0) console.log(`[MEDIA] frames received: ${ws._rx}`);
+      if(dg && dg.readyState===dg.OPEN && !ws._speaking && Date.now()>=ws._graceUntil){
+        const b=Buffer.from(msg.media.payload,"base64");
+        const pcm16=inboundToPCM16(b);
+        dg.send(pcm16);
+      }
+    }
+
+    if(msg.event==="stop"){
+      console.log(`[WS] STOP (total inbound frames: ${ws._rx||0})`);
+      if(dg && dg.readyState===dg.OPEN) dg.close();
+      if(noInputTimer) clearTimeout(noInputTimer);
+      clearInterval(idleTicker);
+    }
+  });
+
+  ws.on("close",()=>{ console.log("[WS] CLOSE code=1005"); if(noInputTimer) clearTimeout(noInputTimer); clearInterval(idleTicker); });
+  ws.on("error",(err)=>console.error("[WS] error",err));
+});
+
+// ───────────────────────────────────────────────────────────────────────────────
+// HTTP: health + debug speak
+// ───────────────────────────────────────────────────────────────────────────────
+app.get("/",(_req,res)=>res.status(200).send("OK"));
+app.get("/debug/say",async (req,res)=>{
+  try{
+    if (!ttsIsEnabled()) return res.status(503).send("TTS disabled");
+    const text=(req.query.text||"This is a test.").toString();
+    const buf = MEDIA_FORMAT==="mulaw"?await ttsToMulaw(text):await ttsToPcm16(text);
+    res.setHeader("Content-Type", MEDIA_FORMAT==="mulaw"?"audio/basic":"audio/L16");
+    res.send(buf);
+  }catch(e){ res.status(500).send(e.message); }
+});
+
+// ───────────────────────────────────────────────────────────────────────────────
+const server = app.listen(PORT,()=>console.log(`🚀 Server running on port ${PORT}`));
+server.on("upgrade",(req,socket,head)=>{
+  try {
+    const u = new URL(req.url, `http://${req.headers.host}`);
+    if(u.pathname!=="/stream") return socket.destroy();
+    if (u.searchParams.get("token") !== STREAM_TOKEN) return socket.destroy();
+    wss.handleUpgrade(req,socket,head,(ws)=>wss.emit("connection",ws,req));
+  } catch {
+    socket.destroy();
+  }
+});
