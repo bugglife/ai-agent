@@ -308,6 +308,7 @@ function extractPhone(text) {
 
 function extractDateTime(text) {
   const q = normalize(text);
+  console.log(`[EXTRACT DateTime] Input: "${text}" → Normalized: "${q}"`);
   let day = null, time = null;
   
   const daysEn = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday","tomorrow","today"];
@@ -323,20 +324,56 @@ function extractDateTime(text) {
     }
   }
   
-  // Find time - multiple patterns
-  const timePatterns = [
-    /(\d{1,2})\s*(?::|h)?\s*(\d{2})?\s*(am|pm|a\.m\.|p\.m\.)/i, // "4 PM", "4:30 PM"
-    /(\d{1,2})\s*(o'?clock|oclock)/i, // "4 o'clock"
-    /(morning|afternoon|evening|noon)/i, // "afternoon"
-  ];
+  // Find time - handle multiple patterns including word numbers
+  const timeWords = {
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", 
+    "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+    "eleven": "11", "twelve": "12"
+  };
   
-  for (const pattern of timePatterns) {
-    const m = text.match(pattern);
-    if (m) { 
-      time = m[0];
-      console.log(`[EXTRACT] Time: ${time}`);
-      break;
+  // Pattern 1: Digit with AM/PM: "4 PM", "4:30 PM"
+  let m = text.match(/(\d{1,2})\s*(?::|h)?\s*(\d{2})?\s*(am|pm|a\.m\.|p\.m\.)/i);
+  if (m) {
+    time = m[0];
+    console.log(`[EXTRACT] Time (with AM/PM): ${time}`);
+    return { day, time };
+  }
+  
+  // Pattern 2: "at four", "at 4", "at four PM", "thinking thursday at four"
+  m = text.match(/(?:at|on)\s+(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d{1,2})(?:\s*(am|pm|a\.m\.|p\.m\.))?/i);
+  if (m) {
+    let hour = timeWords[m[1].toLowerCase()] || m[1];
+    let period = m[2] || "";
+    time = period ? `${hour} ${period}` : `${hour}`;
+    console.log(`[EXTRACT] Time (at/on + number): ${time}`);
+    return { day, time };
+  }
+  
+  // Pattern 3: Just a number in time context (e.g., "Thursday four")
+  if (day) {
+    m = q.match(/\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d{1,2})\b/);
+    if (m && !["monday","tuesday","wednesday","thursday","friday","saturday","sunday"].includes(m[1])) {
+      time = timeWords[m[1]] || m[1];
+      console.log(`[EXTRACT] Time (context + number): ${time}`);
+      return { day, time };
     }
+  }
+  
+  // Pattern 4: "morning", "afternoon", "evening"
+  m = text.match(/(morning|afternoon|evening|noon)/i);
+  if (m) {
+    time = m[0];
+    console.log(`[EXTRACT] Time (period): ${time}`);
+    return { day, time };
+  }
+  
+  // Pattern 5: "o'clock"
+  m = text.match(/(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(o'?clock|oclock)/i);
+  if (m) {
+    let hour = timeWords[m[1].toLowerCase()] || m[1];
+    time = `${hour} o'clock`;
+    console.log(`[EXTRACT] Time (o'clock): ${time}`);
+    return { day, time };
   }
   
   return { day, time };
@@ -564,8 +601,14 @@ function routeWithContext(text, ctx) {
   
   if (name && !ctx.data.name) ctx.data.name = name;
   if (phone && !ctx.data.phone) ctx.data.phone = phone;
-  if (dateTime.day) ctx.data.date = dateTime.day;
-  if (dateTime.time) ctx.data.time = dateTime.time;
+  if (dateTime.day && !ctx.data.date) {
+    ctx.data.date = dateTime.day;
+    console.log(`[DATA] Set date: ${dateTime.day}`);
+  }
+  if (dateTime.time && !ctx.data.time) {
+    ctx.data.time = dateTime.time;
+    console.log(`[DATA] Set time: ${dateTime.time}`);
+  }
   if (bedrooms && !ctx.data.bedrooms) {
     ctx.data.bedrooms = bedrooms;
     console.log(`[DATA] Set bedrooms: ${bedrooms}`);
@@ -630,11 +673,17 @@ function routeWithContext(text, ctx) {
     if (q.includes("pet") || q.includes("mascota") || q.includes("animal")) return ctx.t("pets");
   }
   
-  // PRIORITY 3: Small talk (ONLY if no substantive query detected)
+  // PRIORITY 3: Small talk (ONLY if no substantive query detected AND short message)
   if (ctx.state === "initial") {
-    // Only respond to small talk if it's JUST small talk (not "hi, do you service...")
-    const words = q.split(" ");
-    if (words.length <= 3) {
+    // Check if this is ONLY small talk (short message with no other content)
+    const words = q.split(" ").filter(w => w.length > 0);
+    const hasSubstantiveContent = words.some(w => 
+      ["service", "serve", "cover", "book", "price", "cost", "clean", "hour", 
+       "servicio", "servico", "precio", "preco", "limpieza", "limpeza"].includes(w)
+    );
+    
+    // Only respond to small talk if message is short AND has no substantive content
+    if (!hasSubstantiveContent && words.length <= 3) {
       if (q.includes("hi") || q.includes("hello") || q.includes("hola") || q === "ola") {
         return ctx.t("smallTalk").hi;
       }
@@ -642,6 +691,8 @@ function routeWithContext(text, ctx) {
         return ctx.t("smallTalk").howAreYou;
       }
     }
+    
+    // These can be longer, so check separately
     if (q.includes("who are you") || q.includes("quien eres") || q.includes("quem e")) {
       return ctx.t("smallTalk").whoAreYou;
     }
