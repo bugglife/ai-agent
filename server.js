@@ -11,7 +11,9 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL";
+const ELEVEN_VOICE_ID_EN = process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL"; // English
+const ELEVEN_VOICE_ID_ES = process.env.ELEVEN_VOICE_ID_ES || "VR6AewLTigWG4xSOukaG"; // Spanish
+const ELEVEN_VOICE_ID_PT = process.env.ELEVEN_VOICE_ID_PT || "yoZ06aMxZJJ28mfd3POQ"; // Portuguese
 const DG_KEY = process.env.DEEPGRAM_API_KEY || "";
 
 const MEDIA_FORMAT = (process.env.TWILIO_MEDIA_FORMAT || "pcm16").toLowerCase();
@@ -20,7 +22,6 @@ if (!["pcm16", "mulaw"].includes(MEDIA_FORMAT)) {
   console.warn(`⚠️ Unknown TWILIO_MEDIA_FORMAT='${MEDIA_FORMAT}', defaulting to pcm16`);
 }
 
-// Timing / frame sizes
 const SAMPLE_RATE = 8000;
 const FRAME_MS = 20;
 const BYTES_PER_SAMPLE_PCM16 = 2;
@@ -28,12 +29,455 @@ const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS;
 const BYTES_PER_FRAME_PCM16 = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE_PCM16;
 const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1;
 
-// ASR behavior
 const ASR_PARTIAL_PROMOTE_MS = 1200;
 const NO_INPUT_REPROMPT_MS = 7000;
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Utilities (beeps + μ-law compand/decompand)
+// SERVICE AREAS & PRICING
+// ───────────────────────────────────────────────────────────────────────────────
+const SERVICE_AREAS = [
+  "Boston","Cambridge","Somerville","Brookline","Newton","Watertown","Arlington",
+  "Belmont","Medford","Waltham","Needham","Wellesley","Dedham","Quincy"
+];
+
+// Your actual pricing matrix: bedroom-bathroom combos
+const PRICING_MATRIX = {
+  standard: {
+    Studio: 100, "1-1": 120, "1-2": 140, "2-1": 160, "2-2": 180, "2-3": 200, "2-4": 220, "2-5+": 240,
+    "3-1": 200, "3-2": 220, "3-3": 260, "3-4": 280, "3-5+": 300,
+    "4-1": 260, "4-2": 270, "4-3": 280, "4-4": 300, "4-5+": 320,
+    "5+-1": 300, "5+-2": 310, "5+-3": 320, "5+-4": 320, "5+-5+": 340,
+  },
+  airbnb: {
+    Studio: 120, "1-1": 140, "1-2": 160, "2-1": 180, "2-2": 200, "2-3": 220, "2-4": 240, "2-5+": 260,
+    "3-1": 220, "3-2": 240, "3-3": 270, "3-4": 290, "3-5+": 310,
+    "4-1": 280, "4-2": 290, "4-3": 300, "4-4": 320, "4-5+": 350,
+    "5+-1": 330, "5+-2": 340, "5+-3": 350, "5+-4": 350, "5+-5+": 370,
+  },
+  deep: {
+    Studio: 150, "1-1": 180, "1-2": 200, "2-1": 220, "2-2": 240, "2-3": 260, "2-4": 280, "2-5+": 300,
+    "3-1": 275, "3-2": 295, "3-3": 335, "3-4": 355, "3-5+": 375,
+    "4-1": 335, "4-2": 345, "4-3": 365, "4-4": 385, "4-5+": 415,
+    "5+-1": 385, "5+-2": 395, "5+-3": 415, "5+-4": 415, "5+-5+": 435,
+  },
+  moveout: {
+    Studio: 180, "1-1": 220, "1-2": 260, "2-1": 280, "2-2": 320, "2-3": 340, "2-4": 360, "2-5+": 380,
+    "3-1": 355, "3-2": 375, "3-3": 415, "3-4": 435, "3-5+": 455,
+    "4-1": 415, "4-2": 435, "4-3": 465, "4-4": 485, "4-5+": 515,
+    "5+-1": 485, "5+-2": 495, "5+-3": 515, "5+-4": 515, "5+-5+": 535,
+  },
+};
+
+const FREQUENCY_DISCOUNTS = {
+  weekly: 0.15,
+  biweekly: 0.12,
+  monthly: 0.05,
+  onetime: 0,
+};
+
+function normalize(s) {
+  return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function findCityInText(text) {
+  const q = normalize(text);
+  for (const city of SERVICE_AREAS) {
+    if (q.includes(city.toLowerCase())) return { city, known: true };
+  }
+  return null;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// LANGUAGE DETECTION & MULTILINGUAL CONTENT
+// ───────────────────────────────────────────────────────────────────────────────
+function detectLanguage(text) {
+  const q = normalize(text);
+  
+  // Spanish indicators
+  const spanishWords = ["hola", "si", "bueno", "gracias", "como", "que", "limpieza", "servicio", "precio", "cuando", "donde"];
+  if (spanishWords.some(w => q.includes(w))) return "es";
+  
+  // Portuguese indicators
+  const portugueseWords = ["ola", "sim", "obrigado", "obrigada", "como", "que", "limpeza", "servico", "preco", "quando", "onde"];
+  if (portugueseWords.some(w => q.includes(w))) return "pt";
+  
+  return "en";
+}
+
+const TRANSLATIONS = {
+  en: {
+    greeting: "Hi! I'm your AI receptionist at Clean Easy. I can help with booking or answer questions. What would you like to do?",
+    serviceTypes: { standard: "standard", deep: "deep", moveout: "move-out", airbnb: "Airbnb turnover" },
+    askServiceType: "What type of cleaning would you like—standard, deep, move-out, or Airbnb turnover?",
+    askBedrooms: "Great! How many bedrooms?",
+    askBathrooms: "And how many bathrooms?",
+    askCity: "Perfect. What city are you located in?",
+    askDateTime: "What date and time work best for you? You can say something like Saturday at 2 PM.",
+    askName: "Great! Can I get your name for the booking?",
+    askPhone: "And what's the best phone number to reach you?",
+    priceQuote: "That would be around $",
+    confirmation: "Perfect! Let me confirm:",
+    confirmQuestion: "Does that sound good?",
+    finalConfirm: "Perfect! We'll send a confirmation to",
+    anythingElse: "Is there anything else you'd like to know?",
+    stillThere: "Are you still there? I can help with booking or any questions.",
+    coverCity: "Yes, we serve",
+    andSurrounding: "and the surrounding area. Would you like to book a time?",
+    hours: "We're open 8 AM to 8 PM Monday through Saturday, and 12 PM to 8 PM on Sunday.",
+    services: "We offer standard and deep cleans, move-in and move-out services, Airbnb turnovers, and office cleanings. You can book one-time or recurring services.",
+    payment: "We accept all major credit cards, Amazon Pay, Cash App Pay, Affirm, and Klarna.",
+    supplies: "We bring all the supplies and equipment. If you prefer eco-friendly products, just let us know.",
+    duration: "A typical standard clean takes 2 to 3 hours, while deep cleans take longer. We'll tailor it to your space.",
+    guarantee: "We stand by our work. If anything was missed, let us know within 24 hours and we'll make it right.",
+    cancellation: "No problem—please give us 24 hours' notice to cancel or reschedule to avoid a late cancellation fee.",
+    pets: "We love pets! Just let us know about any pets so our team can be prepared.",
+    smallTalk: {
+      hi: "Hi there! I'm the Clean Easy assistant. How can I help—booking or any questions?",
+      howAreYou: "I'm doing well—thanks for asking! How can I help you today?",
+      whoAreYou: "I'm Clean Easy's AI receptionist. I can answer questions and help you book a cleaning.",
+      thanks: "You're very welcome! Anything else I can help with?",
+      bye: "Thanks for calling Clean Easy. Have a great day!",
+    }
+  },
+  es: {
+    greeting: "¡Hola! Soy tu recepcionista de IA de Clean Easy. Puedo ayudarte con reservas o responder preguntas. ¿Qué te gustaría hacer?",
+    serviceTypes: { standard: "estándar", deep: "profunda", moveout: "mudanza", airbnb: "turno de Airbnb" },
+    askServiceType: "¿Qué tipo de limpieza te gustaría—estándar, profunda, mudanza, o turno de Airbnb?",
+    askBedrooms: "¡Perfecto! ¿Cuántas habitaciones?",
+    askBathrooms: "¿Y cuántos baños?",
+    askCity: "Perfecto. ¿En qué ciudad estás?",
+    askDateTime: "¿Qué fecha y hora te funcionan mejor? Puedes decir algo como sábado a las 2 PM.",
+    askName: "¡Genial! ¿Puedo tener tu nombre para la reserva?",
+    askPhone: "¿Y cuál es el mejor número de teléfono para contactarte?",
+    priceQuote: "Eso costaría alrededor de $",
+    confirmation: "¡Perfecto! Déjame confirmar:",
+    confirmQuestion: "¿Te parece bien?",
+    finalConfirm: "¡Perfecto! Te enviaremos una confirmación a",
+    anythingElse: "¿Hay algo más que te gustaría saber?",
+    stillThere: "¿Sigues ahí? Puedo ayudarte con reservas o cualquier pregunta.",
+    coverCity: "Sí, servimos",
+    andSurrounding: "y el área circundante. ¿Te gustaría reservar?",
+    hours: "Estamos abiertos de 8 AM a 8 PM de lunes a sábado, y de 12 PM a 8 PM los domingos.",
+    services: "Ofrecemos limpieza estándar y profunda, servicios de mudanza, turnos de Airbnb, y limpieza de oficinas. Puedes reservar servicios únicos o recurrentes.",
+    payment: "Aceptamos todas las tarjetas de crédito principales, Amazon Pay, Cash App Pay, Affirm y Klarna.",
+    supplies: "Traemos todos los suministros y equipos. Si prefieres productos ecológicos, solo háznoslo saber.",
+    duration: "Una limpieza estándar típica toma de 2 a 3 horas, mientras que las limpiezas profundas toman más tiempo.",
+    guarantee: "Respaldamos nuestro trabajo. Si falta algo, avísanos dentro de las 24 horas y lo arreglaremos.",
+    cancellation: "No hay problema—por favor avísanos con 24 horas de anticipación para cancelar o reprogramar y evitar una tarifa.",
+    pets: "¡Amamos las mascotas! Solo háznoslo saber para que nuestro equipo esté preparado.",
+    smallTalk: {
+      hi: "¡Hola! Soy el asistente de Clean Easy. ¿Cómo puedo ayudarte—reservas o preguntas?",
+      howAreYou: "Estoy bien—¡gracias por preguntar! ¿Cómo puedo ayudarte hoy?",
+      whoAreYou: "Soy el recepcionista de IA de Clean Easy. Puedo responder preguntas y ayudarte a reservar.",
+      thanks: "¡De nada! ¿Algo más en lo que pueda ayudar?",
+      bye: "¡Gracias por llamar a Clean Easy. Que tengas un gran día!",
+    }
+  },
+  pt: {
+    greeting: "Olá! Sou sua recepcionista de IA da Clean Easy. Posso ajudar com reservas ou responder perguntas. O que você gostaria de fazer?",
+    serviceTypes: { standard: "padrão", deep: "profunda", moveout: "mudança", airbnb: "turno Airbnb" },
+    askServiceType: "Que tipo de limpeza você gostaria—padrão, profunda, mudança, ou turno Airbnb?",
+    askBedrooms: "Ótimo! Quantos quartos?",
+    askBathrooms: "E quantos banheiros?",
+    askCity: "Perfeito. Em que cidade você está?",
+    askDateTime: "Que data e hora funcionam melhor para você? Pode dizer algo como sábado às 2 da tarde.",
+    askName: "Ótimo! Posso ter seu nome para a reserva?",
+    askPhone: "E qual é o melhor número de telefone para contato?",
+    priceQuote: "Isso custaria cerca de $",
+    confirmation: "Perfeito! Deixe-me confirmar:",
+    confirmQuestion: "Parece bom?",
+    finalConfirm: "Perfeito! Enviaremos uma confirmação para",
+    anythingElse: "Há mais alguma coisa que você gostaria de saber?",
+    stillThere: "Você ainda está aí? Posso ajudar com reservas ou perguntas.",
+    coverCity: "Sim, atendemos",
+    andSurrounding: "e a área circundante. Gostaria de reservar?",
+    hours: "Estamos abertos das 8h às 20h de segunda a sábado, e das 12h às 20h aos domingos.",
+    services: "Oferecemos limpeza padrão e profunda, serviços de mudança, turnos Airbnb, e limpeza de escritórios. Você pode reservar serviços únicos ou recorrentes.",
+    payment: "Aceitamos todos os principais cartões de crédito, Amazon Pay, Cash App Pay, Affirm e Klarna.",
+    supplies: "Trazemos todos os suprimentos e equipamentos. Se preferir produtos ecológicos, é só avisar.",
+    duration: "Uma limpeza padrão típica leva de 2 a 3 horas, enquanto limpezas profundas levam mais tempo.",
+    guarantee: "Garantimos nosso trabalho. Se algo foi esquecido, avise-nos dentro de 24 horas e vamos corrigir.",
+    cancellation: "Sem problema—por favor avise com 24 horas de antecedência para cancelar ou reagendar e evitar uma taxa.",
+    pets: "Adoramos animais de estimação! Apenas nos avise para que nossa equipe esteja preparada.",
+    smallTalk: {
+      hi: "Olá! Sou o assistente da Clean Easy. Como posso ajudar—reservas ou perguntas?",
+      howAreYou: "Estou bem—obrigado por perguntar! Como posso ajudá-lo hoje?",
+      whoAreYou: "Sou a recepcionista de IA da Clean Easy. Posso responder perguntas e ajudar a reservar.",
+      thanks: "De nada! Mais alguma coisa que eu possa ajudar?",
+      bye: "Obrigado por ligar para a Clean Easy. Tenha um ótimo dia!",
+    }
+  }
+};
+
+// ───────────────────────────────────────────────────────────────────────────────
+// ENTITY EXTRACTION (multilingual)
+// ───────────────────────────────────────────────────────────────────────────────
+function extractName(text) {
+  const patterns = [
+    /(?:my name is|i'm|i am|this is|call me|me llamo|mi nombre es|meu nome é)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)/i,
+    /^([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)$/,
+  ];
+  for (const p of patterns) {
+    const m = text.match(p);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+function extractPhone(text) {
+  const m = text.match(/(\d{3}[\s.-]?\d{3}[\s.-]?\d{4}|\d{10})/);
+  return m ? m[1].replace(/[^\d]/g, "") : null;
+}
+
+function extractDateTime(text) {
+  const q = normalize(text);
+  let day = null, time = null;
+  
+  const daysEn = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday","tomorrow","today"];
+  const daysEs = ["lunes","martes","miercoles","jueves","viernes","sabado","domingo","mañana","hoy"];
+  const daysPt = ["segunda","terca","quarta","quinta","sexta","sabado","domingo","amanha","hoje"];
+  
+  for (const d of [...daysEn, ...daysEs, ...daysPt]) {
+    if (q.includes(d)) { day = d; break; }
+  }
+  
+  const timeMatch = text.match(/(\d{1,2})\s*(?::|h)?(?:\s*(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?/i);
+  if (timeMatch) time = timeMatch[0];
+  
+  return { day, time };
+}
+
+function extractBedrooms(text) {
+  const q = normalize(text);
+  const patterns = [
+    /(\d+)\s*(?:bed|bedroom|br|habitacion|quarto)/,
+    /(studio|estudio)/,
+  ];
+  
+  for (const p of patterns) {
+    const m = q.match(p);
+    if (m) {
+      if (m[1] === "studio" || m[1] === "estudio") return "Studio";
+      const num = parseInt(m[1]);
+      return num >= 5 ? "5+" : num.toString();
+    }
+  }
+  return null;
+}
+
+function extractBathrooms(text) {
+  const q = normalize(text);
+  const m = q.match(/(\d+)\s*(?:bath|bathroom|baño|banheiro)/);
+  if (m) {
+    const num = parseInt(m[1]);
+    return num >= 5 ? "5+" : num.toString();
+  }
+  return null;
+}
+
+function extractServiceType(text, lang) {
+  const q = normalize(text);
+  if (lang === "en") {
+    if (q.includes("deep") || q.includes("thorough")) return "deep";
+    if (q.includes("move out") || q.includes("move-out") || q.includes("moveout")) return "moveout";
+    if (q.includes("airbnb") || q.includes("turnover")) return "airbnb";
+    if (q.includes("standard") || q.includes("regular") || q.includes("basic")) return "standard";
+  } else if (lang === "es") {
+    if (q.includes("profunda") || q.includes("fondo")) return "deep";
+    if (q.includes("mudanza")) return "moveout";
+    if (q.includes("airbnb") || q.includes("turno")) return "airbnb";
+    if (q.includes("estandar") || q.includes("basica")) return "standard";
+  } else if (lang === "pt") {
+    if (q.includes("profunda") || q.includes("fundo")) return "deep";
+    if (q.includes("mudanca")) return "moveout";
+    if (q.includes("airbnb") || q.includes("turno")) return "airbnb";
+    if (q.includes("padrao") || q.includes("basica")) return "standard";
+  }
+  return null;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// CONVERSATION STATE
+// ───────────────────────────────────────────────────────────────────────────────
+class ConversationContext {
+  constructor() {
+    this.state = "initial";
+    this.language = null;
+    this.data = {
+      serviceType: null,
+      bedrooms: null,
+      bathrooms: null,
+      city: null,
+      date: null,
+      time: null,
+      name: null,
+      phone: null,
+      frequency: "onetime",
+      estimatedPrice: null,
+    };
+  }
+  
+  t(key) {
+    if (!this.language) return TRANSLATIONS.en[key] || "";
+    return TRANSLATIONS[this.language][key] || TRANSLATIONS.en[key] || "";
+  }
+  
+  calculatePrice() {
+    if (!this.data.serviceType || !this.data.bedrooms) return null;
+    const type = this.data.serviceType;
+    const key = this.data.bedrooms === "Studio" ? "Studio" : 
+                `${this.data.bedrooms}-${this.data.bathrooms || "1"}`;
+    const basePrice = PRICING_MATRIX[type]?.[key];
+    if (!basePrice) return null;
+    const discount = FREQUENCY_DISCOUNTS[this.data.frequency] || 0;
+    return Math.round(basePrice * (1 - discount));
+  }
+  
+  hasAllBookingInfo() {
+    return this.data.serviceType && this.data.bedrooms && this.data.city && 
+           this.data.date && this.data.time && this.data.name && this.data.phone;
+  }
+  
+  getSummary() {
+    const t = this.t("serviceTypes");
+    const parts = [];
+    if (this.data.serviceType) parts.push(`${t[this.data.serviceType]} ${this.t("serviceTypes").standard ? "clean" : "limpieza"}`);
+    if (this.data.bedrooms) {
+      const br = this.data.bedrooms === "Studio" ? "studio" : `${this.data.bedrooms} ${this.language === "es" ? "habitaciones" : this.language === "pt" ? "quartos" : "bedroom"}`;
+      parts.push(br);
+    }
+    if (this.data.bathrooms) parts.push(`${this.data.bathrooms} ${this.language === "es" ? "baños" : this.language === "pt" ? "banheiros" : "bathroom"}`);
+    if (this.data.city) parts.push(`${this.language === "es" ? "en" : this.language === "pt" ? "em" : "in"} ${this.data.city}`);
+    if (this.data.date && this.data.time) parts.push(`${this.language === "es" ? "el" : this.language === "pt" ? "em" : "on"} ${this.data.date} ${this.language === "es" || this.language === "pt" ? "a las" : "at"} ${this.data.time}`);
+    if (this.data.estimatedPrice) parts.push(`${this.language === "es" ? "por" : this.language === "pt" ? "por" : "for"} $${this.data.estimatedPrice}`);
+    return parts.join(", ");
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// INTELLIGENT ROUTER
+// ───────────────────────────────────────────────────────────────────────────────
+function routeWithContext(text, ctx) {
+  const q = normalize(text);
+  
+  // Detect language on first turn
+  if (!ctx.language) {
+    ctx.language = detectLanguage(text);
+    console.log(`[LANG] Detected: ${ctx.language}`);
+  }
+  
+  const lang = ctx.language;
+  
+  // Extract entities
+  const name = extractName(text);
+  const phone = extractPhone(text);
+  const dateTime = extractDateTime(text);
+  const bedrooms = extractBedrooms(text);
+  const bathrooms = extractBathrooms(text);
+  const serviceType = extractServiceType(text, lang);
+  const city = findCityInText(text);
+  
+  if (name && !ctx.data.name) ctx.data.name = name;
+  if (phone && !ctx.data.phone) ctx.data.phone = phone;
+  if (dateTime.day) ctx.data.date = dateTime.day;
+  if (dateTime.time) ctx.data.time = dateTime.time;
+  if (bedrooms && !ctx.data.bedrooms) ctx.data.bedrooms = bedrooms;
+  if (bathrooms && !ctx.data.bathrooms) ctx.data.bathrooms = bathrooms;
+  if (serviceType && !ctx.data.serviceType) ctx.data.serviceType = serviceType;
+  if (city && city.known && !ctx.data.city) ctx.data.city = city.city;
+  
+  if (ctx.data.serviceType && ctx.data.bedrooms && !ctx.data.estimatedPrice) {
+    ctx.data.estimatedPrice = ctx.calculatePrice();
+  }
+  
+  // Small talk
+  if (ctx.state === "initial") {
+    if (q.includes("hi") || q.includes("hello") || q.includes("hola") || q.includes("ola")) {
+      return ctx.t("smallTalk").hi;
+    }
+    if (q.includes("how are") || q.includes("como estas") || q.includes("como esta")) {
+      return ctx.t("smallTalk").howAreYou;
+    }
+    if (q.includes("who are you") || q.includes("quien eres") || q.includes("quem e")) {
+      return ctx.t("smallTalk").whoAreYou;
+    }
+    if (q.includes("thank") || q.includes("gracias") || q.includes("obrigad")) {
+      return ctx.t("smallTalk").thanks;
+    }
+    if (q.includes("bye") || q.includes("adios") || q.includes("tchau")) {
+      return ctx.t("smallTalk").bye;
+    }
+  }
+  
+  // Service area
+  if (city && !ctx.data.city) {
+    if (city.known) {
+      ctx.data.city = city.city;
+      return `${ctx.t("coverCity")} ${city.city} ${ctx.t("andSurrounding")}`;
+    }
+  }
+  
+  // KB questions
+  if (ctx.state === "initial") {
+    if (q.includes("hour") || q.includes("open") || q.includes("horario")) return ctx.t("hours");
+    if (q.includes("service") || q.includes("servicio") || q.includes("servico")) return ctx.t("services");
+    if (q.includes("pay") || q.includes("pago") || q.includes("pagamento")) return ctx.t("payment");
+    if (q.includes("supplies") || q.includes("productos") || q.includes("produtos")) return ctx.t("supplies");
+    if (q.includes("how long") || q.includes("cuanto tiempo") || q.includes("quanto tempo")) return ctx.t("duration");
+    if (q.includes("guarantee") || q.includes("garantia")) return ctx.t("guarantee");
+    if (q.includes("cancel") || q.includes("cancelar")) return ctx.t("cancellation");
+    if (q.includes("pet") || q.includes("mascota") || q.includes("animal")) return ctx.t("pets");
+  }
+  
+  // Booking intent
+  if ((q.includes("book") || q.includes("schedule") || q.includes("reserva") || q.includes("agendar")) && ctx.state === "initial") {
+    ctx.state = "booking_flow";
+    if (!ctx.data.serviceType) return ctx.t("askServiceType");
+  }
+  
+  // Pricing
+  if (q.includes("price") || q.includes("cost") || q.includes("precio") || q.includes("preco") || q.includes("cuanto")) {
+    if (ctx.data.estimatedPrice) {
+      return `${ctx.t("priceQuote")}${ctx.data.estimatedPrice}. ${lang === "es" ? "¿Te gustaría reservar?" : lang === "pt" ? "Gostaria de reservar?" : "Would you like to book?"}`;
+    }
+    if (!ctx.data.bedrooms) return ctx.t("askBedrooms");
+    if (!ctx.data.serviceType) return ctx.t("askServiceType");
+  }
+  
+  // Booking flow
+  if (ctx.state === "booking_flow") {
+    if ((q.includes("yes") || q.includes("si") || q.includes("sim") || q.includes("sounds good")) && ctx.hasAllBookingInfo()) {
+      return `${ctx.t("finalConfirm")} ${ctx.data.phone}. ${ctx.t("anythingElse")}`;
+    }
+    
+    if (!ctx.data.serviceType) return ctx.t("askServiceType");
+    if (!ctx.data.bedrooms) return ctx.t("askBedrooms");
+    if (!ctx.data.bathrooms && ctx.data.bedrooms !== "Studio") return ctx.t("askBathrooms");
+    if (!ctx.data.city) return ctx.t("askCity");
+    
+    if (ctx.data.serviceType && ctx.data.bedrooms && !ctx.data.estimatedPrice) {
+      ctx.data.estimatedPrice = ctx.calculatePrice();
+    }
+    
+    if (!ctx.data.date || !ctx.data.time) {
+      const priceMsg = ctx.data.estimatedPrice ? ` ${ctx.t("priceQuote")}${ctx.data.estimatedPrice}.` : "";
+      return `${lang === "es" ? "¡Excelente!" : lang === "pt" ? "Excelente!" : "Excellent!"}${priceMsg} ${ctx.t("askDateTime")}`;
+    }
+    if (!ctx.data.name) return ctx.t("askName");
+    if (!ctx.data.phone) return ctx.t("askPhone");
+    
+    if (ctx.hasAllBookingInfo()) {
+      return `${ctx.t("confirmation")} ${ctx.getSummary()}. ${ctx.t("confirmQuestion")}`;
+    }
+  }
+  
+  return lang === "es" ? "Puedo ayudar con reservas o preguntas sobre nuestros servicios. ¿Qué te gustaría saber?" :
+         lang === "pt" ? "Posso ajudar com reservas ou perguntas sobre nossos serviços. O que você gostaria de saber?" :
+         "I can help with booking or questions about our services. What would you like to know?";
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Audio & TTS
 // ───────────────────────────────────────────────────────────────────────────────
 function makeBeepPcm16(ms = 180, hz = 950) {
   const samples = Math.floor((SAMPLE_RATE * ms) / 1000);
@@ -86,11 +530,9 @@ function inboundToPCM16(buf) {
   return out;
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// TTS via ElevenLabs (MP3) → ffmpeg → target format buffer
-// ───────────────────────────────────────────────────────────────────────────────
-async function ttsElevenLabsRaw(text) {
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
+async function ttsElevenLabsRaw(text, lang = "en") {
+  const voiceId = lang === "es" ? ELEVEN_VOICE_ID_ES : lang === "pt" ? ELEVEN_VOICE_ID_PT : ELEVEN_VOICE_ID_EN;
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -101,7 +543,7 @@ async function ttsElevenLabsRaw(text) {
     body: JSON.stringify({ text, voice_settings: { stability: 0.4, similarity_boost: 0.7 } }),
   });
   if (!res.ok) {
-    throw new Error(`ElevenLabs TTS failed: ${res.status} ${res.statusText} ${await res.text()}`);
+    throw new Error(`ElevenLabs TTS failed: ${res.status} ${res.statusText}`);
   }
   return Buffer.from(await res.arrayBuffer());
 }
@@ -118,9 +560,8 @@ function ffmpegTranscode(inputBuf, args) {
   });
 }
 
-async function ttsToPcm16(text) {
-  const input = await ttsElevenLabsRaw(text);
-  console.log("[TTS] Received MP3. → PCM16/8k/mono");
+async function ttsToPcm16(text, lang = "en") {
+  const input = await ttsElevenLabsRaw(text, lang);
   let out = await ffmpegTranscode(input, [
     "-hide_banner","-nostdin","-loglevel","error",
     "-i","pipe:0","-ac","1","-ar","8000",
@@ -130,9 +571,8 @@ async function ttsToPcm16(text) {
   return out;
 }
 
-async function ttsToMulaw(text) {
-  const input = await ttsElevenLabsRaw(text);
-  console.log("[TTS] Received MP3. → μ-law/8k/mono");
+async function ttsToMulaw(text, lang = "en") {
+  const input = await ttsElevenLabsRaw(text, lang);
   return await ffmpegTranscode(input, [
     "-hide_banner","-nostdin","-loglevel","error",
     "-i","pipe:0","-ac","1","-ar","8000",
@@ -140,9 +580,6 @@ async function ttsToMulaw(text) {
   ]);
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Outbound streaming (Twilio frames)
-// ───────────────────────────────────────────────────────────────────────────────
 async function streamFrames(ws, raw) {
   const bytesPerFrame = MEDIA_FORMAT === "mulaw" ? BYTES_PER_FRAME_MULAW : BYTES_PER_FRAME_PCM16;
   let offset = 0, frames = 0;
@@ -156,42 +593,22 @@ async function streamFrames(ws, raw) {
     }
     ws.send(JSON.stringify({ event: "media", streamSid: ws._streamSid, media: { payload: frame.toString("base64") } }));
     frames++;
-    if (frames % 100 === 0) console.log(`[TTS] sent ${frames} frames (~${(frames * FRAME_MS) / 1000}s)`);
+    if (frames % 100 === 0) console.log(`[TTS] sent ${frames} frames`);
     await new Promise(r => setTimeout(r, FRAME_MS));
     offset += bytesPerFrame;
   }
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Simple intent routing
+// Deepgram with multi-language
 // ───────────────────────────────────────────────────────────────────────────────
-function normalize(s) {
-  return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function routeIntent(text) {
-  const q = normalize(text);
-  if (q.includes("hour") || q.includes("open") || q.includes("close")) {
-    return "We're open 8 AM to 6 PM Monday through Friday, and 9 AM to 2 PM on Saturday.";
-  }
-  if (q.includes("book") || q.includes("appointment") || q.includes("schedule")) {
-    return "Sure—what date and time are you looking for? Please say something like Saturday at 2 PM.";
-  }
-  if (q.includes("availability") || q.includes("available")) {
-    return "Happy to check—what date and time would you like?";
-  }
-  return "I can help with booking and general questions. What would you like to do?";
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// Deepgram realtime with partial buffering + idle promotion
-// ───────────────────────────────────────────────────────────────────────────────
-function connectDeepgram(onFinal, onAnyTranscript) {
+function connectDeepgram(onFinal, onAnyTranscript, lang = "en") {
   if (!DG_KEY) {
     console.warn("⚠️ DEEPGRAM_API_KEY missing — STT disabled.");
     return null;
   }
-  const url = `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&punctuate=true&vad_events=true&endpointing=true`;
+  const langCode = lang === "es" ? "es" : lang === "pt" ? "pt" : "en-US";
+  const url = `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&punctuate=true&language=${langCode}`;
   const dg = new WebSocket(url, { headers: { Authorization: `Token ${DG_KEY}` } });
 
   let lastPartial = "";
@@ -208,16 +625,11 @@ function connectDeepgram(onFinal, onAnyTranscript) {
     }
   }
 
-  dg.on("open", () => console.log("[DG] connected"));
+  dg.on("open", () => console.log(`[DG] connected (${langCode})`));
 
   dg.on("message", (d) => {
     try {
       const msg = JSON.parse(d.toString());
-
-      if (msg.type === "SpeechStarted" || msg.type === "SpeechEnded") {
-        console.log(`[DG] ${msg.type}`);
-      }
-
       const alt = msg.channel?.alternatives?.[0];
       const transcript = alt?.transcript?.trim() || "";
 
@@ -250,7 +662,7 @@ function connectDeepgram(onFinal, onAnyTranscript) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// WebSocket (Twilio <Stream> → wss://…/stream)
+// WebSocket
 // ───────────────────────────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ noServer: true });
 
@@ -258,6 +670,8 @@ wss.on("connection", (ws) => {
   console.log("🔗 WebSocket connected");
   ws._rx = 0;
   ws._speaking = false;
+  ws._ctx = new ConversationContext();
+  ws._dgConnection = null;
 
   let noInputTimer = null;
   const resetNoInputTimer = () => {
@@ -266,8 +680,8 @@ wss.on("connection", (ws) => {
       if (ws._speaking) return;
       ws._speaking = true;
       try {
-        const prompt = "Are you still there? I can help with booking or any questions.";
-        const out = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(prompt) : await ttsToPcm16(prompt);
+        const prompt = ws._ctx.t("stillThere");
+        const out = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(prompt, ws._ctx.language) : await ttsToPcm16(prompt, ws._ctx.language);
         await streamFrames(ws, out);
       } catch (e) {
         console.error("[TTS] reprompt failed:", e.message);
@@ -278,46 +692,53 @@ wss.on("connection", (ws) => {
     }, NO_INPUT_REPROMPT_MS);
   };
 
-  const dg = connectDeepgram(
-    async (finalText) => {
-      if (ws._speaking) return;
-      const reply = routeIntent(finalText);
-      ws._speaking = true;
-      try {
-        const out = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(reply) : await ttsToPcm16(reply);
-        await streamFrames(ws, out);
-      } catch (e) {
-        console.error("[TTS] reply failed:", e.message);
-      } finally {
-        ws._speaking = false;
-        resetNoInputTimer();
-      }
-    },
-    () => resetNoInputTimer()
-  );
+  const handleFinal = async (finalText) => {
+    if (ws._speaking) return;
+    
+    // If language just detected, reconnect Deepgram
+    if (!ws._ctx.language) {
+      ws._ctx.language = detectLanguage(finalText);
+      console.log(`[LANG] Switching to ${ws._ctx.language}`);
+      if (ws._dgConnection) ws._dgConnection.close();
+      ws._dgConnection = connectDeepgram(handleFinal, () => resetNoInputTimer(), ws._ctx.language);
+    }
+    
+    const reply = routeWithContext(finalText, ws._ctx);
+    console.log(`[CONTEXT] ${JSON.stringify(ws._ctx.data)}`);
+    
+    ws._speaking = true;
+    try {
+      const out = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(reply, ws._ctx.language) : await ttsToPcm16(reply, ws._ctx.language);
+      await streamFrames(ws, out);
+    } catch (e) {
+      console.error("[TTS] reply failed:", e.message);
+    } finally {
+      ws._speaking = false;
+      resetNoInputTimer();
+    }
+  };
+
+  ws._dgConnection = connectDeepgram(handleFinal, () => resetNoInputTimer());
 
   ws.on("message", async (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
     if (msg.event === "connected") {
-      console.log(`[WS] event: connected proto=${msg.protocol} v=${msg.version}`);
+      console.log(`[WS] event: connected`);
     }
 
     if (msg.event === "start") {
       ws._streamSid = msg.start?.streamSid;
-      console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${ws._streamSid}`);
+      console.log(`[WS] START callSid=${msg.start?.callSid}`);
 
       if (MEDIA_FORMAT === "mulaw") await streamFrames(ws, makeBeepMulaw());
       else await streamFrames(ws, makeBeepPcm16());
-      console.log("[BEEP] done.");
 
       try {
-        console.log(`[TTS] streaming greeting as ${MEDIA_FORMAT}…`);
         const text = "Hi! I'm your AI receptionist at Clean Easy. I can help with booking or answer questions. What would you like to do?";
         const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text) : await ttsToPcm16(text);
         await streamFrames(ws, buf);
-        console.log("[TTS] done.");
       } catch (e) {
         console.error("[TTS] greeting failed:", e.message);
       }
@@ -327,36 +748,36 @@ wss.on("connection", (ws) => {
 
     if (msg.event === "media") {
       ws._rx++;
-      if (ws._rx % 100 === 0) console.log(`[MEDIA] frames received: ${ws._rx}`);
-      if (dg && dg.readyState === dg.OPEN && !ws._speaking) {
+      if (ws._dgConnection && ws._dgConnection.readyState === ws._dgConnection.OPEN && !ws._speaking) {
         const b = Buffer.from(msg.media.payload, "base64");
         const pcm16 = inboundToPCM16(b);
-        dg.send(pcm16);
+        ws._dgConnection.send(pcm16);
       }
     }
 
     if (msg.event === "stop") {
-      console.log(`[WS] STOP (total inbound frames: ${ws._rx || 0})`);
-      if (dg && dg.readyState === dg.OPEN) dg.close();
+      console.log(`[WS] STOP`);
+      if (ws._dgConnection && ws._dgConnection.readyState === ws._dgConnection.OPEN) ws._dgConnection.close();
       if (noInputTimer) clearTimeout(noInputTimer);
     }
   });
 
   ws.on("close", () => {
-    console.log("[WS] CLOSE code=1005");
+    console.log("[WS] CLOSE");
     if (noInputTimer) clearTimeout(noInputTimer);
   });
   ws.on("error", (err) => console.error("[WS] error", err));
 });
 
 // ───────────────────────────────────────────────────────────────────────────────
-// HTTP: health + debug speak
+// HTTP
 // ───────────────────────────────────────────────────────────────────────────────
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/debug/say", async (req, res) => {
   try {
     const text = (req.query.text || "This is a test.").toString();
-    const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text) : await ttsToPcm16(text);
+    const lang = req.query.lang || "en";
+    const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text, lang) : await ttsToPcm16(text, lang);
     res.setHeader("Content-Type", MEDIA_FORMAT === "mulaw" ? "audio/basic" : "audio/L16");
     res.send(buf);
   } catch (e) {
@@ -364,7 +785,6 @@ app.get("/debug/say", async (req, res) => {
   }
 });
 
-// ───────────────────────────────────────────────────────────────────────────────
 const server = app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 server.on("upgrade", (req, socket, head) => {
   if (req.url !== "/stream") return socket.destroy();
