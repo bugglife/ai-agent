@@ -31,7 +31,7 @@ const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1;
 
 const ASR_PARTIAL_PROMOTE_MS = 1200;
 const NO_INPUT_REPROMPT_MS = 7000;
-const POST_TTS_GRACE_MS = 2500; // Increased from default - gives caller time to think
+const POST_TTS_GRACE_MS = 1200; // Shorter grace - just enough to prevent echo, not responses
 
 // ───────────────────────────────────────────────────────────────────────────────
 // SERVICE AREAS & PRICING
@@ -326,29 +326,92 @@ function extractDateTime(text) {
 
 function extractBedrooms(text) {
   const q = normalize(text);
-  const patterns = [
-    /(\d+)\s*(?:bed|bedroom|br|habitacion|quarto)/,
-    /(studio|estudio)/,
-  ];
   
-  for (const p of patterns) {
-    const m = q.match(p);
-    if (m) {
-      if (m[1] === "studio" || m[1] === "estudio") return "Studio";
-      const num = parseInt(m[1]);
-      return num >= 5 ? "5+" : num.toString();
+  // Number words to digits
+  const numberWords = {
+    "studio": "Studio",
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "5+", "seven": "5+", "eight": "5+",
+    "uno": "1", "dos": "2", "tres": "3", "cuatro": "4", "cinco": "5",
+    "um": "1", "dois": "2", "tres": "3", "quatro": "4", "cinco": "5",
+  };
+  
+  // Try word patterns first
+  for (const [word, num] of Object.entries(numberWords)) {
+    if (q.includes(word + " bed") || q.includes(word + " room") || 
+        q.includes(word + " habitacion") || q.includes(word + " quarto")) {
+      console.log(`[EXTRACT] Bedrooms via word: ${word} → ${num}`);
+      return num;
     }
   }
+  
+  // Try just the number word if context suggests bedrooms
+  if (q.includes("bedroom") || q.includes("habitacion") || q.includes("quarto") || 
+      q.match(/how many|cuantos|quantos/)) {
+    for (const [word, num] of Object.entries(numberWords)) {
+      if (q === word || q === word + "s") {
+        console.log(`[EXTRACT] Bedrooms via number word: ${word} → ${num}`);
+        return num;
+      }
+    }
+  }
+  
+  // Try digit patterns
+  const digitMatch = q.match(/(\d+)\s*(?:bed|bedroom|br|habitacion|quarto)/);
+  if (digitMatch) {
+    const num = parseInt(digitMatch[1]);
+    const result = num >= 5 ? "5+" : num.toString();
+    console.log(`[EXTRACT] Bedrooms via digit: ${num} → ${result}`);
+    return result;
+  }
+  
+  // If in bedroom context and just a number is said
+  const justNumber = q.match(/^(one|two|three|four|five|six|1|2|3|4|5|6|studio)$/);
+  if (justNumber) {
+    const word = justNumber[1];
+    const result = numberWords[word] || (parseInt(word) >= 5 ? "5+" : word);
+    console.log(`[EXTRACT] Bedrooms via standalone: ${word} → ${result}`);
+    return result;
+  }
+  
   return null;
 }
 
 function extractBathrooms(text) {
   const q = normalize(text);
-  const m = q.match(/(\d+)\s*(?:bath|bathroom|baño|banheiro)/);
-  if (m) {
-    const num = parseInt(m[1]);
-    return num >= 5 ? "5+" : num.toString();
+  
+  const numberWords = {
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "uno": "1", "dos": "2", "tres": "3", "cuatro": "4", "cinco": "5",
+    "um": "1", "dois": "2", "tres": "3", "quatro": "4", "cinco": "5",
+  };
+  
+  // Try word patterns
+  for (const [word, num] of Object.entries(numberWords)) {
+    if (q.includes(word + " bath") || q.includes(word + " bano") || q.includes(word + " banheiro")) {
+      console.log(`[EXTRACT] Bathrooms via word: ${word} → ${num}`);
+      return num >= 5 ? "5+" : num;
+    }
   }
+  
+  // Try digit patterns
+  const digitMatch = q.match(/(\d+)\s*(?:bath|bathroom|baño|banheiro)/);
+  if (digitMatch) {
+    const num = parseInt(digitMatch[1]);
+    const result = num >= 5 ? "5+" : num.toString();
+    console.log(`[EXTRACT] Bathrooms via digit: ${num} → ${result}`);
+    return result;
+  }
+  
+  // If in bathroom context and just a number
+  const justNumber = q.match(/^(one|two|three|four|five|1|2|3|4|5)$/);
+  if (justNumber) {
+    const word = justNumber[1];
+    const result = numberWords[word] || word;
+    console.log(`[EXTRACT] Bathrooms via standalone: ${word} → ${result}`);
+    return result;
+  }
+  
   return null;
 }
 
@@ -484,6 +547,23 @@ function routeWithContext(text, ctx) {
       return lang === "es" ? `Estamos expandiendo nuestra cobertura. ¿Cuál es el código postal de ${city.city}?` :
              lang === "pt" ? `Estamos expandindo nossa cobertura. Qual é o CEP de ${city.city}?` :
              `We're expanding our coverage. What's the ZIP code for ${city.city}? I can confirm if we serve that area.`;
+    }
+  }
+  
+  // Handle "I don't know the ZIP" when previously asked
+  if ((q.includes("don't know") || q.includes("no se") || q.includes("nao sei")) && 
+      (q.includes("zip") || q.includes("codigo") || q.includes("cep"))) {
+    // Check if they mentioned a city we actually serve
+    for (const serviceCity of SERVICE_AREAS) {
+      const cityNorm = serviceCity.toLowerCase();
+      if (q.includes(cityNorm) || ctx.data.city === serviceCity) {
+        if (!ctx.data.city) ctx.data.city = serviceCity;
+        return `${lang === "es" ? "No hay problema" : lang === "pt" ? "Sem problema" : "No problem"}! ${ctx.t("coverCity")} ${serviceCity}. ${lang === "es" ? "¿Te gustaría reservar?" : lang === "pt" ? "Gostaria de reservar?" : "Would you like to book?"}`;
+      }
+    }
+    // Check history for city mentions
+    if (ctx.data.city && SERVICE_AREAS.includes(ctx.data.city)) {
+      return `${lang === "es" ? "No hay problema" : lang === "pt" ? "Sem problema" : "No problem"}! ${ctx.t("coverCity")} ${ctx.data.city}. ${lang === "es" ? "¿Te gustaría reservar?" : lang === "pt" ? "Gostaria de reservar?" : "Would you like to book?"}`;
     }
   }
   
