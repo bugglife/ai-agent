@@ -186,9 +186,9 @@ const TRANSLATIONS = {
     greeting: "Hi! I'm your AI receptionist at Clean Easy. I can help with booking or answer questions. What would you like to do?",
     serviceTypes: { standard: "standard", deep: "deep", moveout: "move-out", airbnb: "Airbnb turnover" },
     askServiceType: "What type of cleaning would you like—standard, deep, move-out, or Airbnb turnover?",
-    askBedrooms: "Great! How many bedrooms?",
+    askBedrooms: "How many bedrooms?",
     askBathrooms: "And how many bathrooms?",
-    askCity: "Perfect. What city are you located in?",
+    askCity: "What city are you in?",
     askDateTime: "What date and time work best for you? You can say something like Saturday at 2 PM.",
     askName: "Great! Can I get your name for the booking?",
     askPhone: "And what's the best phone number to reach you?",
@@ -220,9 +220,9 @@ const TRANSLATIONS = {
     greeting: "¡Hola! Soy tu recepcionista de IA de Clean Easy. Puedo ayudarte con reservas o responder preguntas. ¿Qué te gustaría hacer?",
     serviceTypes: { standard: "estándar", deep: "profunda", moveout: "mudanza", airbnb: "turno de Airbnb" },
     askServiceType: "¿Qué tipo de limpieza te gustaría—estándar, profunda, mudanza, o turno de Airbnb?",
-    askBedrooms: "¡Perfecto! ¿Cuántas habitaciones?",
+    askBedrooms: "¿Cuántas habitaciones?",
     askBathrooms: "¿Y cuántos baños?",
-    askCity: "Perfecto. ¿En qué ciudad estás?",
+    askCity: "¿En qué ciudad estás?",
     askDateTime: "¿Qué fecha y hora te funcionan mejor? Puedes decir algo como sábado a las 2 PM.",
     askName: "¡Genial! ¿Puedo tener tu nombre para la reserva?",
     askPhone: "¿Y cuál es el mejor número de teléfono para contactarte?",
@@ -254,9 +254,9 @@ const TRANSLATIONS = {
     greeting: "Olá! Sou sua recepcionista de IA da Clean Easy. Posso ajudar com reservas ou responder perguntas. O que você gostaria de fazer?",
     serviceTypes: { standard: "padrão", deep: "profunda", moveout: "mudança", airbnb: "turno Airbnb" },
     askServiceType: "Que tipo de limpeza você gostaria—padrão, profunda, mudança, ou turno Airbnb?",
-    askBedrooms: "Ótimo! Quantos quartos?",
+    askBedrooms: "Quantos quartos?",
     askBathrooms: "E quantos banheiros?",
-    askCity: "Perfeito. Em que cidade você está?",
+    askCity: "Em que cidade você está?",
     askDateTime: "Que data e hora funcionam melhor para você? Pode dizer algo como sábado às 2 da tarde.",
     askName: "Ótimo! Posso ter seu nome para a reserva?",
     askPhone: "E qual é o melhor número de telefone para contato?",
@@ -314,18 +314,42 @@ function extractDateTime(text) {
   const daysEs = ["lunes","martes","miercoles","jueves","viernes","sabado","domingo","mañana","hoy"];
   const daysPt = ["segunda","terca","quarta","quinta","sexta","sabado","domingo","amanha","hoje"];
   
+  // Find day
   for (const d of [...daysEn, ...daysEs, ...daysPt]) {
-    if (q.includes(d)) { day = d; break; }
+    if (q.includes(d)) { 
+      day = d;
+      console.log(`[EXTRACT] Day: ${day}`);
+      break; 
+    }
   }
   
-  const timeMatch = text.match(/(\d{1,2})\s*(?::|h)?(?:\s*(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?/i);
-  if (timeMatch) time = timeMatch[0];
+  // Find time - multiple patterns
+  const timePatterns = [
+    /(\d{1,2})\s*(?::|h)?\s*(\d{2})?\s*(am|pm|a\.m\.|p\.m\.)/i, // "4 PM", "4:30 PM"
+    /(\d{1,2})\s*(o'?clock|oclock)/i, // "4 o'clock"
+    /(morning|afternoon|evening|noon)/i, // "afternoon"
+  ];
+  
+  for (const pattern of timePatterns) {
+    const m = text.match(pattern);
+    if (m) { 
+      time = m[0];
+      console.log(`[EXTRACT] Time: ${time}`);
+      break;
+    }
+  }
   
   return { day, time };
 }
 
 function extractBedrooms(text) {
   const q = normalize(text);
+  
+  // REJECT filler words that might be misheard as numbers
+  if (q === "uh" || q === "um" || q === "er" || q === "ah" || q === "hmm") {
+    console.log(`[EXTRACT] Rejected filler word: ${q}`);
+    return null;
+  }
   
   // Number words to digits
   const numberWords = {
@@ -346,10 +370,10 @@ function extractBedrooms(text) {
   }
   
   // Try just the number word if context suggests bedrooms
-  if (q.includes("bedroom") || q.includes("habitacion") || q.includes("quarto") || 
-      q.match(/how many|cuantos|quantos/)) {
+  if (q.includes("bedroom") || q.includes("habitacion") || q.includes("quarto")) {
     for (const [word, num] of Object.entries(numberWords)) {
-      if (q === word || q === word + "s") {
+      const wordPattern = new RegExp(`\\b${word}\\b`);
+      if (wordPattern.test(q)) {
         console.log(`[EXTRACT] Bedrooms via number word: ${word} → ${num}`);
         return num;
       }
@@ -365,7 +389,7 @@ function extractBedrooms(text) {
     return result;
   }
   
-  // If in bedroom context and just a number is said
+  // If JUST a standalone number (and nothing else suspicious)
   const justNumber = q.match(/^(one|two|three|four|five|six|1|2|3|4|5|6|studio)$/);
   if (justNumber) {
     const word = justNumber[1];
@@ -465,12 +489,18 @@ class ConversationContext {
   calculatePrice() {
     if (!this.data.serviceType || !this.data.bedrooms) return null;
     const type = this.data.serviceType;
+    const bathrooms = this.data.bathrooms || "1"; // Default to 1 if not specified
     const key = this.data.bedrooms === "Studio" ? "Studio" : 
-                `${this.data.bedrooms}-${this.data.bathrooms || "1"}`;
+                `${this.data.bedrooms}-${bathrooms}`;
     const basePrice = PRICING_MATRIX[type]?.[key];
-    if (!basePrice) return null;
+    if (!basePrice) {
+      console.log(`[PRICE] No match for ${type} ${key}`);
+      return null;
+    }
     const discount = FREQUENCY_DISCOUNTS[this.data.frequency] || 0;
-    return Math.round(basePrice * (1 - discount));
+    const finalPrice = Math.round(basePrice * (1 - discount));
+    console.log(`[PRICE] ${type} ${key}: ${basePrice} - ${discount*100}% = ${finalPrice}`);
+    return finalPrice;
   }
   
   hasAllBookingInfo() {
@@ -478,10 +508,10 @@ class ConversationContext {
            this.data.date && this.data.time && this.data.name && this.data.phone;
   }
   
-  getSummary() {
+  getSummary(includePrice = false) {
     const t = this.t("serviceTypes");
     const parts = [];
-    if (this.data.serviceType) parts.push(`${t[this.data.serviceType]} ${this.t("serviceTypes").standard ? "clean" : "limpieza"}`);
+    if (this.data.serviceType) parts.push(`${t[this.data.serviceType]} ${this.language === "es" ? "limpieza" : this.language === "pt" ? "limpeza" : "clean"}`);
     if (this.data.bedrooms) {
       const br = this.data.bedrooms === "Studio" ? "studio" : `${this.data.bedrooms} ${this.language === "es" ? "habitaciones" : this.language === "pt" ? "quartos" : "bedroom"}`;
       parts.push(br);
@@ -489,7 +519,7 @@ class ConversationContext {
     if (this.data.bathrooms) parts.push(`${this.data.bathrooms} ${this.language === "es" ? "baños" : this.language === "pt" ? "banheiros" : "bathroom"}`);
     if (this.data.city) parts.push(`${this.language === "es" ? "en" : this.language === "pt" ? "em" : "in"} ${this.data.city}`);
     if (this.data.date && this.data.time) parts.push(`${this.language === "es" ? "el" : this.language === "pt" ? "em" : "on"} ${this.data.date} ${this.language === "es" || this.language === "pt" ? "a las" : "at"} ${this.data.time}`);
-    if (this.data.estimatedPrice) parts.push(`${this.language === "es" ? "por" : this.language === "pt" ? "por" : "for"} $${this.data.estimatedPrice}`);
+    if (includePrice && this.data.estimatedPrice) parts.push(`${this.language === "es" ? "por" : this.language === "pt" ? "por" : "for"} ${this.data.estimatedPrice}`);
     return parts.join(", ");
   }
 }
@@ -512,17 +542,38 @@ function routeWithContext(text, ctx) {
   const name = extractName(text);
   const phone = extractPhone(text);
   const dateTime = extractDateTime(text);
-  const bedrooms = extractBedrooms(text);
-  const bathrooms = extractBathrooms(text);
   const serviceType = extractServiceType(text, lang);
   const city = findCityInText(text);
+  
+  // Smart extraction based on context
+  let bedrooms = null;
+  let bathrooms = null;
+  
+  // If we're in booking flow and missing bathrooms but have bedrooms, prioritize bathroom extraction
+  if (ctx.state === "booking_flow" && ctx.data.bedrooms && !ctx.data.bathrooms) {
+    bathrooms = extractBathrooms(text);
+    console.log(`[CONTEXT] Prioritizing bathroom extraction: ${bathrooms}`);
+  } else if (ctx.state === "booking_flow" && !ctx.data.bedrooms) {
+    bedrooms = extractBedrooms(text);
+    console.log(`[CONTEXT] Prioritizing bedroom extraction: ${bedrooms}`);
+  } else {
+    // Extract both normally
+    bedrooms = extractBedrooms(text);
+    bathrooms = extractBathrooms(text);
+  }
   
   if (name && !ctx.data.name) ctx.data.name = name;
   if (phone && !ctx.data.phone) ctx.data.phone = phone;
   if (dateTime.day) ctx.data.date = dateTime.day;
   if (dateTime.time) ctx.data.time = dateTime.time;
-  if (bedrooms && !ctx.data.bedrooms) ctx.data.bedrooms = bedrooms;
-  if (bathrooms && !ctx.data.bathrooms) ctx.data.bathrooms = bathrooms;
+  if (bedrooms && !ctx.data.bedrooms) {
+    ctx.data.bedrooms = bedrooms;
+    console.log(`[DATA] Set bedrooms: ${bedrooms}`);
+  }
+  if (bathrooms && !ctx.data.bathrooms) {
+    ctx.data.bathrooms = bathrooms;
+    console.log(`[DATA] Set bathrooms: ${bathrooms}`);
+  }
   if (serviceType && !ctx.data.serviceType) ctx.data.serviceType = serviceType;
   if (city && city.known && !ctx.data.city) ctx.data.city = city.city;
   
@@ -614,10 +665,26 @@ function routeWithContext(text, ctx) {
     if (q.includes("pet") || q.includes("mascota") || q.includes("animal")) return ctx.t("pets");
   }
   
-  // Booking intent
-  if ((q.includes("book") || q.includes("schedule") || q.includes("reserva") || q.includes("agendar")) && ctx.state === "initial") {
+  // Booking intent - handle variations
+  if (ctx.state === "initial" && (
+      q.includes("book") || q.includes("schedule") || q.includes("make an appointment") ||
+      q.includes("reserva") || q.includes("agendar") || q.includes("marcar") ||
+      q.includes("i would like to book") || q.includes("i want to book")
+    )) {
     ctx.state = "booking_flow";
     if (!ctx.data.serviceType) return ctx.t("askServiceType");
+  }
+  
+  // Handle affirmative responses to "Would you like to book?" 
+  if (ctx.state === "initial" && 
+      (q.includes("yes") || q.includes("yeah") || q.includes("yep") || q.includes("sure") || 
+       q.includes("that would be great") || q.includes("sounds good") ||
+       q.includes("si") || q.includes("sim") || q.includes("claro"))) {
+    // Check if we previously mentioned booking
+    if (ctx.data.city) {
+      ctx.state = "booking_flow";
+      return ctx.t("askServiceType");
+    }
   }
   
   // Pricing
@@ -631,28 +698,37 @@ function routeWithContext(text, ctx) {
   
   // Booking flow
   if (ctx.state === "booking_flow") {
-    if ((q.includes("yes") || q.includes("si") || q.includes("sim") || q.includes("sounds good")) && ctx.hasAllBookingInfo()) {
-      return `${ctx.t("finalConfirm")} ${ctx.data.phone}. ${ctx.t("anythingElse")}`;
+    // Final confirmation after user says yes
+    if ((q.includes("yes") || q.includes("si") || q.includes("sim") || q.includes("sounds good") || q.includes("that's correct")) && ctx.hasAllBookingInfo()) {
+      const msg = lang === "es" ? `¡Perfecto! Enviaremos una confirmación a ${ctx.data.phone}. ¿Hay algo más que te gustaría saber?` :
+                  lang === "pt" ? `Perfeito! Enviaremos uma confirmação para ${ctx.data.phone}. Há mais alguma coisa que você gostaria de saber?` :
+                  `Perfect! We'll send a confirmation to ${ctx.data.phone}. Is there anything else you'd like to know?`;
+      return msg;
     }
+    
+    console.log(`[BOOKING FLOW] Missing: serviceType=${!ctx.data.serviceType}, bedrooms=${!ctx.data.bedrooms}, bathrooms=${!ctx.data.bathrooms}, city=${!ctx.data.city}, date=${!ctx.data.date}, time=${!ctx.data.time}, name=${!ctx.data.name}, phone=${!ctx.data.phone}`);
     
     if (!ctx.data.serviceType) return ctx.t("askServiceType");
     if (!ctx.data.bedrooms) return ctx.t("askBedrooms");
     if (!ctx.data.bathrooms && ctx.data.bedrooms !== "Studio") return ctx.t("askBathrooms");
     if (!ctx.data.city) return ctx.t("askCity");
     
+    // Calculate price silently (for later use) but don't mention it yet
     if (ctx.data.serviceType && ctx.data.bedrooms && !ctx.data.estimatedPrice) {
       ctx.data.estimatedPrice = ctx.calculatePrice();
     }
     
     if (!ctx.data.date || !ctx.data.time) {
-      const priceMsg = ctx.data.estimatedPrice ? ` ${ctx.t("priceQuote")}${ctx.data.estimatedPrice}.` : "";
-      return `${lang === "es" ? "¡Excelente!" : lang === "pt" ? "Excelente!" : "Excellent!"}${priceMsg} ${ctx.t("askDateTime")}`;
+      // DON'T mention price here - just ask for date/time naturally
+      return ctx.t("askDateTime");
     }
     if (!ctx.data.name) return ctx.t("askName");
     if (!ctx.data.phone) return ctx.t("askPhone");
     
+    // Final confirmation WITH price
     if (ctx.hasAllBookingInfo()) {
-      return `${ctx.t("confirmation")} ${ctx.getSummary()}. ${ctx.t("confirmQuestion")}`;
+      const priceMsg = ctx.data.estimatedPrice ? ` ${lang === "es" ? "por alrededor de" : lang === "pt" ? "por cerca de" : "for about"} ${ctx.data.estimatedPrice}` : "";
+      return `${ctx.t("confirmation")} ${ctx.getSummary()}${priceMsg}. ${ctx.t("confirmQuestion")}`;
     }
   }
   
