@@ -1,5 +1,3 @@
-working server.js latest
-
 import express from "express";
 import fetch from "node-fetch";
 import WebSocket, { WebSocketServer } from "ws";
@@ -26,13 +24,13 @@ if (!["pcm16", "mulaw"].includes(MEDIA_FORMAT)) {
 const SAMPLE_RATE = 8000;
 const FRAME_MS = 20;
 const BYTES_PER_SAMPLE_PCM16 = 2;
-const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS; // 160 @ 8kHz, 20ms
-const BYTES_PER_FRAME_PCM16 = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE_PCM16; // 320
-const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1; // 160
+const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS;
+const BYTES_PER_FRAME_PCM16 = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE_PCM16;
+const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1;
 
 // ASR behavior
-const ASR_PARTIAL_PROMOTE_MS = 1200;   // promote latest partial to "final" if ASR goes idle
-const NO_INPUT_REPROMPT_MS = 7000;     // reprompt if caller silent this long
+const ASR_PARTIAL_PROMOTE_MS = 1200;
+const NO_INPUT_REPROMPT_MS = 7000;
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Utilities (beeps + μ-law compand/decompand)
@@ -47,6 +45,7 @@ function makeBeepPcm16(ms = 180, hz = 950) {
   }
   return buf;
 }
+
 function linearToMulawSample(s) {
   const BIAS = 0x84, CLIP = 32635;
   let sign = (s >> 8) & 0x80;
@@ -58,6 +57,7 @@ function linearToMulawSample(s) {
   const mantissa = (s >> (exponent + 3)) & 0x0f;
   return (~(sign | (exponent << 4) | mantissa)) & 0xff;
 }
+
 function mulawToLinearSample(u) {
   u = ~u & 0xff;
   const sign = (u & 0x80) ? -1 : 1;
@@ -67,6 +67,7 @@ function mulawToLinearSample(u) {
   sample -= 0x84;
   return sign * sample;
 }
+
 function makeBeepMulaw(ms = 180, hz = 950) {
   const pcm = makeBeepPcm16(ms, hz);
   const out = Buffer.alloc(pcm.length / 2);
@@ -76,10 +77,8 @@ function makeBeepMulaw(ms = 180, hz = 950) {
   return out;
 }
 
-// Decode incoming Twilio frame → PCM16 (Deepgram needs linear16)
 function inboundToPCM16(buf) {
-  if (MEDIA_FORMAT === "pcm16") return buf; // already LE s16
-  // μ-law → PCM16
+  if (MEDIA_FORMAT === "pcm16") return buf;
   const out = Buffer.alloc(buf.length * 2);
   for (let i = 0, j = 0; i < buf.length; i++, j += 2) {
     out.writeInt16LE(mulawToLinearSample(buf[i]), j);
@@ -130,6 +129,7 @@ async function ttsToPcm16(text) {
   if (out.length % 2 !== 0) out = out.slice(0, out.length - 1);
   return out;
 }
+
 async function ttsToMulaw(text) {
   const input = await ttsElevenLabsRaw(text);
   console.log("[TTS] Received MP3. → μ-law/8k/mono");
@@ -172,7 +172,7 @@ function normalize(s) {
 function routeIntent(text) {
   const q = normalize(text);
   if (q.includes("hour") || q.includes("open") || q.includes("close")) {
-    return "We’re open 8 AM to 6 PM Monday through Friday, and 9 AM to 2 PM on Saturday.";
+    return "We're open 8 AM to 6 PM Monday through Friday, and 9 AM to 2 PM on Saturday.";
   }
   if (q.includes("book") || q.includes("appointment") || q.includes("schedule")) {
     return "Sure—what date and time are you looking for? Please say something like Saturday at 2 PM.";
@@ -214,7 +214,6 @@ function connectDeepgram(onFinal, onAnyTranscript) {
     try {
       const msg = JSON.parse(d.toString());
 
-      // Log VAD-ish events if present
       if (msg.type === "SpeechStarted" || msg.type === "SpeechEnded") {
         console.log(`[DG] ${msg.type}`);
       }
@@ -222,10 +221,8 @@ function connectDeepgram(onFinal, onAnyTranscript) {
       const alt = msg.channel?.alternatives?.[0];
       const transcript = alt?.transcript?.trim() || "";
 
-      // Callback on ANY transcript (for resetting no-input timer)
       if (transcript) onAnyTranscript?.(transcript);
 
-      // Final path
       if (transcript && (msg.is_final || msg.speech_final)) {
         if (partialTimer) { clearTimeout(partialTimer); partialTimer = null; }
         lastPartial = "";
@@ -234,22 +231,17 @@ function connectDeepgram(onFinal, onAnyTranscript) {
         return;
       }
 
-      // Partial path
       if (transcript) {
         lastPartial = transcript;
         console.log(`[ASR~] ${lastPartial}`);
-        // reset promote timer
         if (partialTimer) clearTimeout(partialTimer);
         partialTimer = setTimeout(() => promotePartial("timeout"), ASR_PARTIAL_PROMOTE_MS);
       }
-    } catch {
-      // ignore parse errors
-    }
+    } catch {}
   });
 
   dg.on("close", () => {
     console.log("[DG] close");
-    // If DG closes with a buffered partial, promote it so we don't miss the user's last words
     promotePartial("dg_close");
   });
   dg.on("error", (e) => console.error("[DG] error", e.message));
@@ -288,7 +280,7 @@ wss.on("connection", (ws) => {
 
   const dg = connectDeepgram(
     async (finalText) => {
-      if (ws._speaking) return; // respect turn-taking
+      if (ws._speaking) return;
       const reply = routeIntent(finalText);
       ws._speaking = true;
       try {
@@ -301,7 +293,6 @@ wss.on("connection", (ws) => {
         resetNoInputTimer();
       }
     },
-    // onAnyTranscript: reset the no-input timer even on partials
     () => resetNoInputTimer()
   );
 
@@ -317,12 +308,10 @@ wss.on("connection", (ws) => {
       ws._streamSid = msg.start?.streamSid;
       console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${ws._streamSid}`);
 
-      // Beep (format sanity)
       if (MEDIA_FORMAT === "mulaw") await streamFrames(ws, makeBeepMulaw());
       else await streamFrames(ws, makeBeepPcm16());
       console.log("[BEEP] done.");
 
-      // Greeting
       try {
         console.log(`[TTS] streaming greeting as ${MEDIA_FORMAT}…`);
         const text = "Hi! I'm your AI receptionist at Clean Easy. I can help with booking or answer questions. What would you like to do?";
@@ -333,7 +322,6 @@ wss.on("connection", (ws) => {
         console.error("[TTS] greeting failed:", e.message);
       }
 
-      // start no-input clock after greeting
       resetNoInputTimer();
     }
 
