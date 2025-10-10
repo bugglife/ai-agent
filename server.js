@@ -81,9 +81,30 @@ function normalize(s) {
 
 function findCityInText(text) {
   const q = normalize(text);
+  
+  // Check if question is about service area
+  const isServiceAreaQuery = q.includes("service") || q.includes("cover") || 
+                             q.includes("serve") || q.includes("area") ||
+                             q.includes("servicio") || q.includes("servico") ||
+                             q.includes("atiende") || q.includes("atende");
+  
+  // Look for known cities
   for (const city of SERVICE_AREAS) {
-    if (q.includes(city.toLowerCase())) return { city, known: true };
+    const cityNorm = city.toLowerCase();
+    if (q.includes(cityNorm)) {
+      return { city, known: true, isQuery: isServiceAreaQuery };
+    }
   }
+  
+  // If it's a service area query but city not found, try to extract city name
+  if (isServiceAreaQuery) {
+    const cityPattern = /(?:in|at|to|of|the town of|the city of|en|em|de)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)/i;
+    const match = text.match(cityPattern);
+    if (match) {
+      return { city: match[1], known: false, isQuery: true };
+    }
+  }
+  
   return null;
 }
 
@@ -390,13 +411,49 @@ function routeWithContext(text, ctx) {
     ctx.data.estimatedPrice = ctx.calculatePrice();
   }
   
-  // Small talk
-  if (ctx.state === "initial") {
-    if (q.includes("hi") || q.includes("hello") || q.includes("hola") || q.includes("ola")) {
-      return ctx.t("smallTalk").hi;
+  // PRIORITY 1: Service area queries (check FIRST before small talk)
+  if (city) {
+    if (city.known) {
+      if (!ctx.data.city) ctx.data.city = city.city;
+      // If it's explicitly a service query, confirm coverage
+      if (city.isQuery) {
+        return `${ctx.t("coverCity")} ${city.city} ${ctx.t("andSurrounding")}`;
+      }
+      // Otherwise just note the city for booking flow
+      if (ctx.state !== "booking_flow") {
+        return `${ctx.t("coverCity")} ${city.city}! ${lang === "es" ? "¿Qué tipo de limpieza te interesa?" : lang === "pt" ? "Que tipo de limpeza você gostaria?" : "What type of cleaning are you interested in—standard, deep, move-out, or Airbnb?"}`;
+      }
+    } else if (city.isQuery) {
+      // Unknown city but they're asking about coverage
+      return lang === "es" ? `Estamos expandiendo nuestra cobertura. ¿Cuál es el código postal de ${city.city}?` :
+             lang === "pt" ? `Estamos expandindo nossa cobertura. Qual é o CEP de ${city.city}?` :
+             `We're expanding our coverage. What's the ZIP code for ${city.city}? I can confirm if we serve that area.`;
     }
-    if (q.includes("how are") || q.includes("como estas") || q.includes("como esta")) {
-      return ctx.t("smallTalk").howAreYou;
+  }
+  
+  // PRIORITY 2: KB questions (substantive queries)
+  if (ctx.state === "initial") {
+    if (q.includes("hour") || q.includes("open") || q.includes("horario")) return ctx.t("hours");
+    if (q.includes("service") || q.includes("servicio") || q.includes("servico")) return ctx.t("services");
+    if (q.includes("pay") || q.includes("pago") || q.includes("pagamento")) return ctx.t("payment");
+    if (q.includes("supplies") || q.includes("productos") || q.includes("produtos")) return ctx.t("supplies");
+    if (q.includes("how long") || q.includes("cuanto tiempo") || q.includes("quanto tempo")) return ctx.t("duration");
+    if (q.includes("guarantee") || q.includes("garantia")) return ctx.t("guarantee");
+    if (q.includes("cancel") || q.includes("cancelar")) return ctx.t("cancellation");
+    if (q.includes("pet") || q.includes("mascota") || q.includes("animal")) return ctx.t("pets");
+  }
+  
+  // PRIORITY 3: Small talk (ONLY if no substantive query detected)
+  if (ctx.state === "initial") {
+    // Only respond to small talk if it's JUST small talk (not "hi, do you service...")
+    const words = q.split(" ");
+    if (words.length <= 3) {
+      if (q.includes("hi") || q.includes("hello") || q.includes("hola") || q === "ola") {
+        return ctx.t("smallTalk").hi;
+      }
+      if (q.includes("how are") || q.includes("como estas") || q.includes("como esta")) {
+        return ctx.t("smallTalk").howAreYou;
+      }
     }
     if (q.includes("who are you") || q.includes("quien eres") || q.includes("quem e")) {
       return ctx.t("smallTalk").whoAreYou;
@@ -406,14 +463,6 @@ function routeWithContext(text, ctx) {
     }
     if (q.includes("bye") || q.includes("adios") || q.includes("tchau")) {
       return ctx.t("smallTalk").bye;
-    }
-  }
-  
-  // Service area
-  if (city && !ctx.data.city) {
-    if (city.known) {
-      ctx.data.city = city.city;
-      return `${ctx.t("coverCity")} ${city.city} ${ctx.t("andSurrounding")}`;
     }
   }
   
