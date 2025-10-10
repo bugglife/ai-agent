@@ -31,6 +31,7 @@ const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1;
 
 const ASR_PARTIAL_PROMOTE_MS = 1200;
 const NO_INPUT_REPROMPT_MS = 7000;
+const POST_TTS_GRACE_MS = 2500; // Increased from default - gives caller time to think
 
 // ───────────────────────────────────────────────────────────────────────────────
 // SERVICE AREAS & PRICING
@@ -39,6 +40,31 @@ const SERVICE_AREAS = [
   "Boston","Cambridge","Somerville","Brookline","Newton","Watertown","Arlington",
   "Belmont","Medford","Waltham","Needham","Wellesley","Dedham","Quincy"
 ];
+
+// Common STT errors / phonetic variations
+const CITY_ALIASES = {
+  "brooklyn": "Brookline",
+  "brook line": "Brookline",
+  "brooklin": "Brookline",
+  "cambridge": "Cambridge",
+  "somerville": "Somerville",
+  "sommerville": "Somerville",
+  "newton": "Newton",
+  "new town": "Newton",
+  "watertown": "Watertown",
+  "water town": "Watertown",
+  "arlington": "Arlington",
+  "belmont": "Belmont",
+  "beaumont": "Belmont",
+  "medford": "Medford",
+  "waltham": "Waltham",
+  "needham": "Needham",
+  "wellesley": "Wellesley",
+  "wellsley": "Wellesley",
+  "dedham": "Dedham",
+  "quincy": "Quincy",
+  "quinsy": "Quincy",
+};
 
 // Your actual pricing matrix: bedroom-bathroom combos
 const PRICING_MATRIX = {
@@ -89,29 +115,48 @@ function findCityInText(text) {
                              q.includes("atiende") || q.includes("atende") ||
                              q.includes("do you") || q.includes("can you");
   
-  // Look for known cities - check for word boundaries to avoid partial matches
+  // First, check for exact matches in known cities
   for (const city of SERVICE_AREAS) {
     const cityNorm = city.toLowerCase();
-    // Use word boundary check - look for the city as a complete word
     const regex = new RegExp(`\\b${cityNorm}\\b`, "i");
     if (regex.test(text)) {
+      console.log(`[CITY] Found exact match: ${city}`);
       return { city, known: true, isQuery: isServiceAreaQuery };
+    }
+  }
+  
+  // Check for phonetic aliases (STT often mishears city names)
+  for (const [alias, realCity] of Object.entries(CITY_ALIASES)) {
+    if (q.includes(alias)) {
+      console.log(`[CITY] Found via alias '${alias}' → ${realCity}`);
+      return { city: realCity, known: true, isQuery: isServiceAreaQuery };
     }
   }
   
   // If it's a service area query but city not found, try to extract city name from common patterns
   if (isServiceAreaQuery) {
-    // Try to extract city from common patterns
     const cityPattern = /(?:in|at|to|of|town of|city of|area of|en|em|de)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)/gi;
     let match;
     while ((match = cityPattern.exec(text)) !== null) {
       const extractedCity = match[1];
-      // Double-check if this extracted city is in our known list (case-insensitive)
+      console.log(`[CITY] Extracted from pattern: ${extractedCity}`);
+      
+      // Double-check if this extracted city is in our known list
       const knownCity = SERVICE_AREAS.find(c => c.toLowerCase() === extractedCity.toLowerCase());
       if (knownCity) {
+        console.log(`[CITY] Matched to known city: ${knownCity}`);
         return { city: knownCity, known: true, isQuery: true };
       }
+      
+      // Check aliases too
+      const aliasMatch = CITY_ALIASES[extractedCity.toLowerCase()];
+      if (aliasMatch) {
+        console.log(`[CITY] Matched via alias: ${extractedCity} → ${aliasMatch}`);
+        return { city: aliasMatch, known: true, isQuery: true };
+      }
+      
       // If not in our list, return as unknown
+      console.log(`[CITY] Not in service area: ${extractedCity}`);
       return { city: extractedCity, known: false, isQuery: true };
     }
   }
@@ -730,6 +775,7 @@ wss.on("connection", (ws) => {
   console.log("🔗 WebSocket connected");
   ws._rx = 0;
   ws._speaking = false;
+  ws._graceUntil = 0; // Grace period to prevent barge-in
   ws._ctx = new ConversationContext();
   ws._dgConnection = null;
 
@@ -737,7 +783,9 @@ wss.on("connection", (ws) => {
   const resetNoInputTimer = () => {
     if (noInputTimer) clearTimeout(noInputTimer);
     noInputTimer = setTimeout(async () => {
-      if (ws._speaking) return;
+      // Don't reprompt if in grace period or speaking
+      if (ws._speaking || Date.now() < ws._graceUntil) return;
+      
       ws._speaking = true;
       try {
         const prompt = ws._ctx.t("stillThere");
@@ -747,12 +795,19 @@ wss.on("connection", (ws) => {
         console.error("[TTS] reprompt failed:", e.message);
       } finally {
         ws._speaking = false;
+        ws._graceUntil = Date.now() + POST_TTS_GRACE_MS;
         resetNoInputTimer();
       }
     }, NO_INPUT_REPROMPT_MS);
   };
 
   const handleFinal = async (finalText) => {
+    // Don't process during grace period (agent just finished speaking)
+    if (Date.now() < ws._graceUntil) {
+      console.log("[GRACE] Ignoring input during grace period");
+      return;
+    }
+    
     if (ws._speaking) return;
     
     // If language just detected, reconnect Deepgram
@@ -763,7 +818,9 @@ wss.on("connection", (ws) => {
       ws._dgConnection = connectDeepgram(handleFinal, () => resetNoInputTimer(), ws._ctx.language);
     }
     
+    console.log(`[USER] "${finalText}"`);
     const reply = routeWithContext(finalText, ws._ctx);
+    console.log(`[BOT] "${reply}"`);
     console.log(`[CONTEXT] ${JSON.stringify(ws._ctx.data)}`);
     
     ws._speaking = true;
@@ -774,6 +831,8 @@ wss.on("connection", (ws) => {
       console.error("[TTS] reply failed:", e.message);
     } finally {
       ws._speaking = false;
+      ws._graceUntil = Date.now() + POST_TTS_GRACE_MS; // Set grace period after speaking
+      console.log(`[GRACE] Set until ${new Date(ws._graceUntil).toISOString()}`);
       resetNoInputTimer();
     }
   };
@@ -799,6 +858,8 @@ wss.on("connection", (ws) => {
         const text = "Hi! I'm your AI receptionist at Clean Easy. I can help with booking or answer questions. What would you like to do?";
         const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text) : await ttsToPcm16(text);
         await streamFrames(ws, buf);
+        ws._graceUntil = Date.now() + POST_TTS_GRACE_MS; // Grace period after greeting
+        console.log(`[GRACE] Set after greeting until ${new Date(ws._graceUntil).toISOString()}`);
       } catch (e) {
         console.error("[TTS] greeting failed:", e.message);
       }
@@ -808,7 +869,9 @@ wss.on("connection", (ws) => {
 
     if (msg.event === "media") {
       ws._rx++;
-      if (ws._dgConnection && ws._dgConnection.readyState === ws._dgConnection.OPEN && !ws._speaking) {
+      // Only send to Deepgram if not speaking and not in grace period
+      if (ws._dgConnection && ws._dgConnection.readyState === ws._dgConnection.OPEN && 
+          !ws._speaking && Date.now() >= ws._graceUntil) {
         const b = Buffer.from(msg.media.payload, "base64");
         const pcm16 = inboundToPCM16(b);
         ws._dgConnection.send(pcm16);
