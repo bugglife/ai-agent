@@ -86,22 +86,33 @@ function findCityInText(text) {
   const isServiceAreaQuery = q.includes("service") || q.includes("cover") || 
                              q.includes("serve") || q.includes("area") ||
                              q.includes("servicio") || q.includes("servico") ||
-                             q.includes("atiende") || q.includes("atende");
+                             q.includes("atiende") || q.includes("atende") ||
+                             q.includes("do you") || q.includes("can you");
   
-  // Look for known cities
+  // Look for known cities - check for word boundaries to avoid partial matches
   for (const city of SERVICE_AREAS) {
     const cityNorm = city.toLowerCase();
-    if (q.includes(cityNorm)) {
+    // Use word boundary check - look for the city as a complete word
+    const regex = new RegExp(`\\b${cityNorm}\\b`, "i");
+    if (regex.test(text)) {
       return { city, known: true, isQuery: isServiceAreaQuery };
     }
   }
   
-  // If it's a service area query but city not found, try to extract city name
+  // If it's a service area query but city not found, try to extract city name from common patterns
   if (isServiceAreaQuery) {
-    const cityPattern = /(?:in|at|to|of|the town of|the city of|en|em|de)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)/i;
-    const match = text.match(cityPattern);
-    if (match) {
-      return { city: match[1], known: false, isQuery: true };
+    // Try to extract city from common patterns
+    const cityPattern = /(?:in|at|to|of|town of|city of|area of|en|em|de)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)/gi;
+    let match;
+    while ((match = cityPattern.exec(text)) !== null) {
+      const extractedCity = match[1];
+      // Double-check if this extracted city is in our known list (case-insensitive)
+      const knownCity = SERVICE_AREAS.find(c => c.toLowerCase() === extractedCity.toLowerCase());
+      if (knownCity) {
+        return { city: knownCity, known: true, isQuery: true };
+      }
+      // If not in our list, return as unknown
+      return { city: extractedCity, known: false, isQuery: true };
     }
   }
   
