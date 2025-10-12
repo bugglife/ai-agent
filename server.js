@@ -597,6 +597,7 @@ class ConversationContext {
   constructor() {
     this.state = "initial"; // initial, booking_flow, info_gathering
     this.language = null;
+    this.greeted = false; // Track if user has been greeted
     this.lastExtraction = null; // Track what was extracted in last turn
     this.partialPhone = ""; // Accumulate phone digits across turns
     this.data = {
@@ -823,25 +824,31 @@ function routeWithContext(text, ctx) {
     if (q.includes("pet") || q.includes("mascota") || q.includes("animal")) return ctx.t("pets");
   }
   
-  // PRIORITY 3: Small talk (ONLY if no substantive query detected AND short message)
+  // PRIORITY 3: Small talk (ONLY if no substantive query detected AND not already greeted OR short message)
   if (ctx.state === "initial") {
     // Check if this is ONLY small talk (short message with no other content)
     const words = q.split(" ").filter(w => w.length > 0);
     const substantiveWords = ["service", "serve", "cover", "book", "price", "cost", "clean", "hour", 
                              "servicio", "servico", "precio", "preco", "limpieza", "limpeza",
-                             "brooklyn", "brookline", "brook", "cambridge", "boston"];
+                             "brooklyn", "brookline", "brook", "brooks", "cambridge", "boston", "newton",
+                             "watertown", "somerville", "medford", "waltham", "quincy", "dedham",
+                             "wellesley", "needham", "belmont", "arlington"];
     const hasSubstantiveContent = words.some(w => substantiveWords.includes(w));
     
-    console.log(`[SMALL TALK CHECK] Words: ${words.length}, HasSubstantive: ${hasSubstantiveContent}, Words: [${words.join(", ")}]`);
+    console.log(`[SMALL TALK CHECK] Words: ${words.length}, HasSubstantive: ${hasSubstantiveContent}, Greeted: ${ctx.greeted}, Words: [${words.join(", ")}]`);
     
-    // Only respond to small talk if message is short AND has no substantive content
-    if (!hasSubstantiveContent && words.length <= 3) {
+    // Only respond to small talk if:
+    // 1. NOT already greeted, OR
+    // 2. Message is short AND has no substantive content
+    if (!ctx.greeted || (!hasSubstantiveContent && words.length <= 3)) {
       if (q.includes("hi") || q.includes("hello") || q.includes("hola") || q === "ola") {
         console.log(`[SMALL TALK] Triggered greeting`);
+        ctx.greeted = true;
         return ctx.t("smallTalk").hi;
       }
       if (q.includes("how are") || q.includes("como estas") || q.includes("como esta")) {
         console.log(`[SMALL TALK] Triggered how are you`);
+        ctx.greeted = true;
         return ctx.t("smallTalk").howAreYou;
       }
     }
@@ -859,18 +866,6 @@ function routeWithContext(text, ctx) {
       console.log(`[SMALL TALK] Triggered bye`);
       return ctx.t("smallTalk").bye;
     }
-  }
-  
-  // KB questions
-  if (ctx.state === "initial") {
-    if (q.includes("hour") || q.includes("open") || q.includes("horario")) return ctx.t("hours");
-    if (q.includes("service") || q.includes("servicio") || q.includes("servico")) return ctx.t("services");
-    if (q.includes("pay") || q.includes("pago") || q.includes("pagamento")) return ctx.t("payment");
-    if (q.includes("supplies") || q.includes("productos") || q.includes("produtos")) return ctx.t("supplies");
-    if (q.includes("how long") || q.includes("cuanto tiempo") || q.includes("quanto tempo")) return ctx.t("duration");
-    if (q.includes("guarantee") || q.includes("garantia")) return ctx.t("guarantee");
-    if (q.includes("cancel") || q.includes("cancelar")) return ctx.t("cancellation");
-    if (q.includes("pet") || q.includes("mascota") || q.includes("animal")) return ctx.t("pets");
   }
   
   // Booking intent - handle variations
@@ -1239,6 +1234,7 @@ wss.on("connection", (ws) => {
         const text = "Hi! I'm your AI receptionist at Clean Easy. How can I help you?";
         const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text) : await ttsToPcm16(text);
         await streamFrames(ws, buf);
+        ws._ctx.greeted = true; // Mark initial greeting as done
         ws._graceUntil = Date.now() + POST_TTS_GRACE_MS; // Grace period after greeting
         console.log(`[GRACE] Set after greeting until ${new Date(ws._graceUntil).toISOString()}`);
       } catch (e) {
