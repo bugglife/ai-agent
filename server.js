@@ -31,7 +31,7 @@ const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1;
 
 const ASR_PARTIAL_PROMOTE_MS = 1200;
 const NO_INPUT_REPROMPT_MS = 7000;
-const POST_TTS_GRACE_MS = 1200; // Shorter grace - just enough to prevent echo, not responses
+const POST_TTS_GRACE_MS = 800; // Reduced - just enough to prevent echo
 
 // ───────────────────────────────────────────────────────────────────────────────
 // SERVICE AREAS & PRICING
@@ -208,7 +208,7 @@ function detectLanguage(text) {
 
 const TRANSLATIONS = {
   en: {
-    greeting: "Hi! I'm your AI receptionist at Clean Easy. I can help with booking or answer questions. What would you like to do?",
+    greeting: "Hi! I'm your AI receptionist at Clean Easy. How can I help you?",
     serviceTypes: { standard: "standard", deep: "deep", moveout: "move-out", airbnb: "Airbnb turnover" },
     askServiceType: "What type of cleaning would you like—standard, deep, move-out, or Airbnb turnover?",
     askBedrooms: "How many bedrooms?",
@@ -242,7 +242,7 @@ const TRANSLATIONS = {
     }
   },
   es: {
-    greeting: "¡Hola! Soy tu recepcionista de IA de Clean Easy. Puedo ayudarte con reservas o responder preguntas. ¿Qué te gustaría hacer?",
+    greeting: "¡Hola! Soy tu recepcionista de IA de Clean Easy. ¿Cómo puedo ayudarte?",
     serviceTypes: { standard: "estándar", deep: "profunda", moveout: "mudanza", airbnb: "turno de Airbnb" },
     askServiceType: "¿Qué tipo de limpieza te gustaría—estándar, profunda, mudanza, o turno de Airbnb?",
     askBedrooms: "¿Cuántas habitaciones?",
@@ -276,7 +276,7 @@ const TRANSLATIONS = {
     }
   },
   pt: {
-    greeting: "Olá! Sou sua recepcionista de IA da Clean Easy. Posso ajudar com reservas ou responder perguntas. O que você gostaria de fazer?",
+    greeting: "Olá! Sou sua recepcionista de IA da Clean Easy. Como posso ajudar?",
     serviceTypes: { standard: "padrão", deep: "profunda", moveout: "mudança", airbnb: "turno Airbnb" },
     askServiceType: "Que tipo de limpeza você gostaria—padrão, profunda, mudança, ou turno Airbnb?",
     askBedrooms: "Quantos quartos?",
@@ -327,8 +327,51 @@ function extractName(text) {
 }
 
 function extractPhone(text) {
-  const m = text.match(/(\d{3}[\s.-]?\d{3}[\s.-]?\d{4}|\d{10})/);
-  return m ? m[1].replace(/[^\d]/g, "") : null;
+  const q = normalize(text);
+  
+  // Pattern 1: Standard formats (617-555-1234, 617.555.1234, 6175551234)
+  const standardMatch = text.match(/(\d{3}[\s.-]?\d{3}[\s.-]?\d{4}|\d{10})/);
+  if (standardMatch) {
+    const cleaned = standardMatch[1].replace(/[^\d]/g, "");
+    console.log(`[EXTRACT] Phone (standard): ${cleaned}`);
+    return cleaned;
+  }
+  
+  // Pattern 2: Spoken digits "six one seven five five five one two three four"
+  const digitWords = {
+    "zero": "0", "oh": "0", "o": "0",
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9"
+  };
+  
+  // Extract all digit words from the text
+  const words = q.split(/\s+/);
+  const digits = [];
+  for (const word of words) {
+    if (digitWords[word]) {
+      digits.push(digitWords[word]);
+    } else if (/^\d+$/.test(word)) {
+      // Handle numbers like "200" as individual digits
+      digits.push(...word.split(''));
+    }
+  }
+  
+  // If we found 10+ digits, construct phone number
+  if (digits.length >= 10) {
+    const phoneNum = digits.slice(0, 10).join('');
+    console.log(`[EXTRACT] Phone (spoken): ${phoneNum} from ${digits.join('')}`);
+    return phoneNum;
+  }
+  
+  // Pattern 3: Partial phone in context "call me at 617..."
+  const contextMatch = text.match(/(?:call|text|reach|phone|number)(?:\s+me)?(?:\s+at)?\s+(\d{3,})/i);
+  if (contextMatch && contextMatch[1].length >= 10) {
+    const cleaned = contextMatch[1].replace(/[^\d]/g, '').slice(0, 10);
+    console.log(`[EXTRACT] Phone (context): ${cleaned}`);
+    return cleaned;
+  }
+  
+  return null;
 }
 
 function extractDateTime(text) {
@@ -527,8 +570,9 @@ function extractServiceType(text, lang) {
 // ───────────────────────────────────────────────────────────────────────────────
 class ConversationContext {
   constructor() {
-    this.state = "initial";
+    this.state = "initial"; // initial, booking_flow, info_gathering
     this.language = null;
+    this.lastExtraction = null; // Track what was extracted in last turn
     this.data = {
       serviceType: null,
       bedrooms: null,
@@ -625,26 +669,42 @@ function routeWithContext(text, ctx) {
     bathrooms = extractBathrooms(text);
   }
   
-  if (name && !ctx.data.name) ctx.data.name = name;
-  if (phone && !ctx.data.phone) ctx.data.phone = phone;
+  if (name && !ctx.data.name) {
+    ctx.data.name = name;
+    ctx.lastExtraction = "name";
+  }
+  if (phone && !ctx.data.phone) {
+    ctx.data.phone = phone;
+    ctx.lastExtraction = "phone";
+  }
   if (dateTime.day && !ctx.data.date) {
     ctx.data.date = dateTime.day;
+    ctx.lastExtraction = "date";
     console.log(`[DATA] Set date: ${dateTime.day}`);
   }
   if (dateTime.time && !ctx.data.time) {
     ctx.data.time = dateTime.time;
+    ctx.lastExtraction = "time";
     console.log(`[DATA] Set time: ${dateTime.time}`);
   }
   if (bedrooms && !ctx.data.bedrooms) {
     ctx.data.bedrooms = bedrooms;
+    ctx.lastExtraction = "bedrooms";
     console.log(`[DATA] Set bedrooms: ${bedrooms}`);
   }
   if (bathrooms && !ctx.data.bathrooms) {
     ctx.data.bathrooms = bathrooms;
+    ctx.lastExtraction = "bathrooms";
     console.log(`[DATA] Set bathrooms: ${bathrooms}`);
   }
-  if (serviceType && !ctx.data.serviceType) ctx.data.serviceType = serviceType;
-  if (city && city.known && !ctx.data.city) ctx.data.city = city.city;
+  if (serviceType && !ctx.data.serviceType) {
+    ctx.data.serviceType = serviceType;
+    ctx.lastExtraction = "serviceType";
+  }
+  if (city && city.known && !ctx.data.city) {
+    ctx.data.city = city.city;
+    ctx.lastExtraction = "city";
+  }
   
   if (ctx.data.serviceType && ctx.data.bedrooms && !ctx.data.estimatedPrice) {
     ctx.data.estimatedPrice = ctx.calculatePrice();
@@ -860,7 +920,7 @@ function routeWithContext(text, ctx) {
 // ───────────────────────────────────────────────────────────────────────────────
 // Audio & TTS
 // ───────────────────────────────────────────────────────────────────────────────
-function makeBeepPcm16(ms = 180, hz = 950) {
+function makeBeepPcm16(ms = 100, hz = 950) {  // Reduced from 180ms to 100ms
   const samples = Math.floor((SAMPLE_RATE * ms) / 1000);
   const buf = Buffer.alloc(samples * BYTES_PER_SAMPLE_PCM16);
   for (let i = 0; i < samples; i++) {
@@ -893,7 +953,7 @@ function mulawToLinearSample(u) {
   return sign * sample;
 }
 
-function makeBeepMulaw(ms = 180, hz = 950) {
+function makeBeepMulaw(ms = 100, hz = 950) {  // Reduced from 180ms to 100ms
   const pcm = makeBeepPcm16(ms, hz);
   const out = Buffer.alloc(pcm.length / 2);
   for (let i = 0, j = 0; i < pcm.length; i += 2, j++) {
@@ -1131,7 +1191,7 @@ wss.on("connection", (ws) => {
       else await streamFrames(ws, makeBeepPcm16());
 
       try {
-        const text = "Hi! I'm your AI receptionist at Clean Easy. I can help with booking or answer questions. What would you like to do?";
+        const text = "Hi! I'm your AI receptionist at Clean Easy. How can I help you?";
         const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text) : await ttsToPcm16(text);
         await streamFrames(ws, buf);
         ws._graceUntil = Date.now() + POST_TTS_GRACE_MS; // Grace period after greeting
