@@ -46,6 +46,9 @@ const CITY_ALIASES = {
   "brooklyn": "Brookline",
   "brook line": "Brookline",
   "brooklin": "Brookline",
+  "brook": "Brookline",  // Deepgram often cuts off "Brookline" to just "Brook"
+  "brooks": "Brookline",
+  "brooke": "Brookline",
   "cambridge": "Cambridge",
   "somerville": "Somerville",
   "sommerville": "Somerville",
@@ -110,10 +113,12 @@ function findCityInText(text) {
   
   // Check if question is about service area
   const isServiceAreaQuery = q.includes("service") || q.includes("cover") || 
-                             q.includes("serve") || q.includes("area") ||
+                             q.includes("serve") || q.includes("area") || q.includes("clean") ||
                              q.includes("servicio") || q.includes("servico") ||
                              q.includes("atiende") || q.includes("atende") ||
                              q.includes("do you") || q.includes("can you");
+  
+  console.log(`[CITY DETECTION] Query: "${text}" | isServiceAreaQuery: ${isServiceAreaQuery}`);
   
   // First, check for exact matches in known cities
   for (const city of SERVICE_AREAS) {
@@ -127,7 +132,8 @@ function findCityInText(text) {
   
   // Check for phonetic aliases (STT often mishears city names)
   for (const [alias, realCity] of Object.entries(CITY_ALIASES)) {
-    if (q.includes(alias)) {
+    const regex = new RegExp(`\\b${alias}\\b`, "i");
+    if (regex.test(q)) {
       console.log(`[CITY] Found via alias '${alias}' → ${realCity}`);
       return { city: realCity, known: true, isQuery: isServiceAreaQuery };
     }
@@ -135,32 +141,51 @@ function findCityInText(text) {
   
   // If it's a service area query but city not found, try to extract city name from common patterns
   if (isServiceAreaQuery) {
-    const cityPattern = /(?:in|at|to|of|town of|city of|area of|en|em|de)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)/gi;
-    let match;
-    while ((match = cityPattern.exec(text)) !== null) {
-      const extractedCity = match[1];
-      console.log(`[CITY] Extracted from pattern: ${extractedCity}`);
-      
-      // Double-check if this extracted city is in our known list
-      const knownCity = SERVICE_AREAS.find(c => c.toLowerCase() === extractedCity.toLowerCase());
-      if (knownCity) {
-        console.log(`[CITY] Matched to known city: ${knownCity}`);
-        return { city: knownCity, known: true, isQuery: true };
+    // More robust pattern that skips articles
+    // "in Brookline", "in the town of Brookline", "to Brookline", etc.
+    const cityPatterns = [
+      /(?:in|at|to|of)\s+(?:the\s+)?(?:town\s+of\s+|city\s+of\s+|area\s+of\s+)?([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)/gi,
+      /(?:town|city|area)\s+of\s+(?:the\s+)?([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)/gi,
+    ];
+    
+    for (const pattern of cityPatterns) {
+      let match;
+      while ((match = pattern.exec(text)) !== null) {
+        const extractedCity = match[1];
+        
+        // Skip common words that aren't cities
+        const skipWords = ["the", "town", "city", "area", "this", "that"];
+        if (skipWords.includes(extractedCity.toLowerCase())) {
+          console.log(`[CITY] Skipped non-city word: ${extractedCity}`);
+          continue;
+        }
+        
+        console.log(`[CITY] Extracted from pattern: ${extractedCity}`);
+        
+        // Double-check if this extracted city is in our known list
+        const knownCity = SERVICE_AREAS.find(c => c.toLowerCase() === extractedCity.toLowerCase());
+        if (knownCity) {
+          console.log(`[CITY] Matched to known city: ${knownCity}`);
+          return { city: knownCity, known: true, isQuery: true };
+        }
+        
+        // Check aliases too
+        const aliasMatch = CITY_ALIASES[extractedCity.toLowerCase()];
+        if (aliasMatch) {
+          console.log(`[CITY] Matched via alias: ${extractedCity} → ${aliasMatch}`);
+          return { city: aliasMatch, known: true, isQuery: true };
+        }
+        
+        // If not in our list, return as unknown (only if 3+ chars to avoid garbage)
+        if (extractedCity.length >= 3) {
+          console.log(`[CITY] Not in service area: ${extractedCity}`);
+          return { city: extractedCity, known: false, isQuery: true };
+        }
       }
-      
-      // Check aliases too
-      const aliasMatch = CITY_ALIASES[extractedCity.toLowerCase()];
-      if (aliasMatch) {
-        console.log(`[CITY] Matched via alias: ${extractedCity} → ${aliasMatch}`);
-        return { city: aliasMatch, known: true, isQuery: true };
-      }
-      
-      // If not in our list, return as unknown
-      console.log(`[CITY] Not in service area: ${extractedCity}`);
-      return { city: extractedCity, known: false, isQuery: true };
     }
   }
   
+  console.log(`[CITY] No city found in query`);
   return null;
 }
 
@@ -566,6 +591,7 @@ class ConversationContext {
 // ───────────────────────────────────────────────────────────────────────────────
 function routeWithContext(text, ctx) {
   const q = normalize(text);
+  console.log(`[ROUTE] Input: "${text}" → Normalized: "${q}"`);
   
   // Detect language on first turn
   if (!ctx.language) {
@@ -630,14 +656,17 @@ function routeWithContext(text, ctx) {
       if (!ctx.data.city) ctx.data.city = city.city;
       // If it's explicitly a service query, confirm coverage
       if (city.isQuery) {
+        console.log(`[ROUTING] Confirming service area: ${city.city}`);
         return `${ctx.t("coverCity")} ${city.city} ${ctx.t("andSurrounding")}`;
       }
       // Otherwise just note the city for booking flow
       if (ctx.state !== "booking_flow") {
+        console.log(`[ROUTING] City mentioned, asking about service type`);
         return `${ctx.t("coverCity")} ${city.city}! ${lang === "es" ? "¿Qué tipo de limpieza te interesa?" : lang === "pt" ? "Que tipo de limpeza você gostaria?" : "What type of cleaning are you interested in—standard, deep, move-out, or Airbnb?"}`;
       }
     } else if (city.isQuery) {
       // Unknown city but they're asking about coverage
+      console.log(`[ROUTING] Unknown city, asking for ZIP: ${city.city}`);
       return lang === "es" ? `Estamos expandiendo nuestra cobertura. ¿Cuál es el código postal de ${city.city}?` :
              lang === "pt" ? `Estamos expandindo nossa cobertura. Qual é o CEP de ${city.city}?` :
              `We're expanding our coverage. What's the ZIP code for ${city.city}? I can confirm if we serve that area.`;
@@ -645,20 +674,36 @@ function routeWithContext(text, ctx) {
   }
   
   // Handle "I don't know the ZIP" when previously asked
-  if ((q.includes("don't know") || q.includes("no se") || q.includes("nao sei")) && 
-      (q.includes("zip") || q.includes("codigo") || q.includes("cep"))) {
+  if ((q.includes("don't know") || q.includes("no se") || q.includes("nao sei") || q.includes("i don't know")) && 
+      (q.includes("zip") || q.includes("codigo") || q.includes("cep") || q.includes("code"))) {
+    console.log(`[ROUTING] User doesn't know ZIP, checking for city mentions`);
+    
+    // Check the current query for any city mentions (even partial like "brook")
+    for (const [alias, realCity] of Object.entries(CITY_ALIASES)) {
+      if (q.includes(alias)) {
+        if (!ctx.data.city) ctx.data.city = realCity;
+        console.log(`[ROUTING] Found city via alias in "don't know ZIP" response: ${alias} → ${realCity}`);
+        return `${lang === "es" ? "No hay problema" : lang === "pt" ? "Sem problema" : "No problem"}! ${ctx.t("coverCity")} ${realCity}. ${lang === "es" ? "¿Te gustaría reservar?" : lang === "pt" ? "Gostaria de reservar?" : "Would you like to book?"}`;
+      }
+    }
+    
     // Check if they mentioned a city we actually serve
     for (const serviceCity of SERVICE_AREAS) {
       const cityNorm = serviceCity.toLowerCase();
       if (q.includes(cityNorm) || ctx.data.city === serviceCity) {
         if (!ctx.data.city) ctx.data.city = serviceCity;
+        console.log(`[ROUTING] Found known city in "don't know ZIP" response: ${serviceCity}`);
         return `${lang === "es" ? "No hay problema" : lang === "pt" ? "Sem problema" : "No problem"}! ${ctx.t("coverCity")} ${serviceCity}. ${lang === "es" ? "¿Te gustaría reservar?" : lang === "pt" ? "Gostaria de reservar?" : "Would you like to book?"}`;
       }
     }
-    // Check history for city mentions
+    
+    // Check history/context for city mentions
     if (ctx.data.city && SERVICE_AREAS.includes(ctx.data.city)) {
+      console.log(`[ROUTING] Using city from context: ${ctx.data.city}`);
       return `${lang === "es" ? "No hay problema" : lang === "pt" ? "Sem problema" : "No problem"}! ${ctx.t("coverCity")} ${ctx.data.city}. ${lang === "es" ? "¿Te gustaría reservar?" : lang === "pt" ? "Gostaria de reservar?" : "Would you like to book?"}`;
     }
+    
+    console.log(`[ROUTING] No city found in context for ZIP response`);
   }
   
   // PRIORITY 2: KB questions (substantive queries)
@@ -677,29 +722,36 @@ function routeWithContext(text, ctx) {
   if (ctx.state === "initial") {
     // Check if this is ONLY small talk (short message with no other content)
     const words = q.split(" ").filter(w => w.length > 0);
-    const hasSubstantiveContent = words.some(w => 
-      ["service", "serve", "cover", "book", "price", "cost", "clean", "hour", 
-       "servicio", "servico", "precio", "preco", "limpieza", "limpeza"].includes(w)
-    );
+    const substantiveWords = ["service", "serve", "cover", "book", "price", "cost", "clean", "hour", 
+                             "servicio", "servico", "precio", "preco", "limpieza", "limpeza",
+                             "brooklyn", "brookline", "brook", "cambridge", "boston"];
+    const hasSubstantiveContent = words.some(w => substantiveWords.includes(w));
+    
+    console.log(`[SMALL TALK CHECK] Words: ${words.length}, HasSubstantive: ${hasSubstantiveContent}, Words: [${words.join(", ")}]`);
     
     // Only respond to small talk if message is short AND has no substantive content
     if (!hasSubstantiveContent && words.length <= 3) {
       if (q.includes("hi") || q.includes("hello") || q.includes("hola") || q === "ola") {
+        console.log(`[SMALL TALK] Triggered greeting`);
         return ctx.t("smallTalk").hi;
       }
       if (q.includes("how are") || q.includes("como estas") || q.includes("como esta")) {
+        console.log(`[SMALL TALK] Triggered how are you`);
         return ctx.t("smallTalk").howAreYou;
       }
     }
     
     // These can be longer, so check separately
     if (q.includes("who are you") || q.includes("quien eres") || q.includes("quem e")) {
+      console.log(`[SMALL TALK] Triggered who are you`);
       return ctx.t("smallTalk").whoAreYou;
     }
     if (q.includes("thank") || q.includes("gracias") || q.includes("obrigad")) {
+      console.log(`[SMALL TALK] Triggered thanks`);
       return ctx.t("smallTalk").thanks;
     }
     if (q.includes("bye") || q.includes("adios") || q.includes("tchau")) {
+      console.log(`[SMALL TALK] Triggered bye`);
       return ctx.t("smallTalk").bye;
     }
   }
@@ -783,9 +835,26 @@ function routeWithContext(text, ctx) {
     }
   }
   
-  return lang === "es" ? "Puedo ayudar con reservas o preguntas sobre nuestros servicios. ¿Qué te gustaría saber?" :
-         lang === "pt" ? "Posso ajudar com reservas ou perguntas sobre nossos serviços. O que você gostaria de saber?" :
-         "I can help with booking or questions about our services. What would you like to know?";
+  // Fallback: if they keep asking about service/coverage but we haven't detected a city
+  if ((q.includes("service") || q.includes("cover") || q.includes("serve") || q.includes("what about")) && 
+      !city && ctx.state === "initial") {
+    console.log(`[ROUTING] Service query without detected city, asking for clarification`);
+    return lang === "es" ? "¿En qué ciudad te encuentras?" :
+           lang === "pt" ? "Em que cidade você está?" :
+           "What city are you in? We serve the Greater Boston area including Brookline, Cambridge, Somerville, and more.";
+  }
+  
+  // Generic fallback
+  if (ctx.state === "initial") {
+    console.log(`[ROUTING] Generic fallback`);
+    return lang === "es" ? "Puedo ayudar con reservas o preguntas sobre nuestros servicios. ¿Qué te gustaría saber?" :
+           lang === "pt" ? "Posso ajudar com reservas ou perguntas sobre nossos serviços. O que você gostaria de saber?" :
+           "I can help with booking or questions about our services. What would you like to know?";
+  }
+  
+  return lang === "es" ? "¿En qué más puedo ayudarte?" :
+         lang === "pt" ? "Em que mais posso ajudá-lo?" :
+         "What else can I help you with?";
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
