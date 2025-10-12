@@ -215,6 +215,8 @@ const TRANSLATIONS = {
     askBathrooms: "And how many bathrooms?",
     askCity: "What city are you in?",
     askDateTime: "What date and time work best for you? You can say something like Saturday at 2 PM.",
+    askDate: "What day works for you?",
+    askTime: "What time works for you?",
     askName: "Great! Can I get your name for the booking?",
     askPhone: "And what's the best phone number to reach you?",
     priceQuote: "That would be around $",
@@ -249,6 +251,8 @@ const TRANSLATIONS = {
     askBathrooms: "¿Y cuántos baños?",
     askCity: "¿En qué ciudad estás?",
     askDateTime: "¿Qué fecha y hora te funcionan mejor? Puedes decir algo como sábado a las 2 PM.",
+    askDate: "¿Qué día te funciona mejor?",
+    askTime: "¿A qué hora?",
     askName: "¡Genial! ¿Puedo tener tu nombre para la reserva?",
     askPhone: "¿Y cuál es el mejor número de teléfono para contactarte?",
     priceQuote: "Eso costaría alrededor de $",
@@ -283,6 +287,8 @@ const TRANSLATIONS = {
     askBathrooms: "E quantos banheiros?",
     askCity: "Em que cidade você está?",
     askDateTime: "Que data e hora funcionam melhor para você? Pode dizer algo como sábado às 2 da tarde.",
+    askDate: "Que dia funciona melhor para você?",
+    askTime: "A que horas?",
     askName: "Ótimo! Posso ter seu nome para a reserva?",
     askPhone: "E qual é o melhor número de telefone para contato?",
     priceQuote: "Isso custaria cerca de $",
@@ -336,6 +342,13 @@ function extractName(text) {
     return null;
   }
   
+  // Don't extract common objects as names
+  const commonObjects = ["faucet", "sink", "toilet", "shower", "bath", "door", "window", "floor", "wall"];
+  if (commonObjects.includes(normalized)) {
+    console.log(`[EXTRACT] Rejected common object as name: ${text}`);
+    return null;
+  }
+  
   const patterns = [
     /(?:my name is|i'm|i am|this is|call me|me llamo|mi nombre es|meu nome é)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)/i,
     /^([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)$/,  // At least 3 chars to avoid "Two"
@@ -344,8 +357,8 @@ function extractName(text) {
     const m = text.match(p);
     if (m) {
       const name = m[1];
-      // Double check it's not a service word
-      if (!serviceWords.includes(name.toLowerCase())) {
+      // Double check it's not a service word or common object
+      if (!serviceWords.includes(name.toLowerCase()) && !commonObjects.includes(name.toLowerCase())) {
         console.log(`[EXTRACT] Name: ${name}`);
         return name;
       }
@@ -671,7 +684,7 @@ class ConversationContext {
     if (this.data.bathrooms) parts.push(`${this.data.bathrooms} ${this.language === "es" ? "baños" : this.language === "pt" ? "banheiros" : "bathroom"}`);
     if (this.data.city) parts.push(`${this.language === "es" ? "en" : this.language === "pt" ? "em" : "in"} ${this.data.city}`);
     if (this.data.date && this.data.time) parts.push(`${this.language === "es" ? "el" : this.language === "pt" ? "em" : "on"} ${this.data.date} ${this.language === "es" || this.language === "pt" ? "a las" : "at"} ${this.data.time}`);
-    if (includePrice && this.data.estimatedPrice) parts.push(`${this.language === "es" ? "por" : this.language === "pt" ? "por" : "for"} ${this.data.estimatedPrice}`);
+    if (includePrice && this.data.estimatedPrice) parts.push(`${this.language === "es" ? "por" : this.language === "pt" ? "por" : "for"} $${this.data.estimatedPrice}`);
     return parts.join(", ");
   }
 }
@@ -866,7 +879,8 @@ function routeWithContext(text, ctx) {
                              "servicio", "servico", "precio", "preco", "limpieza", "limpeza",
                              "brooklyn", "brookline", "brook", "brooks", "cambridge", "boston", "newton",
                              "watertown", "somerville", "medford", "waltham", "quincy", "dedham",
-                             "wellesley", "needham", "belmont", "arlington", "repeat", "telephone", "number"];
+                             "wellesley", "needham", "belmont", "arlington", "repeat", "telephone", "number",
+                             "availability", "available", "appointment"];
     const hasSubstantiveContent = words.some(w => substantiveWords.includes(w));
     
     console.log(`[SMALL TALK CHECK] Words: ${words.length}, HasSubstantive: ${hasSubstantiveContent}, Greeted: ${ctx.greeted}, Words: [${words.join(", ")}]`);
@@ -905,12 +919,17 @@ function routeWithContext(text, ctx) {
     }
   }
   
-  // Booking intent - handle variations
+  // Booking intent - handle variations including "availability"
   if (ctx.state === "initial" && (
-      q.includes("book") || q.includes("schedule") || q.includes("make an appointment") ||
+      q.includes("book") || q.includes("booking") || q.includes("schedule") || 
+      q.includes("make an appointment") || q.includes("appointment") ||
+      q.includes("availability") || q.includes("available") || q.includes("see if you have") ||
       q.includes("reserva") || q.includes("agendar") || q.includes("marcar") ||
-      q.includes("i would like to book") || q.includes("i want to book")
+      q.includes("disponibilidad") || q.includes("disponibilidade") ||
+      q.includes("i would like to book") || q.includes("i want to book") ||
+      q.includes("i want to see")
     )) {
+    console.log(`[ROUTING] Detected booking intent`);
     ctx.state = "booking_flow";
     if (!ctx.data.serviceType) return ctx.t("askServiceType");
   }
@@ -958,10 +977,27 @@ function routeWithContext(text, ctx) {
       ctx.data.estimatedPrice = ctx.calculatePrice();
     }
     
+    // Handle date/time collection more gracefully
     if (!ctx.data.date || !ctx.data.time) {
-      // DON'T mention price here - just ask for date/time naturally
-      return ctx.t("askDateTime");
+      if (ctx.data.date && !ctx.data.time) {
+        // We have date but need time
+        console.log(`[BOOKING FLOW] Have date, asking for time only`);
+        return lang === "es" ? `Perfecto, ${ctx.data.date}. ¿A qué hora?` :
+               lang === "pt" ? `Perfeito, ${ctx.data.date}. A que horas?` :
+               `Great, ${ctx.data.date}. What time works for you?`;
+      } else if (ctx.data.time && !ctx.data.date) {
+        // We have time but need date
+        console.log(`[BOOKING FLOW] Have time, asking for date only`);
+        return lang === "es" ? `Perfecto, a las ${ctx.data.time}. ¿Qué día?` :
+               lang === "pt" ? `Perfeito, às ${ctx.data.time}. Que dia?` :
+               `Great, at ${ctx.data.time}. What day works for you?`;
+      } else {
+        // Missing both
+        console.log(`[BOOKING FLOW] Missing both date and time`);
+        return ctx.t("askDateTime");
+      }
     }
+    
     if (!ctx.data.name) return ctx.t("askName");
     if (!ctx.data.phone) return ctx.t("askPhone");
     
