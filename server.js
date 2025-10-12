@@ -315,15 +315,56 @@ const TRANSLATIONS = {
 // ENTITY EXTRACTION (multilingual)
 // ───────────────────────────────────────────────────────────────────────────────
 function extractName(text) {
+  // Don't extract numbers as names
+  if (/^\d+$/.test(text.trim())) {
+    console.log(`[EXTRACT] Rejected number as name: ${text}`);
+    return null;
+  }
+  
+  // Don't extract common number words as names
+  const numberWords = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
+  const normalized = normalize(text);
+  if (numberWords.includes(normalized)) {
+    console.log(`[EXTRACT] Rejected number word as name: ${text}`);
+    return null;
+  }
+  
   const patterns = [
     /(?:my name is|i'm|i am|this is|call me|me llamo|mi nombre es|meu nome é)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)/i,
-    /^([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)$/,
+    /^([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)$/,  // At least 3 chars to avoid "Two"
   ];
   for (const p of patterns) {
     const m = text.match(p);
-    if (m) return m[1];
+    if (m) {
+      console.log(`[EXTRACT] Name: ${m[1]}`);
+      return m[1];
+    }
   }
   return null;
+}
+
+function extractPhoneDigits(text) {
+  const q = normalize(text);
+  const digitWords = {
+    "zero": "0", "oh": "0", "o": "0",
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9"
+  };
+  
+  const words = q.split(/[\s.-]+/);  // Split on space, dash, dot
+  let digits = "";
+  
+  for (const word of words) {
+    if (digitWords[word]) {
+      digits += digitWords[word];
+    } else if (/^\d+$/.test(word)) {
+      // Handle numbers - add all digits
+      digits += word;
+    }
+  }
+  
+  console.log(`[PHONE DIGITS] Extracted "${digits}" from "${text}"`);
+  return digits;
 }
 
 function extractPhone(text) {
@@ -338,28 +379,12 @@ function extractPhone(text) {
   }
   
   // Pattern 2: Spoken digits "six one seven five five five one two three four"
-  const digitWords = {
-    "zero": "0", "oh": "0", "o": "0",
-    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
-    "six": "6", "seven": "7", "eight": "8", "nine": "9"
-  };
-  
-  // Extract all digit words from the text
-  const words = q.split(/\s+/);
-  const digits = [];
-  for (const word of words) {
-    if (digitWords[word]) {
-      digits.push(digitWords[word]);
-    } else if (/^\d+$/.test(word)) {
-      // Handle numbers like "200" as individual digits
-      digits.push(...word.split(''));
-    }
-  }
+  const digits = extractPhoneDigits(text);
   
   // If we found 10+ digits, construct phone number
   if (digits.length >= 10) {
-    const phoneNum = digits.slice(0, 10).join('');
-    console.log(`[EXTRACT] Phone (spoken): ${phoneNum} from ${digits.join('')}`);
+    const phoneNum = digits.slice(0, 10);
+    console.log(`[EXTRACT] Phone (spoken): ${phoneNum}`);
     return phoneNum;
   }
   
@@ -573,6 +598,7 @@ class ConversationContext {
     this.state = "initial"; // initial, booking_flow, info_gathering
     this.language = null;
     this.lastExtraction = null; // Track what was extracted in last turn
+    this.partialPhone = ""; // Accumulate phone digits across turns
     this.data = {
       serviceType: null,
       bedrooms: null,
@@ -647,7 +673,6 @@ function routeWithContext(text, ctx) {
   
   // Extract entities
   const name = extractName(text);
-  const phone = extractPhone(text);
   const dateTime = extractDateTime(text);
   const serviceType = extractServiceType(text, lang);
   const city = findCityInText(text);
@@ -655,6 +680,26 @@ function routeWithContext(text, ctx) {
   // Smart extraction based on context
   let bedrooms = null;
   let bathrooms = null;
+  let phone = null;
+  
+  // If we're in booking flow and missing phone, try to accumulate phone digits
+  if (ctx.state === "booking_flow" && !ctx.data.phone && ctx.data.name) {
+    // We just asked for phone - try to extract it or accumulate partial
+    phone = extractPhone(text);
+    if (!phone) {
+      // Try to accumulate digits
+      const digits = extractPhoneDigits(text);
+      if (digits.length > 0) {
+        ctx.partialPhone += digits;
+        console.log(`[PHONE] Accumulated: ${ctx.partialPhone} (${ctx.partialPhone.length}/10 digits)`);
+        if (ctx.partialPhone.length >= 10) {
+          phone = ctx.partialPhone.slice(0, 10);
+          ctx.partialPhone = ""; // Reset
+          console.log(`[PHONE] Complete phone extracted: ${phone}`);
+        }
+      }
+    }
+  }
   
   // If we're in booking flow and missing bathrooms but have bedrooms, prioritize bathroom extraction
   if (ctx.state === "booking_flow" && ctx.data.bedrooms && !ctx.data.bathrooms) {
