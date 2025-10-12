@@ -329,6 +329,13 @@ function extractName(text) {
     return null;
   }
   
+  // Don't extract service types as names
+  const serviceWords = ["standard", "deep", "airbnb", "moveout", "move-out", "turnover"];
+  if (serviceWords.includes(normalized)) {
+    console.log(`[EXTRACT] Rejected service type as name: ${text}`);
+    return null;
+  }
+  
   const patterns = [
     /(?:my name is|i'm|i am|this is|call me|me llamo|mi nombre es|meu nome é)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)/i,
     /^([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)$/,  // At least 3 chars to avoid "Two"
@@ -336,8 +343,12 @@ function extractName(text) {
   for (const p of patterns) {
     const m = text.match(p);
     if (m) {
-      console.log(`[EXTRACT] Name: ${m[1]}`);
-      return m[1];
+      const name = m[1];
+      // Double check it's not a service word
+      if (!serviceWords.includes(name.toLowerCase())) {
+        console.log(`[EXTRACT] Name: ${name}`);
+        return name;
+      }
     }
   }
   return null;
@@ -415,6 +426,14 @@ function extractDateTime(text) {
       console.log(`[EXTRACT] Day: ${day}`);
       break; 
     }
+  }
+  
+  // Check for specific dates like "October 18th", "October eighteenth"
+  const monthPattern = /(january|february|march|april|may|june|july|august|september|october|november|december)\s+(eighteenth|nineteenth|twentieth|twenty first|twenty second|twenty third|twenty fourth|twenty fifth|twenty sixth|twenty seventh|twenty eighth|twenty ninth|thirtieth|thirty first|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|\d{1,2}(?:st|nd|rd|th)?)/i;
+  const monthMatch = text.match(monthPattern);
+  if (monthMatch) {
+    day = monthMatch[0]; // e.g., "October eighteenth"
+    console.log(`[EXTRACT] Day from date pattern: ${day}`);
   }
   
   // Find time - handle multiple patterns including word numbers
@@ -779,6 +798,21 @@ function routeWithContext(text, ctx) {
     }
   }
   
+  // Handle requests to repeat/confirm information (not city queries)
+  if ((q.includes("repeat") || q.includes("confirm") || q.includes("what was") || 
+       q.includes("can you repeat") || q.includes("say that again")) && 
+      (q.includes("number") || q.includes("phone") || q.includes("telephone"))) {
+    console.log(`[ROUTING] Request to repeat phone number`);
+    if (ctx.data.phone) {
+      return lang === "es" ? `El número es ${ctx.data.phone}.` :
+             lang === "pt" ? `O número é ${ctx.data.phone}.` :
+             `The number is ${ctx.data.phone}.`;
+    }
+    return lang === "es" ? "¿Cuál es tu número de teléfono?" :
+           lang === "pt" ? "Qual é o seu número de telefone?" :
+           "What's your phone number?";
+  }
+  
   // Handle "I don't know the ZIP" when previously asked
   if ((q.includes("don't know") || q.includes("no se") || q.includes("nao sei") || q.includes("i don't know")) && 
       (q.includes("zip") || q.includes("codigo") || q.includes("cep") || q.includes("code"))) {
@@ -824,7 +858,7 @@ function routeWithContext(text, ctx) {
     if (q.includes("pet") || q.includes("mascota") || q.includes("animal")) return ctx.t("pets");
   }
   
-  // PRIORITY 3: Small talk (ONLY if no substantive query detected AND not already greeted OR short message)
+  // PRIORITY 3: Small talk (ONLY if not already greeted AND is standalone greeting)
   if (ctx.state === "initial") {
     // Check if this is ONLY small talk (short message with no other content)
     const words = q.split(" ").filter(w => w.length > 0);
@@ -832,15 +866,14 @@ function routeWithContext(text, ctx) {
                              "servicio", "servico", "precio", "preco", "limpieza", "limpeza",
                              "brooklyn", "brookline", "brook", "brooks", "cambridge", "boston", "newton",
                              "watertown", "somerville", "medford", "waltham", "quincy", "dedham",
-                             "wellesley", "needham", "belmont", "arlington"];
+                             "wellesley", "needham", "belmont", "arlington", "repeat", "telephone", "number"];
     const hasSubstantiveContent = words.some(w => substantiveWords.includes(w));
     
     console.log(`[SMALL TALK CHECK] Words: ${words.length}, HasSubstantive: ${hasSubstantiveContent}, Greeted: ${ctx.greeted}, Words: [${words.join(", ")}]`);
     
-    // Only respond to small talk if:
-    // 1. NOT already greeted, OR
-    // 2. Message is short AND has no substantive content
-    if (!ctx.greeted || (!hasSubstantiveContent && words.length <= 3)) {
+    // ONLY respond to greeting if NOT greeted yet AND no other entities detected
+    if (!ctx.greeted && !hasSubstantiveContent && words.length <= 3 && 
+        !city && !serviceType && !name && !dateTime.day && !dateTime.time) {
       if (q.includes("hi") || q.includes("hello") || q.includes("hola") || q === "ola") {
         console.log(`[SMALL TALK] Triggered greeting`);
         ctx.greeted = true;
@@ -853,11 +886,15 @@ function routeWithContext(text, ctx) {
       }
     }
     
-    // These can be longer, so check separately
-    if (q.includes("who are you") || q.includes("quien eres") || q.includes("quem e")) {
-      console.log(`[SMALL TALK] Triggered who are you`);
-      return ctx.t("smallTalk").whoAreYou;
+    // These can be longer, so check separately (but not if already greeted)
+    if (!ctx.greeted) {
+      if (q.includes("who are you") || q.includes("quien eres") || q.includes("quem e")) {
+        console.log(`[SMALL TALK] Triggered who are you`);
+        ctx.greeted = true;
+        return ctx.t("smallTalk").whoAreYou;
+      }
     }
+    
     if (q.includes("thank") || q.includes("gracias") || q.includes("obrigad")) {
       console.log(`[SMALL TALK] Triggered thanks`);
       return ctx.t("smallTalk").thanks;
@@ -881,7 +918,7 @@ function routeWithContext(text, ctx) {
   // Handle affirmative responses to "Would you like to book?" 
   if (ctx.state === "initial" && 
       (q.includes("yes") || q.includes("yeah") || q.includes("yep") || q.includes("sure") || 
-       q.includes("that would be great") || q.includes("sounds good") ||
+       q.includes("that would be great") || q.includes("sounds good") || q.includes("i would") ||
        q.includes("si") || q.includes("sim") || q.includes("claro"))) {
     // Check if we previously mentioned booking
     if (ctx.data.city) {
@@ -930,7 +967,7 @@ function routeWithContext(text, ctx) {
     
     // Final confirmation WITH price
     if (ctx.hasAllBookingInfo()) {
-      const priceMsg = ctx.data.estimatedPrice ? ` ${lang === "es" ? "por alrededor de" : lang === "pt" ? "por cerca de" : "for about"} ${ctx.data.estimatedPrice}` : "";
+      const priceMsg = ctx.data.estimatedPrice ? ` ${lang === "es" ? "por alrededor de" : lang === "pt" ? "por cerca de" : "for about"} $${ctx.data.estimatedPrice}` : "";
       return `${ctx.t("confirmation")} ${ctx.getSummary()}${priceMsg}. ${ctx.t("confirmQuestion")}`;
     }
   }
