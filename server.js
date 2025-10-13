@@ -943,10 +943,18 @@ function routeWithContext(text, ctx) {
     console.log(`[ROUTING] No city found in context for ZIP response`);
   }
   
-  // PRIORITY 2: KB questions (substantive queries)
+  // PRIORITY 2: KB questions (substantive queries) - but SKIP service keyword if it's a service area query
   if (ctx.state === "initial") {
     if (q.includes("hour") || q.includes("open") || q.includes("horario")) return ctx.t("hours");
-    if (q.includes("service") || q.includes("servicio") || q.includes("servico")) return ctx.t("services");
+    
+    // Only answer with services KB if NOT a service area query
+    const isServiceAreaQuery = (q.includes("do you service") || q.includes("do you serve") || 
+                                q.includes("can you service") || q.includes("do you cover") ||
+                                q.includes("can you clean"));
+    if ((q.includes("service") || q.includes("servicio") || q.includes("servico")) && !isServiceAreaQuery) {
+      return ctx.t("services");
+    }
+    
     if (q.includes("pay") || q.includes("pago") || q.includes("pagamento")) return ctx.t("payment");
     if (q.includes("supplies") || q.includes("productos") || q.includes("produtos")) return ctx.t("supplies");
     if (q.includes("how long") || q.includes("cuanto tiempo") || q.includes("quanto tempo")) return ctx.t("duration");
