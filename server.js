@@ -948,7 +948,9 @@ function routeWithContext(text, ctx) {
     if (q.includes("hour") || q.includes("open") || q.includes("horario")) return ctx.t("hours");
     
     // Only answer with services KB if NOT a service area query
-    const isServiceAreaQuery = (q.includes("do you service") || q.includes("do you serve") || 
+    // Use the city detection result if available, otherwise check patterns
+    const isServiceAreaQuery = city?.isQuery || 
+                               (q.includes("do you service") || q.includes("do you serve") || 
                                 q.includes("can you service") || q.includes("do you cover") ||
                                 q.includes("can you clean"));
     if ((q.includes("service") || q.includes("servicio") || q.includes("servico")) && !isServiceAreaQuery) {
