@@ -41,32 +41,90 @@ const SERVICE_AREAS = [
   "Belmont","Medford","Waltham","Needham","Wellesley","Dedham","Quincy"
 ];
 
-// Common STT errors / phonetic variations
+// Common STT errors / phonetic variations + neighborhood nicknames
 const CITY_ALIASES = {
+  // Brookline variations
   "brooklyn": "Brookline",
   "brook line": "Brookline",
   "brooklin": "Brookline",
-  "brook": "Brookline",  // Deepgram often cuts off "Brookline" to just "Brook"
+  "brook": "Brookline",
   "brooks": "Brookline",
   "brooke": "Brookline",
+  
+  // Cambridge variations
   "cambridge": "Cambridge",
+  
+  // Somerville variations
   "somerville": "Somerville",
   "sommerville": "Somerville",
+  
+  // Newton variations
   "newton": "Newton",
   "new town": "Newton",
+  
+  // Watertown variations
   "watertown": "Watertown",
   "water town": "Watertown",
+  
+  // Arlington variations
   "arlington": "Arlington",
+  
+  // Belmont variations
   "belmont": "Belmont",
   "beaumont": "Belmont",
+  
+  // Medford variations
   "medford": "Medford",
+  
+  // Waltham variations
   "waltham": "Waltham",
+  
+  // Needham variations
   "needham": "Needham",
+  
+  // Wellesley variations
   "wellesley": "Wellesley",
   "wellsley": "Wellesley",
+  
+  // Dedham variations
   "dedham": "Dedham",
+  
+  // Quincy variations
   "quincy": "Quincy",
   "quinsy": "Quincy",
+  
+  // Boston neighborhoods - full names
+  "jamaica plain": "Boston",
+  "south boston": "Boston",
+  "west roxbury": "Boston",
+  "roslindale": "Boston",
+  "dorchester": "Boston",
+  "roxbury": "Boston",
+  "allston": "Boston",
+  "brighton": "Boston",
+  "back bay": "Boston",
+  "south end": "Boston",
+  "north end": "Boston",
+  "charlestown": "Boston",
+  "east boston": "Boston",
+  "hyde park": "Boston",
+  "mattapan": "Boston",
+  "fenway": "Boston",
+  "mission hill": "Boston",
+  "west end": "Boston",
+  "beacon hill": "Boston",
+  "seaport": "Boston",
+  
+  // Boston neighborhood nicknames
+  "jp": "Boston",
+  "j p": "Boston",
+  "southie": "Boston",
+  "eastie": "Boston",
+  "westie": "Boston",
+  "rozzie": "Boston",
+  "dot": "Boston",
+  "southend": "Boston",
+  "backbay": "Boston",
 };
 
 // Your actual pricing matrix: bedroom-bathroom combos
@@ -880,7 +938,7 @@ function routeWithContext(text, ctx) {
                              "brooklyn", "brookline", "brook", "brooks", "cambridge", "boston", "newton",
                              "watertown", "somerville", "medford", "waltham", "quincy", "dedham",
                              "wellesley", "needham", "belmont", "arlington", "repeat", "telephone", "number",
-                             "availability", "available", "appointment"];
+                             "availability", "available", "appointment", "jp", "southie", "eastie", "westie"];
     const hasSubstantiveContent = words.some(w => substantiveWords.includes(w));
     
     console.log(`[SMALL TALK CHECK] Words: ${words.length}, HasSubstantive: ${hasSubstantiveContent}, Greeted: ${ctx.greeted}, Words: [${words.join(", ")}]`);
