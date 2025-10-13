@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import fetch from "node-fetch";
 import WebSocket, { WebSocketServer } from "ws";
@@ -29,9 +30,10 @@ const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS;
 const BYTES_PER_FRAME_PCM16 = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE_PCM16;
 const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1;
 
-const ASR_PARTIAL_PROMOTE_MS = 1200;
+// Tuned timers
+const ASR_PARTIAL_PROMOTE_MS = 1600; // reduce premature finals
 const NO_INPUT_REPROMPT_MS = 7000;
-const POST_TTS_GRACE_MS = 800; // Reduced - just enough to prevent echo
+const POST_TTS_GRACE_MS = 1400;      // safer tail to avoid echo / overlap
 
 // ───────────────────────────────────────────────────────────────────────────────
 // SERVICE AREAS & PRICING
@@ -50,49 +52,49 @@ const CITY_ALIASES = {
   "brook": "Brookline",
   "brooks": "Brookline",
   "brooke": "Brookline",
-  
+
   // Cambridge variations
   "cambridge": "Cambridge",
-  
+
   // Somerville variations
   "somerville": "Somerville",
   "sommerville": "Somerville",
-  
-  // Newton variations
+
+  // Newton
   "newton": "Newton",
   "new town": "Newton",
-  
-  // Watertown variations
+
+  // Watertown
   "watertown": "Watertown",
   "water town": "Watertown",
-  
-  // Arlington variations
+
+  // Arlington
   "arlington": "Arlington",
-  
-  // Belmont variations
+
+  // Belmont
   "belmont": "Belmont",
   "beaumont": "Belmont",
-  
-  // Medford variations
+
+  // Medford
   "medford": "Medford",
-  
-  // Waltham variations
+
+  // Waltham
   "waltham": "Waltham",
-  
-  // Needham variations
+
+  // Needham
   "needham": "Needham",
-  
-  // Wellesley variations
+
+  // Wellesley
   "wellesley": "Wellesley",
   "wellsley": "Wellesley",
-  
-  // Dedham variations
+
+  // Dedham
   "dedham": "Dedham",
-  
-  // Quincy variations
+
+  // Quincy
   "quincy": "Quincy",
   "quinsy": "Quincy",
-  
+
   // Boston neighborhoods - full names
   "jamaica plain": "Boston",
   "south boston": "Boston",
@@ -114,8 +116,8 @@ const CITY_ALIASES = {
   "west end": "Boston",
   "beacon hill": "Boston",
   "seaport": "Boston",
-  
-  // Boston neighborhood nicknames
+
+  // Nicknames
   "jp": "Boston",
   "j p": "Boston",
   "southie": "Boston",
@@ -125,9 +127,12 @@ const CITY_ALIASES = {
   "dot": "Boston",
   "southend": "Boston",
   "backbay": "Boston",
+
+  // Quick hardening for common telephony mis-hear:
+  "door": "Boston" // often "Dorchester" → "door"
 };
 
-// Your actual pricing matrix: bedroom-bathroom combos
+// Your actual pricing matrix
 const PRICING_MATRIX = {
   standard: {
     Studio: 100, "1-1": 120, "1-2": 140, "2-1": 160, "2-2": 180, "2-3": 200, "2-4": 220, "2-5+": 240,
@@ -162,23 +167,56 @@ const FREQUENCY_DISCOUNTS = {
   onetime: 0,
 };
 
+// ───────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ───────────────────────────────────────────────────────────────────────────────
 function normalize(s) {
   return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
 }
 
+// Edit distance (Levenshtein) for fuzzy city
+function editDistance(a, b) {
+  a = a.toLowerCase(); b = b.toLowerCase();
+  const dp = Array.from({ length: a.length + 1 }, (_, i) => Array(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i++) dp[i][0] = i;
+  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i-1][j] + 1, dp[i][j-1] + 1, dp[i-1][j-1] + cost);
+    }
+  }
+  return dp[a.length][b.length];
+}
+
+function bestFuzzyCity(tokens) {
+  let best = { city: null, dist: 99 };
+  const candidates = [...SERVICE_AREAS, ...Object.keys(CITY_ALIASES)];
+  for (const t of tokens) {
+    if (t.length < 3) continue;
+    for (const c of candidates) {
+      const d = editDistance(t, c);
+      if (d < best.dist) best = { city: c, dist: d };
+    }
+  }
+  return best.dist <= 2 ? best.city : null;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// City detection
+// ───────────────────────────────────────────────────────────────────────────────
 function findCityInText(text) {
   const q = normalize(text);
-  
-  // Check if question is about service area
-  const isServiceAreaQuery = q.includes("service") || q.includes("cover") || 
-                             q.includes("serve") || q.includes("area") || q.includes("clean") ||
-                             q.includes("servicio") || q.includes("servico") ||
-                             q.includes("atiende") || q.includes("atende") ||
-                             q.includes("do you") || q.includes("can you");
-  
+
+  // Is this likely a coverage question?
+  const isServiceAreaQuery =
+    q.includes("service") || q.includes("cover") || q.includes("serve") || q.includes("area") || q.includes("clean") ||
+    q.includes("servicio") || q.includes("servico") || q.includes("atiende") || q.includes("atende") ||
+    q.includes("do you") || q.includes("can you");
+
   console.log(`[CITY DETECTION] Query: "${text}" | isServiceAreaQuery: ${isServiceAreaQuery}`);
-  
-  // First, check for exact matches in known cities
+
+  // Exact matches
   for (const city of SERVICE_AREAS) {
     const cityNorm = city.toLowerCase();
     const regex = new RegExp(`\\b${cityNorm}\\b`, "i");
@@ -187,8 +225,8 @@ function findCityInText(text) {
       return { city, known: true, isQuery: isServiceAreaQuery };
     }
   }
-  
-  // Check for phonetic aliases (STT often mishears city names)
+
+  // Alias matches
   for (const [alias, realCity] of Object.entries(CITY_ALIASES)) {
     const regex = new RegExp(`\\b${alias}\\b`, "i");
     if (regex.test(q)) {
@@ -196,71 +234,54 @@ function findCityInText(text) {
       return { city: realCity, known: true, isQuery: isServiceAreaQuery };
     }
   }
-  
-  // If it's a service area query but city not found, try to extract city name from common patterns
+
+  // Pattern extraction for "in the city of X"
   if (isServiceAreaQuery) {
-    // More robust pattern that skips articles
-    // "in Brookline", "in the town of Brookline", "to Brookline", etc.
     const cityPatterns = [
       /(?:in|at|to|of)\s+(?:the\s+)?(?:town\s+of\s+|city\s+of\s+|area\s+of\s+)?([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)/gi,
       /(?:town|city|area)\s+of\s+(?:the\s+)?([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)/gi,
     ];
-    
     for (const pattern of cityPatterns) {
       let match;
       while ((match = pattern.exec(text)) !== null) {
         const extractedCity = match[1];
-        
-        // Skip common words that aren't cities
         const skipWords = ["the", "town", "city", "area", "this", "that"];
-        if (skipWords.includes(extractedCity.toLowerCase())) {
-          console.log(`[CITY] Skipped non-city word: ${extractedCity}`);
-          continue;
-        }
-        
-        console.log(`[CITY] Extracted from pattern: ${extractedCity}`);
-        
-        // Double-check if this extracted city is in our known list
+        if (skipWords.includes(extractedCity.toLowerCase())) continue;
+
         const knownCity = SERVICE_AREAS.find(c => c.toLowerCase() === extractedCity.toLowerCase());
-        if (knownCity) {
-          console.log(`[CITY] Matched to known city: ${knownCity}`);
-          return { city: knownCity, known: true, isQuery: true };
-        }
-        
-        // Check aliases too
+        if (knownCity) return { city: knownCity, known: true, isQuery: true };
+
         const aliasMatch = CITY_ALIASES[extractedCity.toLowerCase()];
-        if (aliasMatch) {
-          console.log(`[CITY] Matched via alias: ${extractedCity} → ${aliasMatch}`);
-          return { city: aliasMatch, known: true, isQuery: true };
-        }
-        
-        // If not in our list, return as unknown (only if 3+ chars to avoid garbage)
-        if (extractedCity.length >= 3) {
-          console.log(`[CITY] Not in service area: ${extractedCity}`);
-          return { city: extractedCity, known: false, isQuery: true };
-        }
+        if (aliasMatch) return { city: aliasMatch, known: true, isQuery: true };
+
+        if (extractedCity.length >= 3) return { city: extractedCity, known: false, isQuery: true };
       }
     }
   }
-  
+
+  // Fuzzy fallback
+  const tokens = q.split(/\s+/);
+  const fuzzy = bestFuzzyCity(tokens);
+  if (fuzzy) {
+    const real = CITY_ALIASES[fuzzy.toLowerCase()] || fuzzy;
+    console.log(`[CITY] Fuzzy '${fuzzy}' → ${real}`);
+    const known = SERVICE_AREAS.includes(real);
+    return { city: real, known, isQuery: isServiceAreaQuery };
+  }
+
   console.log(`[CITY] No city found in query`);
   return null;
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// LANGUAGE DETECTION & MULTILINGUAL CONTENT
+// LANGUAGE DETECTION & TRANSLATIONS
 // ───────────────────────────────────────────────────────────────────────────────
 function detectLanguage(text) {
   const q = normalize(text);
-  
-  // Spanish indicators
   const spanishWords = ["hola", "si", "bueno", "gracias", "como", "que", "limpieza", "servicio", "precio", "cuando", "donde"];
   if (spanishWords.some(w => q.includes(w))) return "es";
-  
-  // Portuguese indicators
   const portugueseWords = ["ola", "sim", "obrigado", "obrigada", "como", "que", "limpeza", "servico", "preco", "quando", "onde"];
   if (portugueseWords.some(w => q.includes(w))) return "pt";
-  
   return "en";
 }
 
@@ -376,46 +397,36 @@ const TRANSLATIONS = {
 };
 
 // ───────────────────────────────────────────────────────────────────────────────
-// ENTITY EXTRACTION (multilingual)
+// ENTITY EXTRACTION (multilingual)  — unchanged except for small guards
 // ───────────────────────────────────────────────────────────────────────────────
 function extractName(text) {
-  // Don't extract numbers as names
-  if (/^\d+$/.test(text.trim())) {
-    console.log(`[EXTRACT] Rejected number as name: ${text}`);
-    return null;
-  }
-  
-  // Don't extract common number words as names
-  const numberWords = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
+  // Reject plain numbers
+  if (/^\d+$/.test(text.trim())) return null;
+
   const normalized = normalize(text);
-  if (numberWords.includes(normalized)) {
-    console.log(`[EXTRACT] Rejected number word as name: ${text}`);
-    return null;
-  }
-  
-  // Don't extract service types as names
-  const serviceWords = ["standard", "deep", "airbnb", "moveout", "move-out", "turnover"];
-  if (serviceWords.includes(normalized)) {
-    console.log(`[EXTRACT] Rejected service type as name: ${text}`);
-    return null;
-  }
-  
-  // Don't extract common objects or phrases as names
-  const commonObjects = ["faucet", "sink", "toilet", "shower", "bath", "door", "window", "floor", "wall", "looking for", "thinking about"];
-  if (commonObjects.includes(normalized)) {
-    console.log(`[EXTRACT] Rejected common object/phrase as name: ${text}`);
-    return null;
-  }
-  
+  // Reject common number words
+  const numberWords = ["one","two","three","four","five","six","seven","eight","nine","ten"];
+  if (numberWords.includes(normalized)) return null;
+
+  // Reject service words
+  const serviceWords = ["standard","deep","airbnb","moveout","move-out","turnover"];
+  if (serviceWords.includes(normalized)) return null;
+
+  // Reject objects/phrases
+  const commonObjects = ["faucet","sink","toilet","shower","bath","door","window","floor","wall","looking for","thinking about"];
+  if (commonObjects.includes(normalized)) return null;
+
+  // Guard against "it's" being heard without apostrophe
+  if (/^(its|it s)$/i.test(normalized)) return null;
+
   const patterns = [
     /(?:my name is|i'm|i am|this is|call me|me llamo|mi nombre es|meu nome é)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)/i,
-    /^([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)$/,  // At least 3 chars to avoid "Two"
+    /^([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)$/,
   ];
   for (const p of patterns) {
     const m = text.match(p);
     if (m) {
       const name = m[1];
-      // Double check it's not a service word, common object, or phrase
       if (!serviceWords.includes(name.toLowerCase()) && !commonObjects.some(obj => name.toLowerCase().includes(obj))) {
         console.log(`[EXTRACT] Name: ${name}`);
         return name;
@@ -432,52 +443,35 @@ function extractPhoneDigits(text) {
     "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
     "six": "6", "seven": "7", "eight": "8", "nine": "9"
   };
-  
-  const words = q.split(/[\s.-]+/);  // Split on space, dash, dot
+  const words = q.split(/[\s.-]+/);
   let digits = "";
-  
   for (const word of words) {
-    if (digitWords[word]) {
-      digits += digitWords[word];
-    } else if (/^\d+$/.test(word)) {
-      // Handle numbers - add all digits
-      digits += word;
-    }
+    if (digitWords[word]) digits += digitWords[word];
+    else if (/^\d+$/.test(word)) digits += word;
   }
-  
   console.log(`[PHONE DIGITS] Extracted "${digits}" from "${text}"`);
   return digits;
 }
 
 function extractPhone(text) {
-  const q = normalize(text);
-  
-  // Pattern 1: Standard formats (617-555-1234, 617.555.1234, 6175551234)
   const standardMatch = text.match(/(\d{3}[\s.-]?\d{3}[\s.-]?\d{4}|\d{10})/);
   if (standardMatch) {
     const cleaned = standardMatch[1].replace(/[^\d]/g, "");
     console.log(`[EXTRACT] Phone (standard): ${cleaned}`);
     return cleaned;
   }
-  
-  // Pattern 2: Spoken digits "six one seven five five five one two three four"
   const digits = extractPhoneDigits(text);
-  
-  // If we found 10+ digits, construct phone number
   if (digits.length >= 10) {
     const phoneNum = digits.slice(0, 10);
     console.log(`[EXTRACT] Phone (spoken): ${phoneNum}`);
     return phoneNum;
   }
-  
-  // Pattern 3: Partial phone in context "call me at 617..."
   const contextMatch = text.match(/(?:call|text|reach|phone|number)(?:\s+me)?(?:\s+at)?\s+(\d{3,})/i);
   if (contextMatch && contextMatch[1].length >= 10) {
     const cleaned = contextMatch[1].replace(/[^\d]/g, '').slice(0, 10);
     console.log(`[EXTRACT] Phone (context): ${cleaned}`);
     return cleaned;
   }
-  
   return null;
 }
 
@@ -485,64 +479,33 @@ function extractDateTime(text) {
   const q = normalize(text);
   console.log(`[EXTRACT DateTime] Input: "${text}" → Normalized: "${q}"`);
   let day = null, time = null;
-  
+
   const daysEn = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday","tomorrow","today"];
   const daysEs = ["lunes","martes","miercoles","jueves","viernes","sabado","domingo","mañana","hoy"];
   const daysPt = ["segunda","terca","quarta","quinta","sexta","sabado","domingo","amanha","hoje"];
-  
-  // Find day
+
   for (const d of [...daysEn, ...daysEs, ...daysPt]) {
-    if (q.includes(d)) { 
-      day = d;
-      console.log(`[EXTRACT] Day: ${day}`);
-      break; 
-    }
+    if (q.includes(d)) { day = d; console.log(`[EXTRACT] Day: ${day}`); break; }
   }
-  
-  // Check for specific dates like "October 18th", "October eighteenth"
+
   const monthPattern = /(january|february|march|april|may|june|july|august|september|october|november|december)\s+(eighteenth|nineteenth|twentieth|twenty first|twenty second|twenty third|twenty fourth|twenty fifth|twenty sixth|twenty seventh|twenty eighth|twenty ninth|thirtieth|thirty first|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|\d{1,2}(?:st|nd|rd|th)?)/i;
   const monthMatch = text.match(monthPattern);
   if (monthMatch) {
-    day = monthMatch[0]; // e.g., "October eighteenth"
+    day = monthMatch[0];
     console.log(`[EXTRACT] Day from date pattern: ${day}`);
   }
-  
-  // Find time - handle multiple patterns including word numbers
-  const timeWords = {
-    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", 
-    "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
-    "eleven": "11", "twelve": "12"
-  };
-  
-  // Pattern 1: Digit with AM/PM: "4 PM", "4:30 PM"
+
+  const timeWords = { one:"1",two:"2",three:"3",four:"4",five:"5",six:"6",seven:"7",eight:"8",nine:"9",ten:"10",eleven:"11",twelve:"12" };
+
   let m = text.match(/(\d{1,2})\s*(?::|h)?\s*(\d{2})?\s*(am|pm|a\.m\.|p\.m\.)/i);
-  if (m) {
-    time = m[0];
-    console.log(`[EXTRACT] Time (with AM/PM): ${time}`);
-    return { day, time };
-  }
-  
-  // Pattern 2: Word number with AM/PM (without "at"): "four PM", "twelve AM"
+  if (m) { time = m[0]; console.log(`[EXTRACT] Time (with AM/PM): ${time}`); return { day, time }; }
+
   m = text.match(/\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(am|pm|a\.m\.|p\.m\.)/i);
-  if (m) {
-    let hour = timeWords[m[1].toLowerCase()] || m[1];
-    let period = m[2];
-    time = `${hour} ${period}`;
-    console.log(`[EXTRACT] Time (word + AM/PM): ${time}`);
-    return { day, time };
-  }
-  
-  // Pattern 3: "at four", "at 4", "at four PM", "thinking thursday at four"
+  if (m) { let hour=timeWords[m[1].toLowerCase()]||m[1]; time=`${hour} ${m[2]}`; console.log(`[EXTRACT] Time (word + AM/PM): ${time}`); return { day, time }; }
+
   m = text.match(/(?:at|on)\s+(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d{1,2})(?:\s*(am|pm|a\.m\.|p\.m\.))?/i);
-  if (m) {
-    let hour = timeWords[m[1].toLowerCase()] || m[1];
-    let period = m[2] || "";
-    time = period ? `${hour} ${period}` : `${hour}`;
-    console.log(`[EXTRACT] Time (at/on + number): ${time}`);
-    return { day, time };
-  }
-  
-  // Pattern 4: Just a number in time context (e.g., "Thursday four")
+  if (m) { let hour=timeWords[m[1]?.toLowerCase()]||m[1]; let period=m[2]||""; time = period ? `${hour} ${period}` : `${hour}`; console.log(`[EXTRACT] Time (at/on + number): ${time}`); return { day, time }; }
+
   if (day) {
     m = q.match(/\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d{1,2})\b/);
     if (m && !["monday","tuesday","wednesday","thursday","friday","saturday","sunday"].includes(m[1])) {
@@ -551,55 +514,36 @@ function extractDateTime(text) {
       return { day, time };
     }
   }
-  
-  // Pattern 5: "morning", "afternoon", "evening"
+
   m = text.match(/(morning|afternoon|evening|noon)/i);
-  if (m) {
-    time = m[0];
-    console.log(`[EXTRACT] Time (period): ${time}`);
-    return { day, time };
-  }
-  
-  // Pattern 6: "o'clock"
+  if (m) { time = m[0]; console.log(`[EXTRACT] Time (period): ${time}`); return { day, time }; }
+
   m = text.match(/(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(o'?clock|oclock)/i);
-  if (m) {
-    let hour = timeWords[m[1].toLowerCase()] || m[1];
-    time = `${hour} o'clock`;
-    console.log(`[EXTRACT] Time (o'clock): ${time}`);
-    return { day, time };
-  }
-  
+  if (m) { let hour=timeWords[m[1].toLowerCase()]||m[1]; time=`${hour} o'clock`; console.log(`[EXTRACT] Time (o'clock): ${time}`); return { day, time }; }
+
   return { day, time };
 }
 
 function extractBedrooms(text) {
   const q = normalize(text);
-  
-  // REJECT filler words that might be misheard as numbers
-  if (q === "uh" || q === "um" || q === "er" || q === "ah" || q === "hmm") {
-    console.log(`[EXTRACT] Rejected filler word: ${q}`);
-    return null;
-  }
-  
-  // Number words to digits
+  if (["uh","um","er","ah","hmm"].includes(q)) return null;
+
   const numberWords = {
     "studio": "Studio",
-    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
-    "six": "5+", "seven": "5+", "eight": "5+",
-    "uno": "1", "dos": "2", "tres": "3", "cuatro": "4", "cinco": "5",
-    "um": "1", "dois": "2", "tres": "3", "quatro": "4", "cinco": "5",
+    "one":"1","two":"2","three":"3","four":"4","five":"5",
+    "six":"5+","seven":"5+","eight":"5+",
+    "uno":"1","dos":"2","tres":"3","cuatro":"4","cinco":"5",
+    "um":"1","dois":"2","tres":"3","quatro":"4","cinco":"5",
   };
-  
-  // Try word patterns first
+
   for (const [word, num] of Object.entries(numberWords)) {
-    if (q.includes(word + " bed") || q.includes(word + " room") || 
+    if (q.includes(word + " bed") || q.includes(word + " room") ||
         q.includes(word + " habitacion") || q.includes(word + " quarto")) {
       console.log(`[EXTRACT] Bedrooms via word: ${word} → ${num}`);
       return num;
     }
   }
-  
-  // Try just the number word if context suggests bedrooms
+
   if (q.includes("bedroom") || q.includes("habitacion") || q.includes("quarto")) {
     for (const [word, num] of Object.entries(numberWords)) {
       const wordPattern = new RegExp(`\\b${word}\\b`);
@@ -609,8 +553,7 @@ function extractBedrooms(text) {
       }
     }
   }
-  
-  // Try digit patterns
+
   const digitMatch = q.match(/(\d+)\s*(?:bed|bedroom|br|habitacion|quarto)/);
   if (digitMatch) {
     const num = parseInt(digitMatch[1]);
@@ -618,8 +561,7 @@ function extractBedrooms(text) {
     console.log(`[EXTRACT] Bedrooms via digit: ${num} → ${result}`);
     return result;
   }
-  
-  // If JUST a standalone number (and nothing else suspicious)
+
   const justNumber = q.match(/^(one|two|three|four|five|six|1|2|3|4|5|6|studio)$/);
   if (justNumber) {
     const word = justNumber[1];
@@ -627,45 +569,31 @@ function extractBedrooms(text) {
     console.log(`[EXTRACT] Bedrooms via standalone: ${word} → ${result}`);
     return result;
   }
-  
   return null;
 }
 
 function extractBathrooms(text) {
   const q = normalize(text);
-  
   const numberWords = {
-    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
-    "uno": "1", "dos": "2", "tres": "3", "cuatro": "4", "cinco": "5",
-    "um": "1", "dois": "2", "tres": "3", "quatro": "4", "cinco": "5",
+    "one":"1","two":"2","three":"3","four":"4","five":"5",
+    "uno":"1","dos":"2","tres":"3","cuatro":"4","cinco":"5",
+    "um":"1","dois":"2","tres":"3","quatro":"4","cinco":"5",
   };
-  
-  // Try word patterns
   for (const [word, num] of Object.entries(numberWords)) {
     if (q.includes(word + " bath") || q.includes(word + " bano") || q.includes(word + " banheiro")) {
-      console.log(`[EXTRACT] Bathrooms via word: ${word} → ${num}`);
-      return num >= 5 ? "5+" : num;
+      return (parseInt(num) >= 5) ? "5+" : num;
     }
   }
-  
-  // Try digit patterns
   const digitMatch = q.match(/(\d+)\s*(?:bath|bathroom|baño|banheiro)/);
   if (digitMatch) {
     const num = parseInt(digitMatch[1]);
-    const result = num >= 5 ? "5+" : num.toString();
-    console.log(`[EXTRACT] Bathrooms via digit: ${num} → ${result}`);
-    return result;
+    return num >= 5 ? "5+" : num.toString();
   }
-  
-  // If in bathroom context and just a number
   const justNumber = q.match(/^(one|two|three|four|five|1|2|3|4|5)$/);
   if (justNumber) {
     const word = justNumber[1];
-    const result = numberWords[word] || word;
-    console.log(`[EXTRACT] Bathrooms via standalone: ${word} → ${result}`);
-    return result;
+    return numberWords[word] || word;
   }
-  
   return null;
 }
 
@@ -695,11 +623,11 @@ function extractServiceType(text, lang) {
 // ───────────────────────────────────────────────────────────────────────────────
 class ConversationContext {
   constructor() {
-    this.state = "initial"; // initial, booking_flow, info_gathering
+    this.state = "initial"; // initial, booking_flow
     this.language = null;
-    this.greeted = false; // Track if user has been greeted
-    this.lastExtraction = null; // Track what was extracted in last turn
-    this.partialPhone = ""; // Accumulate phone digits across turns
+    this.greeted = false;
+    this.lastExtraction = null;
+    this.partialPhone = "";
     this.data = {
       serviceType: null,
       bedrooms: null,
@@ -713,18 +641,17 @@ class ConversationContext {
       estimatedPrice: null,
     };
   }
-  
+
   t(key) {
     if (!this.language) return TRANSLATIONS.en[key] || "";
     return TRANSLATIONS[this.language][key] || TRANSLATIONS.en[key] || "";
   }
-  
+
   calculatePrice() {
     if (!this.data.serviceType || !this.data.bedrooms) return null;
     const type = this.data.serviceType;
-    const bathrooms = this.data.bathrooms || "1"; // Default to 1 if not specified
-    const key = this.data.bedrooms === "Studio" ? "Studio" : 
-                `${this.data.bedrooms}-${bathrooms}`;
+    const bathrooms = this.data.bathrooms || "1";
+    const key = this.data.bedrooms === "Studio" ? "Studio" : `${this.data.bedrooms}-${bathrooms}`;
     const basePrice = PRICING_MATRIX[type]?.[key];
     if (!basePrice) {
       console.log(`[PRICE] No match for ${type} ${key}`);
@@ -735,12 +662,12 @@ class ConversationContext {
     console.log(`[PRICE] ${type} ${key}: ${basePrice} - ${discount*100}% = ${finalPrice}`);
     return finalPrice;
   }
-  
+
   hasAllBookingInfo() {
-    return this.data.serviceType && this.data.bedrooms && this.data.city && 
+    return this.data.serviceType && this.data.bedrooms && this.data.city &&
            this.data.date && this.data.time && this.data.name && this.data.phone;
   }
-  
+
   getSummary(includePrice = false) {
     const t = this.t("serviceTypes");
     const parts = [];
@@ -758,148 +685,93 @@ class ConversationContext {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// INTELLIGENT ROUTER
+// INTENT ROUTER
 // ───────────────────────────────────────────────────────────────────────────────
 function routeWithContext(text, ctx) {
   const q = normalize(text);
   console.log(`[ROUTE] Input: "${text}" → Normalized: "${q}"`);
-  
-  // Detect language on first turn
+
   if (!ctx.language) {
     ctx.language = detectLanguage(text);
     console.log(`[LANG] Detected: ${ctx.language}`);
   }
-  
   const lang = ctx.language;
-  
-  // Extract entities - ORDER MATTERS!
-  // Extract date/time FIRST before phone extraction to avoid conflicts
+
+  // Extract entities
   const dateTime = extractDateTime(text);
   const name = extractName(text);
   const serviceType = extractServiceType(text, lang);
   const city = findCityInText(text);
-  
-  // Smart extraction based on context
-  let bedrooms = null;
-  let bathrooms = null;
-  let phone = null;
-  
-  // Save date/time FIRST (before phone logic interferes)
-  if (dateTime.day && !ctx.data.date) {
-    ctx.data.date = dateTime.day;
-    ctx.lastExtraction = "date";
-    console.log(`[DATA] Set date: ${dateTime.day}`);
-  }
-  if (dateTime.time && !ctx.data.time) {
-    ctx.data.time = dateTime.time;
-    ctx.lastExtraction = "time";
-    console.log(`[DATA] Set time: ${dateTime.time}`);
-  }
-  
-  // If we're in booking flow and missing phone, try to accumulate phone digits
-  // BUT only if we didn't just extract a time (to avoid "4 PM" becoming phone digits)
+
+  let bedrooms = null, bathrooms = null, phone = null;
+
+  if (dateTime.day && !ctx.data.date) { ctx.data.date = dateTime.day; ctx.lastExtraction = "date"; }
+  if (dateTime.time && !ctx.data.time) { ctx.data.time = dateTime.time; ctx.lastExtraction = "time"; }
+
   if (ctx.state === "booking_flow" && !ctx.data.phone && ctx.data.name && !dateTime.time) {
-    // We just asked for phone - try to extract it or accumulate partial
     phone = extractPhone(text);
     if (!phone) {
-      // Try to accumulate digits
       const digits = extractPhoneDigits(text);
       if (digits.length > 0) {
         ctx.partialPhone += digits;
         console.log(`[PHONE] Accumulated: ${ctx.partialPhone} (${ctx.partialPhone.length}/10 digits)`);
         if (ctx.partialPhone.length >= 10) {
           phone = ctx.partialPhone.slice(0, 10);
-          ctx.partialPhone = ""; // Reset
+          ctx.partialPhone = "";
           console.log(`[PHONE] Complete phone extracted: ${phone}`);
         }
       }
     }
   }
-  
-  // If we're in booking flow and missing bathrooms but have bedrooms, prioritize bathroom extraction
+
   if (ctx.state === "booking_flow" && ctx.data.bedrooms && !ctx.data.bathrooms) {
     bathrooms = extractBathrooms(text);
-    console.log(`[CONTEXT] Prioritizing bathroom extraction: ${bathrooms}`);
   } else if (ctx.state === "booking_flow" && !ctx.data.bedrooms) {
     bedrooms = extractBedrooms(text);
-    console.log(`[CONTEXT] Prioritizing bedroom extraction: ${bedrooms}`);
   } else {
-    // Extract both normally
     bedrooms = extractBedrooms(text);
     bathrooms = extractBathrooms(text);
   }
-  
-  if (name && !ctx.data.name) {
-    ctx.data.name = name;
-    ctx.lastExtraction = "name";
-  }
-  if (phone && !ctx.data.phone) {
-    ctx.data.phone = phone;
-    ctx.lastExtraction = "phone";
-  }
-  if (bedrooms && !ctx.data.bedrooms) {
-    ctx.data.bedrooms = bedrooms;
-    ctx.lastExtraction = "bedrooms";
-    console.log(`[DATA] Set bedrooms: ${bedrooms}`);
-  }
-  if (bathrooms && !ctx.data.bathrooms) {
-    ctx.data.bathrooms = bathrooms;
-    ctx.lastExtraction = "bathrooms";
-    console.log(`[DATA] Set bathrooms: ${bathrooms}`);
-  }
-  if (serviceType && !ctx.data.serviceType) {
-    ctx.data.serviceType = serviceType;
-    ctx.lastExtraction = "serviceType";
-  }
-  if (city && city.known && !ctx.data.city) {
-    ctx.data.city = city.city;
-    ctx.lastExtraction = "city";
-  }
-  
+
+  if (name && !ctx.data.name) { ctx.data.name = name; ctx.lastExtraction = "name"; }
+  if (phone && !ctx.data.phone) { ctx.data.phone = phone; ctx.lastExtraction = "phone"; }
+  if (bedrooms && !ctx.data.bedrooms) { ctx.data.bedrooms = bedrooms; ctx.lastExtraction = "bedrooms"; }
+  if (bathrooms && !ctx.data.bathrooms) { ctx.data.bathrooms = bathrooms; ctx.lastExtraction = "bathrooms"; }
+  if (serviceType && !ctx.data.serviceType) { ctx.data.serviceType = serviceType; ctx.lastExtraction = "serviceType"; }
+  if (city && city.known && !ctx.data.city) { ctx.data.city = city.city; ctx.lastExtraction = "city"; }
+
   if (ctx.data.serviceType && ctx.data.bedrooms && !ctx.data.estimatedPrice) {
     ctx.data.estimatedPrice = ctx.calculatePrice();
   }
-  
-  // PRIORITY 1: Service area queries (check FIRST before small talk)
+
+  // PRIORITY 1: Service area queries
   if (city) {
     if (city.known) {
       if (!ctx.data.city) ctx.data.city = city.city;
-      // If it's explicitly a service query, confirm coverage
-      if (city.isQuery) {
-        console.log(`[ROUTING] Confirming service area: ${city.city}`);
-        return `${ctx.t("coverCity")} ${city.city} ${ctx.t("andSurrounding")}`;
-      }
-      // Otherwise note the city and enter booking flow if there's booking intent
+      if (city.isQuery) return `${ctx.t("coverCity")} ${city.city} ${ctx.t("andSurrounding")}`;
+
       if (ctx.state !== "booking_flow") {
-        // Check if there's booking intent in the query
-        const hasBookingIntent = q.includes("book") || q.includes("booking") || q.includes("schedule") || 
-                                q.includes("appointment") || q.includes("availability") || q.includes("available") ||
-                                q.includes("reserva") || q.includes("agendar") || q.includes("marcar") ||
-                                q.includes("i would like") || q.includes("i want to");
-        
+        const hasBookingIntent = q.includes("book") || q.includes("booking") || q.includes("schedule") ||
+                                 q.includes("appointment") || q.includes("availability") || q.includes("available") ||
+                                 q.includes("reserva") || q.includes("agendar") || q.includes("marcar") ||
+                                 q.includes("i would like") || q.includes("i want to");
         if (hasBookingIntent) {
-          console.log(`[ROUTING] City + booking intent, entering booking flow`);
           ctx.state = "booking_flow";
           return `${ctx.t("coverCity")} ${city.city}! ${ctx.t("askServiceType")}`;
         } else {
-          console.log(`[ROUTING] City mentioned, asking about service type`);
           return `${ctx.t("coverCity")} ${city.city}! ${lang === "es" ? "¿Qué tipo de limpieza te interesa?" : lang === "pt" ? "Que tipo de limpeza você gostaria?" : "What type of cleaning are you interested in—standard, deep, move-out, or Airbnb?"}`;
         }
       }
     } else if (city.isQuery) {
-      // Unknown city but they're asking about coverage
-      console.log(`[ROUTING] Unknown city, asking for ZIP: ${city.city}`);
       return lang === "es" ? `Estamos expandiendo nuestra cobertura. ¿Cuál es el código postal de ${city.city}?` :
              lang === "pt" ? `Estamos expandindo nossa cobertura. Qual é o CEP de ${city.city}?` :
              `We're expanding our coverage. What's the ZIP code for ${city.city}? I can confirm if we serve that area.`;
     }
   }
-  
-  // Handle requests to repeat/confirm information (not city queries)
-  if ((q.includes("repeat") || q.includes("confirm") || q.includes("what was") || 
-       q.includes("can you repeat") || q.includes("say that again")) && 
+
+  // Repeat phone
+  if ((q.includes("repeat") || q.includes("confirm") || q.includes("what was") || q.includes("can you repeat") || q.includes("say that again")) &&
       (q.includes("number") || q.includes("phone") || q.includes("telephone"))) {
-    console.log(`[ROUTING] Request to repeat phone number`);
     if (ctx.data.phone) {
       return lang === "es" ? `El número es ${ctx.data.phone}.` :
              lang === "pt" ? `O número é ${ctx.data.phone}.` :
@@ -909,41 +781,30 @@ function routeWithContext(text, ctx) {
            lang === "pt" ? "Qual é o seu número de telefone?" :
            "What's your phone number?";
   }
-  
-  // Handle "I don't know the ZIP" when previously asked
-  if ((q.includes("don't know") || q.includes("no se") || q.includes("nao sei") || q.includes("i don't know")) && 
+
+  // "I don't know the ZIP"
+  if ((q.includes("don't know") || q.includes("no se") || q.includes("nao sei") || q.includes("i don't know")) &&
       (q.includes("zip") || q.includes("codigo") || q.includes("cep") || q.includes("code"))) {
-    console.log(`[ROUTING] User doesn't know ZIP, checking for city mentions`);
-    
-    // Check the current query for any city mentions (even partial like "brook")
+
     for (const [alias, realCity] of Object.entries(CITY_ALIASES)) {
       if (q.includes(alias)) {
         if (!ctx.data.city) ctx.data.city = realCity;
-        console.log(`[ROUTING] Found city via alias in "don't know ZIP" response: ${alias} → ${realCity}`);
         return `${lang === "es" ? "No hay problema" : lang === "pt" ? "Sem problema" : "No problem"}! ${ctx.t("coverCity")} ${realCity}. ${lang === "es" ? "¿Te gustaría reservar?" : lang === "pt" ? "Gostaria de reservar?" : "Would you like to book?"}`;
       }
     }
-    
-    // Check if they mentioned a city we actually serve
     for (const serviceCity of SERVICE_AREAS) {
       const cityNorm = serviceCity.toLowerCase();
       if (q.includes(cityNorm) || ctx.data.city === serviceCity) {
         if (!ctx.data.city) ctx.data.city = serviceCity;
-        console.log(`[ROUTING] Found known city in "don't know ZIP" response: ${serviceCity}`);
         return `${lang === "es" ? "No hay problema" : lang === "pt" ? "Sem problema" : "No problem"}! ${ctx.t("coverCity")} ${serviceCity}. ${lang === "es" ? "¿Te gustaría reservar?" : lang === "pt" ? "Gostaria de reservar?" : "Would you like to book?"}`;
       }
     }
-    
-    // Check history/context for city mentions
     if (ctx.data.city && SERVICE_AREAS.includes(ctx.data.city)) {
-      console.log(`[ROUTING] Using city from context: ${ctx.data.city}`);
       return `${lang === "es" ? "No hay problema" : lang === "pt" ? "Sem problema" : "No problem"}! ${ctx.t("coverCity")} ${ctx.data.city}. ${lang === "es" ? "¿Te gustaría reservar?" : lang === "pt" ? "Gostaria de reservar?" : "Would you like to book?"}`;
     }
-    
-    console.log(`[ROUTING] No city found in context for ZIP response`);
   }
-  
-  // PRIORITY 2: KB questions (substantive queries)
+
+  // Initial KB answers
   if (ctx.state === "initial") {
     if (q.includes("hour") || q.includes("open") || q.includes("horario")) return ctx.t("hours");
     if (q.includes("service") || q.includes("servicio") || q.includes("servico")) return ctx.t("services");
@@ -954,58 +815,39 @@ function routeWithContext(text, ctx) {
     if (q.includes("cancel") || q.includes("cancelar")) return ctx.t("cancellation");
     if (q.includes("pet") || q.includes("mascota") || q.includes("animal")) return ctx.t("pets");
   }
-  
-  // PRIORITY 3: Small talk (ONLY if not already greeted AND is standalone greeting)
+
+  // Small talk gating
   if (ctx.state === "initial") {
-    // Check if this is ONLY small talk (short message with no other content)
     const words = q.split(" ").filter(w => w.length > 0);
-    const substantiveWords = ["service", "serve", "cover", "book", "price", "cost", "clean", "hour", 
-                             "servicio", "servico", "precio", "preco", "limpieza", "limpeza",
-                             "brooklyn", "brookline", "brook", "brooks", "cambridge", "boston", "newton",
-                             "watertown", "somerville", "medford", "waltham", "quincy", "dedham",
-                             "wellesley", "needham", "belmont", "arlington", "repeat", "telephone", "number",
-                             "availability", "available", "appointment", "jp", "southie", "eastie", "westie"];
+    const substantiveWords = ["service","serve","cover","book","price","cost","clean","hour",
+      "servicio","servico","precio","preco","limpieza","limpeza",
+      "brooklyn","brookline","brook","brooks","cambridge","boston","newton",
+      "watertown","somerville","medford","waltham","quincy","dedham",
+      "wellesley","needham","belmont","arlington","repeat","telephone","number",
+      "availability","available","appointment","jp","southie","eastie","westie"];
     const hasSubstantiveContent = words.some(w => substantiveWords.includes(w));
-    
-    console.log(`[SMALL TALK CHECK] Words: ${words.length}, HasSubstantive: ${hasSubstantiveContent}, Greeted: ${ctx.greeted}, Words: [${words.join(", ")}]`);
-    
-    // ONLY respond to greeting if NOT greeted yet AND no other entities detected
-    if (!ctx.greeted && !hasSubstantiveContent && words.length <= 3 && 
-        !city && !serviceType && !name && !dateTime.day && !dateTime.time) {
+    console.log(`[SMALL TALK CHECK] Words: ${words.length}, HasSubstantive: ${hasSubstantiveContent}, Greeted: ${ctx.greeted}`);
+    if (!ctx.greeted && !hasSubstantiveContent && words.length <= 3 &&
+        !city && !serviceType && !dateTime.day && !dateTime.time) {
       if (q.includes("hi") || q.includes("hello") || q.includes("hola") || q === "ola") {
-        console.log(`[SMALL TALK] Triggered greeting`);
-        ctx.greeted = true;
-        return ctx.t("smallTalk").hi;
+        ctx.greeted = true; return ctx.t("smallTalk").hi;
       }
       if (q.includes("how are") || q.includes("como estas") || q.includes("como esta")) {
-        console.log(`[SMALL TALK] Triggered how are you`);
-        ctx.greeted = true;
-        return ctx.t("smallTalk").howAreYou;
+        ctx.greeted = true; return ctx.t("smallTalk").howAreYou;
       }
     }
-    
-    // These can be longer, so check separately (but not if already greeted)
     if (!ctx.greeted) {
       if (q.includes("who are you") || q.includes("quien eres") || q.includes("quem e")) {
-        console.log(`[SMALL TALK] Triggered who are you`);
-        ctx.greeted = true;
-        return ctx.t("smallTalk").whoAreYou;
+        ctx.greeted = true; return ctx.t("smallTalk").whoAreYou;
       }
     }
-    
-    if (q.includes("thank") || q.includes("gracias") || q.includes("obrigad")) {
-      console.log(`[SMALL TALK] Triggered thanks`);
-      return ctx.t("smallTalk").thanks;
-    }
-    if (q.includes("bye") || q.includes("adios") || q.includes("tchau")) {
-      console.log(`[SMALL TALK] Triggered bye`);
-      return ctx.t("smallTalk").bye;
-    }
+    if (q.includes("thank") || q.includes("gracias") || q.includes("obrigad")) return ctx.t("smallTalk").thanks;
+    if (q.includes("bye") || q.includes("adios") || q.includes("tchau")) return ctx.t("smallTalk").bye;
   }
-  
-  // Booking intent - handle variations including "availability"
+
+  // Booking intent
   if (ctx.state === "initial" && (
-      q.includes("book") || q.includes("booking") || q.includes("schedule") || 
+      q.includes("book") || q.includes("booking") || q.includes("schedule") ||
       q.includes("make an appointment") || q.includes("appointment") ||
       q.includes("availability") || q.includes("available") || q.includes("see if you have") ||
       q.includes("reserva") || q.includes("agendar") || q.includes("marcar") ||
@@ -1013,109 +855,88 @@ function routeWithContext(text, ctx) {
       q.includes("i would like to book") || q.includes("i want to book") ||
       q.includes("i want to see") || q.includes("looking for a cleaning")
     )) {
-    console.log(`[ROUTING] Detected booking intent`);
     ctx.state = "booking_flow";
     if (!ctx.data.serviceType) return ctx.t("askServiceType");
   }
-  
-  // Handle affirmative responses to "Would you like to book?" 
-  if (ctx.state === "initial" && 
-      (q.includes("yes") || q.includes("yeah") || q.includes("yep") || q.includes("sure") || 
-       q.includes("that would be great") || q.includes("sounds good") || q.includes("i would") ||
-       q.includes("si") || q.includes("sim") || q.includes("claro"))) {
-    // Check if we previously mentioned booking
-    if (ctx.data.city) {
-      ctx.state = "booking_flow";
-      return ctx.t("askServiceType");
-    }
+
+  // Affirmative to book after coverage reply
+  if (ctx.state === "initial" && (q.includes("yes") || q.includes("yeah") || q.includes("yep") || q.includes("sure") ||
+      q.includes("that would be great") || q.includes("sounds good") || q.includes("i would") ||
+      q.includes("si") || q.includes("sim") || q.includes("claro"))) {
+    if (ctx.data.city) { ctx.state = "booking_flow"; return ctx.t("askServiceType"); }
   }
-  
-  // If initial state with city + serviceType, enter booking flow
+
   if (ctx.state === "initial" && ctx.data.city && ctx.data.serviceType) {
-    console.log(`[ROUTING] Have city + serviceType in initial state, entering booking flow`);
     ctx.state = "booking_flow";
-    // Continue with booking flow logic below
   }
-  
-  // Pricing
+
+  // Pricing requests
   if (q.includes("price") || q.includes("cost") || q.includes("precio") || q.includes("preco") || q.includes("cuanto")) {
     if (ctx.data.estimatedPrice) {
       return `${ctx.t("priceQuote")}${ctx.data.estimatedPrice}. ${lang === "es" ? "¿Te gustaría reservar?" : lang === "pt" ? "Gostaria de reservar?" : "Would you like to book?"}`;
     }
     if (!ctx.data.bedrooms) return ctx.t("askBedrooms");
+    if (!ctx.data.bathrooms && ctx.data.bedrooms !== "Studio") return ctx.t("askBathrooms");
     if (!ctx.data.serviceType) return ctx.t("askServiceType");
   }
-  
+
   // Booking flow
   if (ctx.state === "booking_flow") {
-    // Final confirmation after user says yes
     if ((q.includes("yes") || q.includes("si") || q.includes("sim") || q.includes("sounds good") || q.includes("that's correct")) && ctx.hasAllBookingInfo()) {
       const msg = lang === "es" ? `¡Perfecto! Enviaremos una confirmación a ${ctx.data.phone}. ¿Hay algo más que te gustaría saber?` :
                   lang === "pt" ? `Perfeito! Enviaremos uma confirmação para ${ctx.data.phone}. Há mais alguma coisa que você gostaria de saber?` :
                   `Perfect! We'll send a confirmation to ${ctx.data.phone}. Is there anything else you'd like to know?`;
       return msg;
     }
-    
+
     console.log(`[BOOKING FLOW] Missing: serviceType=${!ctx.data.serviceType}, bedrooms=${!ctx.data.bedrooms}, bathrooms=${!ctx.data.bathrooms}, city=${!ctx.data.city}, date=${!ctx.data.date}, time=${!ctx.data.time}, name=${!ctx.data.name}, phone=${!ctx.data.phone}`);
-    
+
     if (!ctx.data.serviceType) return ctx.t("askServiceType");
     if (!ctx.data.bedrooms) return ctx.t("askBedrooms");
     if (!ctx.data.bathrooms && ctx.data.bedrooms !== "Studio") return ctx.t("askBathrooms");
     if (!ctx.data.city) return ctx.t("askCity");
-    
-    // Calculate price silently (for later use) but don't mention it yet
+
     if (ctx.data.serviceType && ctx.data.bedrooms && !ctx.data.estimatedPrice) {
       ctx.data.estimatedPrice = ctx.calculatePrice();
     }
-    
-    // Handle date/time collection more gracefully
+
     if (!ctx.data.date || !ctx.data.time) {
       if (ctx.data.date && !ctx.data.time) {
-        // We have date but need time
-        console.log(`[BOOKING FLOW] Have date, asking for time only`);
         return lang === "es" ? `Perfecto, ${ctx.data.date}. ¿A qué hora?` :
                lang === "pt" ? `Perfeito, ${ctx.data.date}. A que horas?` :
                `Great, ${ctx.data.date}. What time works for you?`;
       } else if (ctx.data.time && !ctx.data.date) {
-        // We have time but need date
-        console.log(`[BOOKING FLOW] Have time, asking for date only`);
         return lang === "es" ? `Perfecto, a las ${ctx.data.time}. ¿Qué día?` :
                lang === "pt" ? `Perfeito, às ${ctx.data.time}. Que dia?` :
                `Great, at ${ctx.data.time}. What day works for you?`;
       } else {
-        // Missing both
-        console.log(`[BOOKING FLOW] Missing both date and time`);
         return ctx.t("askDateTime");
       }
     }
-    
+
     if (!ctx.data.name) return ctx.t("askName");
     if (!ctx.data.phone) return ctx.t("askPhone");
-    
-    // Final confirmation WITH price
+
     if (ctx.hasAllBookingInfo()) {
       const priceMsg = ctx.data.estimatedPrice ? ` ${lang === "es" ? "por alrededor de" : lang === "pt" ? "por cerca de" : "for about"} $${ctx.data.estimatedPrice}` : "";
       return `${ctx.t("confirmation")} ${ctx.getSummary()}${priceMsg}. ${ctx.t("confirmQuestion")}`;
     }
   }
-  
-  // Fallback: if they keep asking about service/coverage but we haven't detected a city
-  if ((q.includes("service") || q.includes("cover") || q.includes("serve") || q.includes("what about")) && 
+
+  // Service query with no city
+  if ((q.includes("service") || q.includes("cover") || q.includes("serve") || q.includes("what about")) &&
       !city && ctx.state === "initial") {
-    console.log(`[ROUTING] Service query without detected city, asking for clarification`);
     return lang === "es" ? "¿En qué ciudad te encuentras?" :
            lang === "pt" ? "Em que cidade você está?" :
            "What city are you in? We serve the Greater Boston area including Brookline, Cambridge, Somerville, and more.";
   }
-  
-  // Generic fallback
+
   if (ctx.state === "initial") {
-    console.log(`[ROUTING] Generic fallback`);
     return lang === "es" ? "Puedo ayudar con reservas o preguntas sobre nuestros servicios. ¿Qué te gustaría saber?" :
            lang === "pt" ? "Posso ajudar com reservas ou perguntas sobre nossos serviços. O que você gostaria de saber?" :
            "I can help with booking or questions about our services. What would you like to know?";
   }
-  
+
   return lang === "es" ? "¿En qué más puedo ayudarte?" :
          lang === "pt" ? "Em que mais posso ajudá-lo?" :
          "What else can I help you with?";
@@ -1124,12 +945,12 @@ function routeWithContext(text, ctx) {
 // ───────────────────────────────────────────────────────────────────────────────
 // Audio & TTS
 // ───────────────────────────────────────────────────────────────────────────────
-function makeBeepPcm16(ms = 100, hz = 950) {  // Reduced from 180ms to 100ms
+function makeBeepPcm16(ms = 60, hz = 800) { // softer beep
   const samples = Math.floor((SAMPLE_RATE * ms) / 1000);
   const buf = Buffer.alloc(samples * BYTES_PER_SAMPLE_PCM16);
   for (let i = 0; i < samples; i++) {
     const t = i / SAMPLE_RATE;
-    const s = Math.round(0.18 * 32767 * Math.sin(2 * Math.PI * hz * t));
+    const s = Math.round(0.15 * 32767 * Math.sin(2 * Math.PI * hz * t));
     buf.writeInt16LE(s, i * 2);
   }
   return buf;
@@ -1157,7 +978,7 @@ function mulawToLinearSample(u) {
   return sign * sample;
 }
 
-function makeBeepMulaw(ms = 100, hz = 950) {  // Reduced from 180ms to 100ms
+function makeBeepMulaw(ms = 60, hz = 800) {
   const pcm = makeBeepPcm16(ms, hz);
   const out = Buffer.alloc(pcm.length / 2);
   for (let i = 0, j = 0; i < pcm.length; i += 2, j++) {
@@ -1187,9 +1008,7 @@ async function ttsElevenLabsRaw(text, lang = "en") {
     },
     body: JSON.stringify({ text, voice_settings: { stability: 0.4, similarity_boost: 0.7 } }),
   });
-  if (!res.ok) {
-    throw new Error(`ElevenLabs TTS failed: ${res.status} ${res.statusText}`);
-  }
+  if (!res.ok) throw new Error(`ElevenLabs TTS failed: ${res.status} ${res.statusText}`);
   return Buffer.from(await res.arrayBuffer());
 }
 
@@ -1225,27 +1044,8 @@ async function ttsToMulaw(text, lang = "en") {
   ]);
 }
 
-async function streamFrames(ws, raw) {
-  const bytesPerFrame = MEDIA_FORMAT === "mulaw" ? BYTES_PER_FRAME_MULAW : BYTES_PER_FRAME_PCM16;
-  let offset = 0, frames = 0;
-  while (offset < raw.length && ws.readyState === ws.OPEN) {
-    const end = Math.min(offset + bytesPerFrame, raw.length);
-    let frame = raw.slice(offset, end);
-    if (frame.length < bytesPerFrame) {
-      const padded = Buffer.alloc(bytesPerFrame);
-      frame.copy(padded, 0);
-      frame = padded;
-    }
-    ws.send(JSON.stringify({ event: "media", streamSid: ws._streamSid, media: { payload: frame.toString("base64") } }));
-    frames++;
-    if (frames % 100 === 0) console.log(`[TTS] sent ${frames} frames`);
-    await new Promise(r => setTimeout(r, FRAME_MS));
-    offset += bytesPerFrame;
-  }
-}
-
 // ───────────────────────────────────────────────────────────────────────────────
-// Deepgram with multi-language
+// Deepgram with multi-language + phonecall model + keyword boosts
 // ───────────────────────────────────────────────────────────────────────────────
 function connectDeepgram(onFinal, onAnyTranscript, lang = "en") {
   if (!DG_KEY) {
@@ -1253,7 +1053,12 @@ function connectDeepgram(onFinal, onAnyTranscript, lang = "en") {
     return null;
   }
   const langCode = lang === "es" ? "es" : lang === "pt" ? "pt" : "en-US";
-  const url = `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&punctuate=true&language=${langCode}`;
+  const cityKeywords = [...SERVICE_AREAS, ...Object.keys(CITY_ALIASES)].map(c => `${c}:2`);
+  const url =
+    `wss://api.deepgram.com/v1/listen` +
+    `?model=phonecall&encoding=linear16&sample_rate=8000&channels=1&punctuate=true&language=${langCode}` +
+    `&keywords=${encodeURIComponent(cityKeywords.join(','))}`;
+
   const dg = new WebSocket(url, { headers: { Authorization: `Token ${DG_KEY}` } });
 
   let lastPartial = "";
@@ -1307,15 +1112,44 @@ function connectDeepgram(onFinal, onAnyTranscript, lang = "en") {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// WebSocket
+// WebSocket + TTS streaming with real barge-in
 // ───────────────────────────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ noServer: true });
+
+async function streamFrames(ws, raw) {
+  const bytesPerFrame = MEDIA_FORMAT === "mulaw" ? BYTES_PER_FRAME_MULAW : BYTES_PER_FRAME_PCM16;
+  let offset = 0, frames = 0;
+  while (offset < raw.length && ws.readyState === ws.OPEN) {
+    // stop if caller starts speaking
+    if (ws._bargeIn) {
+      console.log("[TTS] barge-in: stopping stream");
+      break;
+    }
+    const end = Math.min(offset + bytesPerFrame, raw.length);
+    let frame = raw.slice(offset, end);
+    if (frame.length < bytesPerFrame) {
+      const padded = Buffer.alloc(bytesPerFrame);
+      frame.copy(padded, 0);
+      frame = padded;
+    }
+    ws.send(JSON.stringify({
+      event: "media",
+      streamSid: ws._streamSid,
+      media: { payload: frame.toString("base64") }
+    }));
+    frames++;
+    if (frames % 100 === 0) console.log(`[TTS] sent ${frames} frames`);
+    await new Promise(r => setTimeout(r, FRAME_MS));
+    offset += bytesPerFrame;
+  }
+}
 
 wss.on("connection", (ws) => {
   console.log("🔗 WebSocket connected");
   ws._rx = 0;
   ws._speaking = false;
-  ws._graceUntil = 0; // Grace period to prevent barge-in
+  ws._graceUntil = 0;
+  ws._bargeIn = false;
   ws._ctx = new ConversationContext();
   ws._dgConnection = null;
 
@@ -1323,9 +1157,7 @@ wss.on("connection", (ws) => {
   const resetNoInputTimer = () => {
     if (noInputTimer) clearTimeout(noInputTimer);
     noInputTimer = setTimeout(async () => {
-      // Don't reprompt if in grace period or speaking
       if (ws._speaking || Date.now() < ws._graceUntil) return;
-      
       ws._speaking = true;
       try {
         const prompt = ws._ctx.t("stillThere");
@@ -1341,29 +1173,36 @@ wss.on("connection", (ws) => {
     }, NO_INPUT_REPROMPT_MS);
   };
 
+  const onAnyTranscript = () => {
+    // Any audio while we're speaking should trigger a barge-in
+    if (ws._speaking && Date.now() >= ws._graceUntil) {
+      ws._bargeIn = true;
+    }
+    resetNoInputTimer();
+  };
+
   const handleFinal = async (finalText) => {
-    // Don't process during grace period (agent just finished speaking)
     if (Date.now() < ws._graceUntil) {
       console.log("[GRACE] Ignoring input during grace period");
       return;
     }
-    
     if (ws._speaking) return;
-    
-    // If language just detected, reconnect Deepgram
+
+    // Language detect on first user speech
     if (!ws._ctx.language) {
       ws._ctx.language = detectLanguage(finalText);
       console.log(`[LANG] Switching to ${ws._ctx.language}`);
       if (ws._dgConnection) ws._dgConnection.close();
-      ws._dgConnection = connectDeepgram(handleFinal, () => resetNoInputTimer(), ws._ctx.language);
+      ws._dgConnection = connectDeepgram(handleFinal, onAnyTranscript, ws._ctx.language);
     }
-    
+
     console.log(`[USER] "${finalText}"`);
     const reply = routeWithContext(finalText, ws._ctx);
     console.log(`[BOT] "${reply}"`);
     console.log(`[CONTEXT] ${JSON.stringify(ws._ctx.data)}`);
-    
+
     ws._speaking = true;
+    ws._bargeIn = false; // reset before we speak
     try {
       const out = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(reply, ws._ctx.language) : await ttsToPcm16(reply, ws._ctx.language);
       await streamFrames(ws, out);
@@ -1371,13 +1210,14 @@ wss.on("connection", (ws) => {
       console.error("[TTS] reply failed:", e.message);
     } finally {
       ws._speaking = false;
-      ws._graceUntil = Date.now() + POST_TTS_GRACE_MS; // Set grace period after speaking
+      ws._graceUntil = Date.now() + POST_TTS_GRACE_MS;
+      ws._bargeIn = false;
       console.log(`[GRACE] Set until ${new Date(ws._graceUntil).toISOString()}`);
       resetNoInputTimer();
     }
   };
 
-  ws._dgConnection = connectDeepgram(handleFinal, () => resetNoInputTimer());
+  ws._dgConnection = connectDeepgram(handleFinal, onAnyTranscript);
 
   ws.on("message", async (data) => {
     let msg;
@@ -1391,15 +1231,16 @@ wss.on("connection", (ws) => {
       ws._streamSid = msg.start?.streamSid;
       console.log(`[WS] START callSid=${msg.start?.callSid}`);
 
+      // Optional beep (short/soft). Comment out these two lines to disable entirely.
       if (MEDIA_FORMAT === "mulaw") await streamFrames(ws, makeBeepMulaw());
       else await streamFrames(ws, makeBeepPcm16());
 
       try {
-        const text = "Hi! I'm your AI receptionist at Clean Easy. How can I help you?";
-        const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text) : await ttsToPcm16(text);
+        const text = ws._ctx.t("greeting");
+        const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text, ws._ctx.language) : await ttsToPcm16(text, ws._ctx.language);
         await streamFrames(ws, buf);
-        ws._ctx.greeted = true; // Mark initial greeting as done
-        ws._graceUntil = Date.now() + POST_TTS_GRACE_MS; // Grace period after greeting
+        ws._ctx.greeted = true;
+        ws._graceUntil = Date.now() + POST_TTS_GRACE_MS;
         console.log(`[GRACE] Set after greeting until ${new Date(ws._graceUntil).toISOString()}`);
       } catch (e) {
         console.error("[TTS] greeting failed:", e.message);
@@ -1410,8 +1251,11 @@ wss.on("connection", (ws) => {
 
     if (msg.event === "media") {
       ws._rx++;
-      // Only send to Deepgram if not speaking and not in grace period
-      if (ws._dgConnection && ws._dgConnection.readyState === ws._dgConnection.OPEN && 
+      // if user audio arrives while we're speaking (and not in grace), trigger barge-in immediately
+      if (ws._speaking && Date.now() >= ws._graceUntil) {
+        ws._bargeIn = true;
+      }
+      if (ws._dgConnection && ws._dgConnection.readyState === ws._dgConnection.OPEN &&
           !ws._speaking && Date.now() >= ws._graceUntil) {
         const b = Buffer.from(msg.media.payload, "base64");
         const pcm16 = inboundToPCM16(b);
@@ -1437,6 +1281,7 @@ wss.on("connection", (ws) => {
 // HTTP
 // ───────────────────────────────────────────────────────────────────────────────
 app.get("/", (_req, res) => res.status(200).send("OK"));
+
 app.get("/debug/say", async (req, res) => {
   try {
     const text = (req.query.text || "This is a test.").toString();
