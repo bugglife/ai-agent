@@ -400,10 +400,10 @@ function extractName(text) {
     return null;
   }
   
-  // Don't extract common objects as names
-  const commonObjects = ["faucet", "sink", "toilet", "shower", "bath", "door", "window", "floor", "wall"];
+  // Don't extract common objects or phrases as names
+  const commonObjects = ["faucet", "sink", "toilet", "shower", "bath", "door", "window", "floor", "wall", "looking for", "thinking about"];
   if (commonObjects.includes(normalized)) {
-    console.log(`[EXTRACT] Rejected common object as name: ${text}`);
+    console.log(`[EXTRACT] Rejected common object/phrase as name: ${text}`);
     return null;
   }
   
@@ -415,8 +415,8 @@ function extractName(text) {
     const m = text.match(p);
     if (m) {
       const name = m[1];
-      // Double check it's not a service word or common object
-      if (!serviceWords.includes(name.toLowerCase()) && !commonObjects.includes(name.toLowerCase())) {
+      // Double check it's not a service word, common object, or phrase
+      if (!serviceWords.includes(name.toLowerCase()) && !commonObjects.some(obj => name.toLowerCase().includes(obj))) {
         console.log(`[EXTRACT] Name: ${name}`);
         return name;
       }
@@ -522,7 +522,17 @@ function extractDateTime(text) {
     return { day, time };
   }
   
-  // Pattern 2: "at four", "at 4", "at four PM", "thinking thursday at four"
+  // Pattern 2: Word number with AM/PM (without "at"): "four PM", "twelve AM"
+  m = text.match(/\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(am|pm|a\.m\.|p\.m\.)/i);
+  if (m) {
+    let hour = timeWords[m[1].toLowerCase()] || m[1];
+    let period = m[2];
+    time = `${hour} ${period}`;
+    console.log(`[EXTRACT] Time (word + AM/PM): ${time}`);
+    return { day, time };
+  }
+  
+  // Pattern 3: "at four", "at 4", "at four PM", "thinking thursday at four"
   m = text.match(/(?:at|on)\s+(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d{1,2})(?:\s*(am|pm|a\.m\.|p\.m\.))?/i);
   if (m) {
     let hour = timeWords[m[1].toLowerCase()] || m[1];
@@ -532,7 +542,7 @@ function extractDateTime(text) {
     return { day, time };
   }
   
-  // Pattern 3: Just a number in time context (e.g., "Thursday four")
+  // Pattern 4: Just a number in time context (e.g., "Thursday four")
   if (day) {
     m = q.match(/\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d{1,2})\b/);
     if (m && !["monday","tuesday","wednesday","thursday","friday","saturday","sunday"].includes(m[1])) {
@@ -542,7 +552,7 @@ function extractDateTime(text) {
     }
   }
   
-  // Pattern 4: "morning", "afternoon", "evening"
+  // Pattern 5: "morning", "afternoon", "evening"
   m = text.match(/(morning|afternoon|evening|noon)/i);
   if (m) {
     time = m[0];
@@ -550,7 +560,7 @@ function extractDateTime(text) {
     return { day, time };
   }
   
-  // Pattern 5: "o'clock"
+  // Pattern 6: "o'clock"
   m = text.match(/(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(o'?clock|oclock)/i);
   if (m) {
     let hour = timeWords[m[1].toLowerCase()] || m[1];
@@ -762,9 +772,10 @@ function routeWithContext(text, ctx) {
   
   const lang = ctx.language;
   
-  // Extract entities
-  const name = extractName(text);
+  // Extract entities - ORDER MATTERS!
+  // Extract date/time FIRST before phone extraction to avoid conflicts
   const dateTime = extractDateTime(text);
+  const name = extractName(text);
   const serviceType = extractServiceType(text, lang);
   const city = findCityInText(text);
   
@@ -773,8 +784,21 @@ function routeWithContext(text, ctx) {
   let bathrooms = null;
   let phone = null;
   
+  // Save date/time FIRST (before phone logic interferes)
+  if (dateTime.day && !ctx.data.date) {
+    ctx.data.date = dateTime.day;
+    ctx.lastExtraction = "date";
+    console.log(`[DATA] Set date: ${dateTime.day}`);
+  }
+  if (dateTime.time && !ctx.data.time) {
+    ctx.data.time = dateTime.time;
+    ctx.lastExtraction = "time";
+    console.log(`[DATA] Set time: ${dateTime.time}`);
+  }
+  
   // If we're in booking flow and missing phone, try to accumulate phone digits
-  if (ctx.state === "booking_flow" && !ctx.data.phone && ctx.data.name) {
+  // BUT only if we didn't just extract a time (to avoid "4 PM" becoming phone digits)
+  if (ctx.state === "booking_flow" && !ctx.data.phone && ctx.data.name && !dateTime.time) {
     // We just asked for phone - try to extract it or accumulate partial
     phone = extractPhone(text);
     if (!phone) {
@@ -813,16 +837,6 @@ function routeWithContext(text, ctx) {
     ctx.data.phone = phone;
     ctx.lastExtraction = "phone";
   }
-  if (dateTime.day && !ctx.data.date) {
-    ctx.data.date = dateTime.day;
-    ctx.lastExtraction = "date";
-    console.log(`[DATA] Set date: ${dateTime.day}`);
-  }
-  if (dateTime.time && !ctx.data.time) {
-    ctx.data.time = dateTime.time;
-    ctx.lastExtraction = "time";
-    console.log(`[DATA] Set time: ${dateTime.time}`);
-  }
   if (bedrooms && !ctx.data.bedrooms) {
     ctx.data.bedrooms = bedrooms;
     ctx.lastExtraction = "bedrooms";
@@ -855,10 +869,22 @@ function routeWithContext(text, ctx) {
         console.log(`[ROUTING] Confirming service area: ${city.city}`);
         return `${ctx.t("coverCity")} ${city.city} ${ctx.t("andSurrounding")}`;
       }
-      // Otherwise just note the city for booking flow
+      // Otherwise note the city and enter booking flow if there's booking intent
       if (ctx.state !== "booking_flow") {
-        console.log(`[ROUTING] City mentioned, asking about service type`);
-        return `${ctx.t("coverCity")} ${city.city}! ${lang === "es" ? "¿Qué tipo de limpieza te interesa?" : lang === "pt" ? "Que tipo de limpeza você gostaria?" : "What type of cleaning are you interested in—standard, deep, move-out, or Airbnb?"}`;
+        // Check if there's booking intent in the query
+        const hasBookingIntent = q.includes("book") || q.includes("booking") || q.includes("schedule") || 
+                                q.includes("appointment") || q.includes("availability") || q.includes("available") ||
+                                q.includes("reserva") || q.includes("agendar") || q.includes("marcar") ||
+                                q.includes("i would like") || q.includes("i want to");
+        
+        if (hasBookingIntent) {
+          console.log(`[ROUTING] City + booking intent, entering booking flow`);
+          ctx.state = "booking_flow";
+          return `${ctx.t("coverCity")} ${city.city}! ${ctx.t("askServiceType")}`;
+        } else {
+          console.log(`[ROUTING] City mentioned, asking about service type`);
+          return `${ctx.t("coverCity")} ${city.city}! ${lang === "es" ? "¿Qué tipo de limpieza te interesa?" : lang === "pt" ? "Que tipo de limpeza você gostaria?" : "What type of cleaning are you interested in—standard, deep, move-out, or Airbnb?"}`;
+        }
       }
     } else if (city.isQuery) {
       // Unknown city but they're asking about coverage
@@ -985,7 +1011,7 @@ function routeWithContext(text, ctx) {
       q.includes("reserva") || q.includes("agendar") || q.includes("marcar") ||
       q.includes("disponibilidad") || q.includes("disponibilidade") ||
       q.includes("i would like to book") || q.includes("i want to book") ||
-      q.includes("i want to see")
+      q.includes("i want to see") || q.includes("looking for a cleaning")
     )) {
     console.log(`[ROUTING] Detected booking intent`);
     ctx.state = "booking_flow";
@@ -1002,6 +1028,13 @@ function routeWithContext(text, ctx) {
       ctx.state = "booking_flow";
       return ctx.t("askServiceType");
     }
+  }
+  
+  // If initial state with city + serviceType, enter booking flow
+  if (ctx.state === "initial" && ctx.data.city && ctx.data.serviceType) {
+    console.log(`[ROUTING] Have city + serviceType in initial state, entering booking flow`);
+    ctx.state = "booking_flow";
+    // Continue with booking flow logic below
   }
   
   // Pricing
