@@ -595,7 +595,7 @@ function extractDateTime(textRaw) {
   if (m) {
     let hour = timeWords[m[1].toLowerCase()] || m[1];
     time = `${hour} o'clock";
-    console.log(`[EXTRACT] Time (o'clock): ${time}`);
+    console.log("[EXTRACT] Time (o'clock): " + time);
     return { day, time };
   }
   
