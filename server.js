@@ -15,9 +15,22 @@ const ELEVEN_VOICE_ID_EN = process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL"
 const ELEVEN_VOICE_ID_ES = process.env.ELEVEN_VOICE_ID_ES || "VR6AewLTigWG4xSOukaG"; // Spanish
 const ELEVEN_VOICE_ID_PT = process.env.ELEVEN_VOICE_ID_PT || "yoZ06aMxZJJ28mfd3POQ"; // Portuguese
 const DG_KEY = process.env.DEEPGRAM_API_KEY || "";
-
 const MEDIA_FORMAT = (process.env.TWILIO_MEDIA_FORMAT || "pcm16").toLowerCase();
-if (!ELEVEN_API_KEY) console.error("❌ ELEVEN_API_KEY is not set");
+
+// SECURITY: Shared secret required to open a WS connection
+const AGENT_TOKEN = process.env.AGENT_TOKEN;
+
+// SECURITY: global limits
+const MAX_TTS_TEXT = 500;           // characters
+const MAX_AUDIO_INPUT_BYTES = 7_000_000;
+const FFMPEG_TIMEOUT_MS = 15_000;   // bail if ffmpeg hangs
+const MAX_WS_PER_IP = 10;           // concurrent sockets per IP
+const MAX_DG_PER_SOCKET = 1;        // only 1 Deepgram connection per WS
+const SESSION_IDLE_MS = 60_000;     // drop truly idle sessions
+
+if (!ELEVEN_API_KEY) { console.error("❌ Missing ELEVEN_API_KEY"); process.exit(1); }
+if (!AGENT_TOKEN)     { console.error("❌ Missing AGENT_TOKEN");   process.exit(1); }
+
 if (!["pcm16", "mulaw"].includes(MEDIA_FORMAT)) {
   console.warn(`⚠️ Unknown TWILIO_MEDIA_FORMAT='${MEDIA_FORMAT}', defaulting to pcm16`);
 }
@@ -28,10 +41,12 @@ const BYTES_PER_SAMPLE_PCM16 = 2;
 const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS;
 const BYTES_PER_FRAME_PCM16 = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE_PCM16;
 const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1;
-
 const ASR_PARTIAL_PROMOTE_MS = 1200;
 const NO_INPUT_REPROMPT_MS = 7000;
 const POST_TTS_GRACE_MS = 800; // Reduced - just enough to prevent echo
+
+// Rate limiting state
+const ipSessionCounts = new Map(); // ip -> count
 
 // ───────────────────────────────────────────────────────────────────────────────
 // SERVICE AREAS & PRICING
@@ -40,7 +55,6 @@ const SERVICE_AREAS = [
   "Boston","Cambridge","Somerville","Brookline","Newton","Watertown","Arlington",
   "Belmont","Medford","Waltham","Needham","Wellesley","Dedham","Quincy"
 ];
-
 // Common STT errors / phonetic variations + neighborhood nicknames
 const CITY_ALIASES = {
   // Brookline variations
@@ -126,7 +140,6 @@ const CITY_ALIASES = {
   "southend": "Boston",
   "backbay": "Boston",
 };
-
 // Your actual pricing matrix: bedroom-bathroom combos
 const PRICING_MATRIX = {
   standard: {
@@ -154,7 +167,6 @@ const PRICING_MATRIX = {
     "5+-1": 485, "5+-2": 495, "5+-3": 515, "5+-4": 515, "5+-5+": 535,
   },
 };
-
 const FREQUENCY_DISCOUNTS = {
   weekly: 0.15,
   biweekly: 0.12,
@@ -162,89 +174,27 @@ const FREQUENCY_DISCOUNTS = {
   onetime: 0,
 };
 
-function normalize(s) {
-  return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+// ───────────────────────────────────────────────────────────────────────────────
+// Sanitization helpers
+// ───────────────────────────────────────────────────────────────────────────────
+function stripInvisibles(s) {
+  // zero-width chars, BOM, word joiner, Mongolian vowel sep
+  return String(s || "").replace(/[\u200B\u200C\u200D\uFEFF\u2060\u180E]/g, "");
 }
-
-function findCityInText(text) {
-  const q = normalize(text);
-  
-  // Check if question is about service area
-  const isServiceAreaQuery = q.includes("service") || q.includes("cover") || 
-                             q.includes("serve") || q.includes("area") || q.includes("clean") ||
-                             q.includes("servicio") || q.includes("servico") ||
-                             q.includes("atiende") || q.includes("atende") ||
-                             q.includes("do you") || q.includes("can you");
-  
-  console.log(`[CITY DETECTION] Query: "${text}" | isServiceAreaQuery: ${isServiceAreaQuery}`);
-  
-  // First, check for exact matches in known cities
-  for (const city of SERVICE_AREAS) {
-    const cityNorm = city.toLowerCase();
-    const regex = new RegExp(`\\b${cityNorm}\\b`, "i");
-    if (regex.test(text)) {
-      console.log(`[CITY] Found exact match: ${city}`);
-      return { city, known: true, isQuery: isServiceAreaQuery };
-    }
-  }
-  
-  // Check for phonetic aliases (STT often mishears city names)
-  for (const [alias, realCity] of Object.entries(CITY_ALIASES)) {
-    const regex = new RegExp(`\\b${alias}\\b`, "i");
-    if (regex.test(q)) {
-      console.log(`[CITY] Found via alias '${alias}' → ${realCity}`);
-      return { city: realCity, known: true, isQuery: isServiceAreaQuery };
-    }
-  }
-  
-  // If it's a service area query but city not found, try to extract city name from common patterns
-  if (isServiceAreaQuery) {
-    // More robust pattern that skips articles
-    // "in Brookline", "in the town of Brookline", "to Brookline", etc.
-    const cityPatterns = [
-      /(?:in|at|to|of)\s+(?:the\s+)?(?:town\s+of\s+|city\s+of\s+|area\s+of\s+)?([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)/gi,
-      /(?:town|city|area)\s+of\s+(?:the\s+)?([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)/gi,
-    ];
-    
-    for (const pattern of cityPatterns) {
-      let match;
-      while ((match = pattern.exec(text)) !== null) {
-        const extractedCity = match[1];
-        
-        // Skip common words that aren't cities
-        const skipWords = ["the", "town", "city", "area", "this", "that"];
-        if (skipWords.includes(extractedCity.toLowerCase())) {
-          console.log(`[CITY] Skipped non-city word: ${extractedCity}`);
-          continue;
-        }
-        
-        console.log(`[CITY] Extracted from pattern: ${extractedCity}`);
-        
-        // Double-check if this extracted city is in our known list
-        const knownCity = SERVICE_AREAS.find(c => c.toLowerCase() === extractedCity.toLowerCase());
-        if (knownCity) {
-          console.log(`[CITY] Matched to known city: ${knownCity}`);
-          return { city: knownCity, known: true, isQuery: true };
-        }
-        
-        // Check aliases too
-        const aliasMatch = CITY_ALIASES[extractedCity.toLowerCase()];
-        if (aliasMatch) {
-          console.log(`[CITY] Matched via alias: ${extractedCity} → ${aliasMatch}`);
-          return { city: aliasMatch, known: true, isQuery: true };
-        }
-        
-        // If not in our list, return as unknown (only if 3+ chars to avoid garbage)
-        if (extractedCity.length >= 3) {
-          console.log(`[CITY] Not in service area: ${extractedCity}`);
-          return { city: extractedCity, known: false, isQuery: true };
-        }
-      }
-    }
-  }
-  
-  console.log(`[CITY] No city found in query`);
-  return null;
+function sanitizeUserText(s) {
+  s = String(s || "");
+  s = s.normalize("NFKC");
+  s = stripInvisibles(s);
+  // soft limit; trim, don’t throw for ASR text
+  if (s.length > 2000) s = s.slice(0, 2000);
+  return s;
+}
+// safer logging (no newlines; cap)
+function safeLog(s) {
+  return String(s).replace(/[\r\n]/g, " ").slice(0, 300);
+}
+function normalize(s) {
+  return stripInvisibles(s).toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -263,7 +213,6 @@ function detectLanguage(text) {
   
   return "en";
 }
-
 const TRANSLATIONS = {
   en: {
     greeting: "Hi! I'm your AI receptionist at Clean Easy. How can I help you?",
@@ -378,10 +327,91 @@ const TRANSLATIONS = {
 // ───────────────────────────────────────────────────────────────────────────────
 // ENTITY EXTRACTION (multilingual)
 // ───────────────────────────────────────────────────────────────────────────────
-function extractName(text) {
+function findCityInText(textRaw) {
+  const text = sanitizeUserText(textRaw);
+  const q = normalize(text);
+  
+  // Check if question is about service area
+  const isServiceAreaQuery = q.includes("service") || q.includes("cover") || 
+                             q.includes("serve") || q.includes("area") || q.includes("clean") ||
+                             q.includes("servicio") || q.includes("servico") ||
+                             q.includes("atiende") || q.includes("atende") ||
+                             q.includes("do you") || q.includes("can you");
+  
+  console.log(`[CITY DETECTION] Query: "${safeLog(text)}" | isServiceAreaQuery: ${isServiceAreaQuery}`);
+  
+  // First, check for exact matches in known cities
+  for (const city of SERVICE_AREAS) {
+    const cityNorm = city.toLowerCase();
+    const regex = new RegExp(`\\b${cityNorm}\\b`, "i");
+    if (regex.test(text)) {
+      console.log(`[CITY] Found exact match: ${city}`);
+      return { city, known: true, isQuery: isServiceAreaQuery };
+    }
+  }
+  
+  // Check for phonetic aliases (STT often mishears city names)
+  for (const [alias, realCity] of Object.entries(CITY_ALIASES)) {
+    const regex = new RegExp(`\\b${alias}\\b`, "i");
+    if (regex.test(q)) {
+      console.log(`[CITY] Found via alias '${alias}' → ${realCity}`);
+      return { city: realCity, known: true, isQuery: isServiceAreaQuery };
+    }
+  }
+  
+  // If it's a service area query but city not found, try to extract city name from common patterns
+  if (isServiceAreaQuery) {
+    // More robust pattern that skips articles
+    const cityPatterns = [
+      /(?:in|at|to|of)\s+(?:the\s+)?(?:town\s+of\s+|city\s+of\s+|area\s+of\s+)?([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)/gi,
+      /(?:town|city|area)\s+of\s+(?:the\s+)?([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)/gi,
+    ];
+    
+    for (const pattern of cityPatterns) {
+      let match;
+      while ((match = pattern.exec(text)) !== null) {
+        const extractedCity = match[1];
+        
+        // Skip common words that aren't cities
+        const skipWords = ["the", "town", "city", "area", "this", "that"];
+        if (skipWords.includes(extractedCity.toLowerCase())) {
+          console.log(`[CITY] Skipped non-city word: ${extractedCity}`);
+          continue;
+        }
+        
+        console.log(`[CITY] Extracted from pattern: ${extractedCity}`);
+        
+        // Double-check if this extracted city is in our known list
+        const knownCity = SERVICE_AREAS.find(c => c.toLowerCase() === extractedCity.toLowerCase());
+        if (knownCity) {
+          console.log(`[CITY] Matched to known city: ${knownCity}`);
+          return { city: knownCity, known: true, isQuery: true };
+        }
+        
+        // Check aliases too
+        const aliasMatch = CITY_ALIASES[extractedCity.toLowerCase()];
+        if (aliasMatch) {
+          console.log(`[CITY] Matched via alias: ${extractedCity} → ${aliasMatch}`);
+          return { city: aliasMatch, known: true, isQuery: true };
+        }
+        
+        // If not in our list, return as unknown (only if 3+ chars to avoid garbage)
+        if (extractedCity.length >= 3) {
+          console.log(`[CITY] Not in service area: ${extractedCity}`);
+          return { city: extractedCity, known: false, isQuery: true };
+        }
+      }
+    }
+  }
+  
+  console.log(`[CITY] No city found in query`);
+  return null;
+}
+function extractName(textRaw) {
+  const text = sanitizeUserText(textRaw);
   // Don't extract numbers as names
   if (/^\d+$/.test(text.trim())) {
-    console.log(`[EXTRACT] Rejected number as name: ${text}`);
+    console.log(`[EXTRACT] Rejected number as name: ${safeLog(text)}`);
     return null;
   }
   
@@ -389,21 +419,21 @@ function extractName(text) {
   const numberWords = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
   const normalized = normalize(text);
   if (numberWords.includes(normalized)) {
-    console.log(`[EXTRACT] Rejected number word as name: ${text}`);
+    console.log(`[EXTRACT] Rejected number word as name: ${safeLog(text)}`);
     return null;
   }
   
   // Don't extract service types as names
   const serviceWords = ["standard", "deep", "airbnb", "moveout", "move-out", "turnover"];
   if (serviceWords.includes(normalized)) {
-    console.log(`[EXTRACT] Rejected service type as name: ${text}`);
+    console.log(`[EXTRACT] Rejected service type as name: ${safeLog(text)}`);
     return null;
   }
   
   // Don't extract common objects or phrases as names
   const commonObjects = ["faucet", "sink", "toilet", "shower", "bath", "door", "window", "floor", "wall", "looking for", "thinking about"];
   if (commonObjects.includes(normalized)) {
-    console.log(`[EXTRACT] Rejected common object/phrase as name: ${text}`);
+    console.log(`[EXTRACT] Rejected common object/phrase as name: ${safeLog(text)}`);
     return null;
   }
   
@@ -424,8 +454,8 @@ function extractName(text) {
   }
   return null;
 }
-
-function extractPhoneDigits(text) {
+function extractPhoneDigits(textRaw) {
+  const text = sanitizeUserText(textRaw);
   const q = normalize(text);
   const digitWords = {
     "zero": "0", "oh": "0", "o": "0",
@@ -445,11 +475,11 @@ function extractPhoneDigits(text) {
     }
   }
   
-  console.log(`[PHONE DIGITS] Extracted "${digits}" from "${text}"`);
+  console.log(`[PHONE DIGITS] Extracted "${digits}" from "${safeLog(text)}"`);
   return digits;
 }
-
-function extractPhone(text) {
+function extractPhone(textRaw) {
+  const text = sanitizeUserText(textRaw);
   const q = normalize(text);
   
   // Pattern 1: Standard formats (617-555-1234, 617.555.1234, 6175551234)
@@ -480,10 +510,10 @@ function extractPhone(text) {
   
   return null;
 }
-
-function extractDateTime(text) {
+function extractDateTime(textRaw) {
+  const text = sanitizeUserText(textRaw);
   const q = normalize(text);
-  console.log(`[EXTRACT DateTime] Input: "${text}" → Normalized: "${q}"`);
+  console.log(`[EXTRACT DateTime] Input: "${safeLog(text)}" → Normalized: "${safeLog(q)}"`);
   let day = null, time = null;
   
   const daysEn = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday","tomorrow","today"];
@@ -564,15 +594,15 @@ function extractDateTime(text) {
   m = text.match(/(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(o'?clock|oclock)/i);
   if (m) {
     let hour = timeWords[m[1].toLowerCase()] || m[1];
-    time = `${hour} o'clock`;
+    time = `${hour} o'clock";
     console.log(`[EXTRACT] Time (o'clock): ${time}`);
     return { day, time };
   }
   
   return { day, time };
 }
-
-function extractBedrooms(text) {
+function extractBedrooms(textRaw) {
+  const text = sanitizeUserText(textRaw);
   const q = normalize(text);
   
   // REJECT filler words that might be misheard as numbers
@@ -630,8 +660,8 @@ function extractBedrooms(text) {
   
   return null;
 }
-
-function extractBathrooms(text) {
+function extractBathrooms(textRaw) {
+  const text = sanitizeUserText(textRaw);
   const q = normalize(text);
   
   const numberWords = {
@@ -668,8 +698,8 @@ function extractBathrooms(text) {
   
   return null;
 }
-
-function extractServiceType(text, lang) {
+function extractServiceType(textRaw, lang) {
+  const text = sanitizeUserText(textRaw);
   const q = normalize(text);
   if (lang === "en") {
     if (q.includes("deep") || q.includes("thorough")) return "deep";
@@ -760,9 +790,10 @@ class ConversationContext {
 // ───────────────────────────────────────────────────────────────────────────────
 // INTELLIGENT ROUTER
 // ───────────────────────────────────────────────────────────────────────────────
-function routeWithContext(text, ctx) {
+function routeWithContext(textRaw, ctx) {
+  const text = sanitizeUserText(textRaw);
   const q = normalize(text);
-  console.log(`[ROUTE] Input: "${text}" → Normalized: "${q}"`);
+  console.log(`[ROUTE] Input: "${safeLog(text)}" → Normalized: "${safeLog(q)}"`);
   
   // Detect language on first turn
   if (!ctx.language) {
@@ -949,7 +980,7 @@ function routeWithContext(text, ctx) {
     
     // Only answer with services KB if NOT a service area query
     // Use the city detection result if available, otherwise check patterns
-    const isServiceAreaQuery = city?.isQuery || 
+    const isServiceAreaQuery = (city && city.isQuery) || 
                                (q.includes("do you service") || q.includes("do you serve") || 
                                 q.includes("can you service") || q.includes("do you cover") ||
                                 q.includes("can you clean"));
@@ -970,11 +1001,11 @@ function routeWithContext(text, ctx) {
     // Check if this is ONLY small talk (short message with no other content)
     const words = q.split(" ").filter(w => w.length > 0);
     const substantiveWords = ["service", "serve", "cover", "book", "price", "cost", "clean", "hour", 
-                             "servicio", "servico", "precio", "preco", "limpieza", "limpeza",
-                             "brooklyn", "brookline", "brook", "brooks", "cambridge", "boston", "newton",
-                             "watertown", "somerville", "medford", "waltham", "quincy", "dedham",
-                             "wellesley", "needham", "belmont", "arlington", "repeat", "telephone", "number",
-                             "availability", "available", "appointment", "jp", "southie", "eastie", "westie"];
+                              "servicio", "servico", "precio", "preco", "limpieza", "limpeza",
+                              "brooklyn", "brookline", "brook", "brooks", "cambridge", "boston", "newton",
+                              "watertown", "somerville", "medford", "waltham", "quincy", "dedham",
+                              "wellesley", "needham", "belmont", "arlington", "repeat", "telephone", "number",
+                              "availability", "available", "appointment", "jp", "southie", "eastie", "westie"];
     const hasSubstantiveContent = words.some(w => substantiveWords.includes(w));
     
     console.log(`[SMALL TALK CHECK] Words: ${words.length}, HasSubstantive: ${hasSubstantiveContent}, Greeted: ${ctx.greeted}, Words: [${words.join(", ")}]`);
@@ -1132,7 +1163,7 @@ function routeWithContext(text, ctx) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Audio & TTS
+// Audio & TTS (hardened)
 // ───────────────────────────────────────────────────────────────────────────────
 function makeBeepPcm16(ms = 100, hz = 950) {  // Reduced from 180ms to 100ms
   const samples = Math.floor((SAMPLE_RATE * ms) / 1000);
@@ -1144,7 +1175,6 @@ function makeBeepPcm16(ms = 100, hz = 950) {  // Reduced from 180ms to 100ms
   }
   return buf;
 }
-
 function linearToMulawSample(s) {
   const BIAS = 0x84, CLIP = 32635;
   let sign = (s >> 8) & 0x80;
@@ -1156,7 +1186,6 @@ function linearToMulawSample(s) {
   const mantissa = (s >> (exponent + 3)) & 0x0f;
   return (~(sign | (exponent << 4) | mantissa)) & 0xff;
 }
-
 function mulawToLinearSample(u) {
   u = ~u & 0xff;
   const sign = (u & 0x80) ? -1 : 1;
@@ -1166,7 +1195,6 @@ function mulawToLinearSample(u) {
   sample -= 0x84;
   return sign * sample;
 }
-
 function makeBeepMulaw(ms = 100, hz = 950) {  // Reduced from 180ms to 100ms
   const pcm = makeBeepPcm16(ms, hz);
   const out = Buffer.alloc(pcm.length / 2);
@@ -1175,7 +1203,6 @@ function makeBeepMulaw(ms = 100, hz = 950) {  // Reduced from 180ms to 100ms
   }
   return out;
 }
-
 function inboundToPCM16(buf) {
   if (MEDIA_FORMAT === "pcm16") return buf;
   const out = Buffer.alloc(buf.length * 2);
@@ -1185,7 +1212,16 @@ function inboundToPCM16(buf) {
   return out;
 }
 
-async function ttsElevenLabsRaw(text, lang = "en") {
+function assertTtsTextSafe(textRaw) {
+  let text = sanitizeUserText(textRaw);
+  if (text.length > MAX_TTS_TEXT) {
+    text = text.slice(0, MAX_TTS_TEXT);
+  }
+  return text;
+}
+
+async function ttsElevenLabsRaw(textRaw, lang = "en") {
+  const text = assertTtsTextSafe(textRaw); // SECURITY: cap & sanitize
   const voiceId = lang === "es" ? ELEVEN_VOICE_ID_ES : lang === "pt" ? ELEVEN_VOICE_ID_PT : ELEVEN_VOICE_ID_EN;
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
   const res = await fetch(url, {
@@ -1200,21 +1236,33 @@ async function ttsElevenLabsRaw(text, lang = "en") {
   if (!res.ok) {
     throw new Error(`ElevenLabs TTS failed: ${res.status} ${res.statusText}`);
   }
-  return Buffer.from(await res.arrayBuffer());
+  const arr = await res.arrayBuffer();
+  if (arr.byteLength > MAX_AUDIO_INPUT_BYTES) throw new Error("TTS output too large");
+  return Buffer.from(arr);
 }
-
 function ffmpegTranscode(inputBuf, args) {
   return new Promise((resolve, reject) => {
+    if (!Buffer.isBuffer(inputBuf) || inputBuf.length === 0) return reject(new Error("Invalid audio buffer"));
+    if (inputBuf.length > MAX_AUDIO_INPUT_BYTES) return reject(new Error("Audio buffer too large"));
+
     const chunks = [];
-    const ff = spawn(ffmpegBin.path, args);
+    const ff = spawn(ffmpegBin.path, args, { stdio: ["pipe", "pipe", "pipe"] });
+
+    const timer = setTimeout(() => {
+      ff.kill("SIGKILL");
+      reject(new Error("ffmpeg timeout"));
+    }, FFMPEG_TIMEOUT_MS);
+
     ff.stdin.on("error", () => {});
     ff.stdout.on("data", d => chunks.push(d));
     ff.stderr.on("data", d => console.error("[ffmpeg]", d.toString().trim()));
-    ff.on("close", code => code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`ffmpeg exited ${code}`)));
+    ff.on("close", code => {
+      clearTimeout(timer);
+      code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`ffmpeg exited ${code}`));
+    });
     ff.stdin.end(inputBuf);
   });
 }
-
 async function ttsToPcm16(text, lang = "en") {
   const input = await ttsElevenLabsRaw(text, lang);
   let out = await ffmpegTranscode(input, [
@@ -1225,7 +1273,6 @@ async function ttsToPcm16(text, lang = "en") {
   if (out.length % 2 !== 0) out = out.slice(0, out.length - 1);
   return out;
 }
-
 async function ttsToMulaw(text, lang = "en") {
   const input = await ttsElevenLabsRaw(text, lang);
   return await ffmpegTranscode(input, [
@@ -1234,7 +1281,6 @@ async function ttsToMulaw(text, lang = "en") {
     "-f","mulaw","-acodec","pcm_mulaw","pipe:1",
   ]);
 }
-
 async function streamFrames(ws, raw) {
   const bytesPerFrame = MEDIA_FORMAT === "mulaw" ? BYTES_PER_FRAME_MULAW : BYTES_PER_FRAME_PCM16;
   let offset = 0, frames = 0;
@@ -1255,81 +1301,100 @@ async function streamFrames(ws, raw) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Deepgram with multi-language
+// Deepgram with multi-language (hardened per-socket cap + idle close)
 // ───────────────────────────────────────────────────────────────────────────────
-function connectDeepgram(onFinal, onAnyTranscript, lang = "en") {
+function connectDeepgram(onFinal, onAnyTranscript, lang = "en", ws) {
   if (!DG_KEY) {
     console.warn("⚠️ DEEPGRAM_API_KEY missing — STT disabled.");
     return null;
   }
+  // SECURITY: Allow at most one DG connection per socket
+  if (ws && ws._dgCount >= MAX_DG_PER_SOCKET) {
+    console.warn("DG limit per socket reached");
+    return null;
+  }
+  if (ws) ws._dgCount = (ws._dgCount || 0) + 1;
+
   const langCode = lang === "es" ? "es" : lang === "pt" ? "pt" : "en-US";
   const url = `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&punctuate=true&language=${langCode}`;
   const dg = new WebSocket(url, { headers: { Authorization: `Token ${DG_KEY}` } });
-
   let lastPartial = "";
   let partialTimer = null;
+  let idleTimer = null;
 
+  const resetIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      try { dg.close(); } catch {}
+    }, SESSION_IDLE_MS);
+  };
   function promotePartial(reason = "idle") {
     if (!lastPartial) return;
     const promoted = lastPartial.trim();
     lastPartial = "";
     if (partialTimer) { clearTimeout(partialTimer); partialTimer = null; }
     if (promoted) {
-      console.log(`[ASR promote:${reason}] ${promoted}`);
+      console.log(`[ASR promote:${reason}] ${safeLog(promoted)}`);
       onFinal(promoted);
     }
   }
-
-  dg.on("open", () => console.log(`[DG] connected (${langCode})`));
-
+  dg.on("open", () => { console.log(`[DG] connected (${langCode})`); resetIdle(); });
   dg.on("message", (d) => {
+    resetIdle();
     try {
       const msg = JSON.parse(d.toString());
       const alt = msg.channel?.alternatives?.[0];
-      const transcript = alt?.transcript?.trim() || "";
-
+      const transcript = sanitizeUserText(alt?.transcript?.trim() || "");
       if (transcript) onAnyTranscript?.(transcript);
-
       if (transcript && (msg.is_final || msg.speech_final)) {
         if (partialTimer) { clearTimeout(partialTimer); partialTimer = null; }
         lastPartial = "";
-        console.log(`[ASR] ${transcript}`);
+        console.log(`[ASR] ${safeLog(transcript)}`);
         onFinal(transcript);
         return;
       }
-
       if (transcript) {
         lastPartial = transcript;
-        console.log(`[ASR~] ${lastPartial}`);
         if (partialTimer) clearTimeout(partialTimer);
         partialTimer = setTimeout(() => promotePartial("timeout"), ASR_PARTIAL_PROMOTE_MS);
       }
     } catch {}
   });
-
   dg.on("close", () => {
     console.log("[DG] close");
     promotePartial("dg_close");
+    if (idleTimer) clearTimeout(idleTimer);
   });
   dg.on("error", (e) => console.error("[DG] error", e.message));
-
   return dg;
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// WebSocket
+// WebSocket (auth, rate limiting, frame validation)
 // ───────────────────────────────────────────────────────────────────────────────
-const wss = new WebSocketServer({ noServer: true });
-
-wss.on("connection", (ws) => {
+const wss = new WebSocketServer({
+  noServer: true,
+  maxPayload: 256 * 1024, // SECURITY: refuse huge payloads
+  perMessageDeflate: false,
+});
+wss.on("connection", (ws, req) => {
+  const ip = req.socket.remoteAddress || "unknown";
   console.log("🔗 WebSocket connected");
   ws._rx = 0;
   ws._speaking = false;
   ws._graceUntil = 0; // Grace period to prevent barge-in
   ws._ctx = new ConversationContext();
   ws._dgConnection = null;
-
+  ws._dgCount = 0;
   let noInputTimer = null;
+
+  // SECURITY: idle session close
+  let hardIdleTimer = setTimeout(() => { try { ws.close(); } catch {} }, SESSION_IDLE_MS);
+  const bumpIdle = () => {
+    if (hardIdleTimer) clearTimeout(hardIdleTimer);
+    hardIdleTimer = setTimeout(() => { try { ws.close(); } catch {} }, SESSION_IDLE_MS);
+  };
+
   const resetNoInputTimer = () => {
     if (noInputTimer) clearTimeout(noInputTimer);
     noInputTimer = setTimeout(async () => {
@@ -1347,17 +1412,16 @@ wss.on("connection", (ws) => {
         ws._speaking = false;
         ws._graceUntil = Date.now() + POST_TTS_GRACE_MS;
         resetNoInputTimer();
+        bumpIdle();
       }
     }, NO_INPUT_REPROMPT_MS);
   };
-
   const handleFinal = async (finalText) => {
     // Don't process during grace period (agent just finished speaking)
     if (Date.now() < ws._graceUntil) {
       console.log("[GRACE] Ignoring input during grace period");
       return;
     }
-    
     if (ws._speaking) return;
     
     // If language just detected, reconnect Deepgram
@@ -1365,13 +1429,13 @@ wss.on("connection", (ws) => {
       ws._ctx.language = detectLanguage(finalText);
       console.log(`[LANG] Switching to ${ws._ctx.language}`);
       if (ws._dgConnection) ws._dgConnection.close();
-      ws._dgConnection = connectDeepgram(handleFinal, () => resetNoInputTimer(), ws._ctx.language);
+      ws._dgConnection = connectDeepgram(handleFinal, () => resetNoInputTimer(), ws._ctx.language, ws);
     }
     
-    console.log(`[USER] "${finalText}"`);
+    console.log(`[USER] "${safeLog(finalText)}"`);
     const reply = routeWithContext(finalText, ws._ctx);
-    console.log(`[BOT] "${reply}"`);
-    console.log(`[CONTEXT] ${JSON.stringify(ws._ctx.data)}`);
+    console.log(`[BOT] "${safeLog(reply)}"`);
+    console.log(`[CONTEXT] ${safeLog(JSON.stringify(ws._ctx.data))}`);
     
     ws._speaking = true;
     try {
@@ -1384,26 +1448,22 @@ wss.on("connection", (ws) => {
       ws._graceUntil = Date.now() + POST_TTS_GRACE_MS; // Set grace period after speaking
       console.log(`[GRACE] Set until ${new Date(ws._graceUntil).toISOString()}`);
       resetNoInputTimer();
+      bumpIdle();
     }
   };
-
-  ws._dgConnection = connectDeepgram(handleFinal, () => resetNoInputTimer());
-
+  ws._dgConnection = connectDeepgram(handleFinal, () => resetNoInputTimer(), "en", ws);
   ws.on("message", async (data) => {
+    bumpIdle();
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
-
     if (msg.event === "connected") {
       console.log(`[WS] event: connected`);
     }
-
     if (msg.event === "start") {
       ws._streamSid = msg.start?.streamSid;
-      console.log(`[WS] START callSid=${msg.start?.callSid}`);
-
+      console.log(`[WS] START callSid=${safeLog(msg.start?.callSid || "")}`);
       if (MEDIA_FORMAT === "mulaw") await streamFrames(ws, makeBeepMulaw());
       else await streamFrames(ws, makeBeepPcm16());
-
       try {
         const text = "Hi! I'm your AI receptionist at Clean Easy. How can I help you?";
         const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text) : await ttsToPcm16(text);
@@ -1414,31 +1474,43 @@ wss.on("connection", (ws) => {
       } catch (e) {
         console.error("[TTS] greeting failed:", e.message);
       }
-
       resetNoInputTimer();
     }
-
     if (msg.event === "media") {
+      // SECURITY: Validate payload
+      const payload = msg?.media?.payload;
+      if (typeof payload !== "string" || payload.length === 0) return;
+      let b;
+      try { b = Buffer.from(payload, "base64"); } catch { return; }
+
+      const expected = MEDIA_FORMAT === "mulaw" ? BYTES_PER_FRAME_MULAW : BYTES_PER_FRAME_PCM16;
+      if (b.length !== expected) {
+        // Drop malformed frame quietly
+        return;
+      }
+
       ws._rx++;
       // Only send to Deepgram if not speaking and not in grace period
       if (ws._dgConnection && ws._dgConnection.readyState === ws._dgConnection.OPEN && 
           !ws._speaking && Date.now() >= ws._graceUntil) {
-        const b = Buffer.from(msg.media.payload, "base64");
         const pcm16 = inboundToPCM16(b);
         ws._dgConnection.send(pcm16);
       }
     }
-
     if (msg.event === "stop") {
       console.log(`[WS] STOP`);
       if (ws._dgConnection && ws._dgConnection.readyState === ws._dgConnection.OPEN) ws._dgConnection.close();
       if (noInputTimer) clearTimeout(noInputTimer);
+      if (hardIdleTimer) clearTimeout(hardIdleTimer);
     }
   });
-
   ws.on("close", () => {
     console.log("[WS] CLOSE");
     if (noInputTimer) clearTimeout(noInputTimer);
+    if (hardIdleTimer) clearTimeout(hardIdleTimer);
+    // decrement IP session count
+    const cur = ipSessionCounts.get(ip) || 0;
+    ipSessionCounts.set(ip, Math.max(0, cur - 1));
   });
   ws.on("error", (err) => console.error("[WS] error", err));
 });
@@ -1446,11 +1518,13 @@ wss.on("connection", (ws) => {
 // ───────────────────────────────────────────────────────────────────────────────
 // HTTP
 // ───────────────────────────────────────────────────────────────────────────────
+app.use(express.json({ limit: "1mb" })); // SECURITY: request size limit
+
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/debug/say", async (req, res) => {
   try {
     const text = (req.query.text || "This is a test.").toString();
-    const lang = req.query.lang || "en";
+    const lang = (req.query.lang || "en").toString().slice(0, 5);
     const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text, lang) : await ttsToPcm16(text, lang);
     res.setHeader("Content-Type", MEDIA_FORMAT === "mulaw" ? "audio/basic" : "audio/L16");
     res.send(buf);
@@ -1458,9 +1532,32 @@ app.get("/debug/say", async (req, res) => {
     res.status(500).send(e.message);
   }
 });
-
 const server = app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+
+// SECURITY: Auth & rate-limit on WS upgrade
 server.on("upgrade", (req, socket, head) => {
-  if (req.url !== "/stream") return socket.destroy();
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    if (url.pathname !== "/stream") {
+      socket.destroy();
+      return;
+    }
+    const token = url.searchParams.get("token");
+    if (token !== AGENT_TOKEN) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    const ip = req.socket.remoteAddress || "unknown";
+    const count = ipSessionCounts.get(ip) || 0;
+    if (count >= MAX_WS_PER_IP) {
+      socket.write("HTTP/1.1 429 Too Many Requests\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    ipSessionCounts.set(ip, count + 1);
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  } catch {
+    socket.destroy();
+  }
 });
