@@ -624,7 +624,7 @@ function extractBedrooms(textRaw) {
   for (const [word, num] of Object.entries(numberWords)) {
     if (q.includes(word + " bed") || q.includes(word + " room") || 
         q.includes(word + " habitacion") || q.includes(word + " quarto")) {
-      console.log(`[EXTRACT] Bedrooms via word: ${word} → ${num}`);
+      console.log("[EXTRACT] Bedrooms via word: " + word + " -> " + num);
       return num;
     }
   }
@@ -634,7 +634,7 @@ function extractBedrooms(textRaw) {
     for (const [word, num] of Object.entries(numberWords)) {
       const wordPattern = new RegExp(`\\b${word}\\b`);
       if (wordPattern.test(q)) {
-        console.log(`[EXTRACT] Bedrooms via number word: ${word} → ${num}`);
+        console.log("[EXTRACT] Bedrooms via number word: " + word + " -> " + num);
         return num;
       }
     }
@@ -645,7 +645,7 @@ function extractBedrooms(textRaw) {
   if (digitMatch) {
     const num = parseInt(digitMatch[1]);
     const result = num >= 5 ? "5+" : num.toString();
-    console.log(`[EXTRACT] Bedrooms via digit: ${num} → ${result}`);
+    console.log("[EXTRACT] Bedrooms via digit: " + num + " -> " + result);
     return result;
   }
   
