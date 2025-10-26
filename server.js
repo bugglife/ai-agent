@@ -1,5 +1,5 @@
 // ==========================================
-// CLEAN EASY AI RECEPTIONIST - PHONE NUMBER FIX
+// CLEAN EASY AI RECEPTIONIST - PHONE NUMBER FIX (ES MODULE)
 // ==========================================
 // This version fixes all 3 phone number issues:
 // 1. ✅ Accumulates partial numbers instead of replacing
@@ -7,9 +7,9 @@
 // 3. ✅ Handles chunked delivery intelligently
 // ==========================================
 
-const express = require('express');
-const WebSocket = require('ws');
-const http = require('http');
+import express from 'express';
+import WebSocket from 'ws';
+import http from 'http';
 
 const app = express();
 const server = http.createServer(app);
