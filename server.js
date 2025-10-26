@@ -607,7 +607,7 @@ function extractBedrooms(textRaw) {
   
   // REJECT filler words that might be misheard as numbers
   if (q === "uh" || q === "um" || q === "er" || q === "ah" || q === "hmm") {
-    console.log(`[EXTRACT] Rejected filler word: ${q}`);
+    console.log("[EXTRACT] Rejected filler word: " + q);
     return null;
   }
   
