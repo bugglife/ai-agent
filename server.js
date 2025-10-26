@@ -423,11 +423,6 @@ function routeWithContext(text, ctx) {
     return `For a ${bed === 0 ? 'studio' : bed + ' bedroom'} with ${bath} bathroom, our standard cleaning starts at around $${100 + (bed * 30) + (bath * 20)}. Would you like to book a cleaning?`;
   }
   
-  // Greetings - respond naturally
-  if (q.match(/^(hi|hello|hey|good morning|good afternoon|good evening)\b/)) {
-    return "Hello! How can I help you today?";
-  }
-  
   // Service area question with city mentioned
   if (city && (q.includes("available") || q.includes("service") || q.includes("area") || q.includes("come"))) {
     if (SERVICE_AREAS.includes(city)) {
@@ -486,6 +481,18 @@ function routeWithContext(text, ctx) {
       return "Great! What date and time work best for you?";
     }
     return "Great! What specifically would you like help with - booking a cleaning, pricing information, or something else?";
+  }
+  
+  // Greetings - ONLY if it's just a greeting with no other content (moved to end)
+  // Check if the message is ONLY a greeting (5 words or less, no substantive keywords)
+  const words = q.split(/\s+/);
+  const isJustGreeting = words.length <= 5 && 
+    q.match(/^(hi|hello|hey|good morning|good afternoon|good evening)\b/) &&
+    !q.includes("available") && !q.includes("book") && !q.includes("price") &&
+    !q.includes("hour") && !q.includes("service") && !q.includes("clean");
+  
+  if (isJustGreeting) {
+    return "Hello! How can I help you today?";
   }
   
   // Default - encourage specifics
@@ -604,8 +611,16 @@ wss.on("connection", (ws, req) => {
     }
 
     console.log(`[USER] "${safeLog(finalText)}"`);
-    const reply = routeWithContext(finalText, ws._ctx);
-    console.log(`[BOT] "${safeLog(reply)}"`);
+    
+    let reply;
+    try {
+      reply = routeWithContext(finalText, ws._ctx);
+      console.log(`[BOT] "${safeLog(reply)}"`);
+      console.log(`[CONTEXT] ${safeLog(JSON.stringify(ws._ctx.data))}`);
+    } catch (e) {
+      console.error("[ROUTING] Error in routeWithContext:", e.message);
+      reply = "I'm sorry, I had trouble processing that. Could you please repeat?";
+    }
 
     ws._speaking = true;
     try {
@@ -613,8 +628,19 @@ wss.on("connection", (ws, req) => {
         await ttsToMulaw(reply, ws._ctx.language) : 
         await ttsToPcm16(reply, ws._ctx.language);
       await streamFrames(ws, out);
+      console.log("[TTS] Successfully streamed response");
     } catch (e) {
-      console.error("[TTS] reply failed:", e.message);
+      console.error("[TTS] reply failed:", e.message, e.stack);
+      // Try to send an error message to the user
+      try {
+        const errorMsg = "I'm having trouble with my voice. Please try again.";
+        const errorBuf = MEDIA_FORMAT === "mulaw" ? 
+          await ttsToMulaw(errorMsg, "en") : 
+          await ttsToPcm16(errorMsg, "en");
+        await streamFrames(ws, errorBuf);
+      } catch (e2) {
+        console.error("[TTS] Error message also failed:", e2.message);
+      }
     } finally {
       ws._speaking = false;
       ws._graceUntil = Date.now() + POST_TTS_GRACE_MS;
