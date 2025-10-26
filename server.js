@@ -260,13 +260,22 @@ async function streamFrames(ws, raw) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Simple conversation context
+// Conversation context with state tracking
 // ───────────────────────────────────────────────────────────────────────────────
 class ConversationContext {
   constructor() {
     this.language = "en";
-    this.data = {};
+    this.data = {
+      city: null,
+      date: null,
+      time: null,
+      bedrooms: null,
+      bathrooms: null,
+      cleaningType: null,
+      frequency: null,
+    };
     this.greeted = false;
+    this.state = "greeting"; // greeting, booking, pricing, confirming
   }
   
   t(key) {
@@ -289,27 +298,166 @@ class ConversationContext {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Intent routing with context
+// Entity extraction helpers
+// ───────────────────────────────────────────────────────────────────────────────
+function extractCity(text) {
+  const q = normalize(text);
+  
+  // Check aliases first
+  for (const [alias, city] of Object.entries(CITY_ALIASES)) {
+    if (q.includes(alias)) return city;
+  }
+  
+  // Check service areas
+  for (const city of SERVICE_AREAS) {
+    if (q.includes(city.toLowerCase())) return city;
+  }
+  
+  return null;
+}
+
+function extractDateTime(text) {
+  const q = normalize(text);
+  const result = { day: null, time: null, raw: text };
+  
+  // Days of week
+  const days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+  for (const day of days) {
+    if (q.includes(day)) {
+      result.day = day.charAt(0).toUpperCase() + day.slice(1);
+      break;
+    }
+  }
+  
+  // Relative days
+  if (q.includes("today")) result.day = "today";
+  if (q.includes("tomorrow")) result.day = "tomorrow";
+  if (q.includes("next week")) result.day = "next week";
+  
+  // Time patterns
+  const timeMatch = q.match(/(\d{1,2})\s*(am|pm|o\s*clock|oclock)/i);
+  if (timeMatch) {
+    const hour = parseInt(timeMatch[1]);
+    const meridiem = timeMatch[2];
+    if (meridiem.includes("pm") || meridiem.includes("p m")) {
+      result.time = hour === 12 ? "12 PM" : `${hour} PM`;
+    } else if (meridiem.includes("am") || meridiem.includes("a m")) {
+      result.time = hour === 12 ? "12 AM" : `${hour} AM`;
+    } else { // o'clock - assume context
+      result.time = hour < 8 ? `${hour} PM` : `${hour} AM`;
+    }
+  }
+  
+  // Time range patterns (e.g., "between 2 and 4")
+  const rangeMatch = q.match(/between\s+(\d{1,2})\s+and\s+(\d{1,2})/);
+  if (rangeMatch) {
+    result.time = `${rangeMatch[1]}-${rangeMatch[2]}`;
+  }
+  
+  return result.day || result.time ? result : null;
+}
+
+function extractRoomCount(text) {
+  const q = normalize(text);
+  const result = { bedrooms: null, bathrooms: null };
+  
+  // Bedroom patterns
+  const bedroomMatch = q.match(/(\d+|one|two|three|four|five|studio)\s*(bed|bedroom)/);
+  if (bedroomMatch) {
+    const num = bedroomMatch[1];
+    if (num === "studio") result.bedrooms = 0;
+    else if (num === "one") result.bedrooms = 1;
+    else if (num === "two") result.bedrooms = 2;
+    else if (num === "three") result.bedrooms = 3;
+    else if (num === "four") result.bedrooms = 4;
+    else if (num === "five") result.bedrooms = 5;
+    else result.bedrooms = parseInt(num);
+  }
+  
+  // Bathroom patterns
+  const bathroomMatch = q.match(/(\d+|one|two|three|four|half)\s*(bath|bathroom)/);
+  if (bathroomMatch) {
+    const num = bathroomMatch[1];
+    if (num === "half") result.bathrooms = 0.5;
+    else if (num === "one") result.bathrooms = 1;
+    else if (num === "two") result.bathrooms = 2;
+    else if (num === "three") result.bathrooms = 3;
+    else if (num === "four") result.bathrooms = 4;
+    else result.bathrooms = parseInt(num);
+  }
+  
+  return result.bedrooms !== null || result.bathrooms !== null ? result : null;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Intent routing with context and entity extraction
 // ───────────────────────────────────────────────────────────────────────────────
 function routeWithContext(text, ctx) {
   const q = normalize(text);
+  
+  // Extract entities from user input
+  const city = extractCity(text);
+  const dateTime = extractDateTime(text);
+  const rooms = extractRoomCount(text);
+  
+  // Store extracted entities in context
+  if (city) ctx.data.city = city;
+  if (dateTime?.day) ctx.data.date = dateTime.day;
+  if (dateTime?.time) ctx.data.time = dateTime.time;
+  if (rooms?.bedrooms !== null) ctx.data.bedrooms = rooms.bedrooms;
+  if (rooms?.bathrooms !== null) ctx.data.bathrooms = rooms.bathrooms;
+  
+  // STATE: Waiting for date/time after asking for it
+  if (ctx.state === "booking" && dateTime) {
+    ctx.state = "confirming";
+    const dayStr = ctx.data.date || "that day";
+    const timeStr = ctx.data.time || "that time";
+    return `Perfect! I have you down for ${dayStr} at ${timeStr}. Can I get your phone number and address to confirm the booking?`;
+  }
+  
+  // STATE: Waiting for room count after asking for it
+  if (ctx.state === "pricing" && rooms) {
+    // Simple price estimation (would be more sophisticated with full pricing logic)
+    const bed = ctx.data.bedrooms || 1;
+    const bath = ctx.data.bathrooms || 1;
+    return `For a ${bed === 0 ? 'studio' : bed + ' bedroom'} with ${bath} bathroom, our standard cleaning starts at around $${100 + (bed * 30) + (bath * 20)}. Would you like to book a cleaning?`;
+  }
   
   // Greetings - respond naturally
   if (q.match(/^(hi|hello|hey|good morning|good afternoon|good evening)\b/)) {
     return "Hello! How can I help you today?";
   }
   
-  // Availability / Booking / Scheduling
+  // Service area question with city mentioned
+  if (city && (q.includes("available") || q.includes("service") || q.includes("area") || q.includes("come"))) {
+    if (SERVICE_AREAS.includes(city)) {
+      ctx.state = "booking";
+      return `Yes, we service ${city}! What date and time work best for you?`;
+    } else {
+      return `I'm sorry, we don't currently service ${city}. We serve the Greater Boston area including Cambridge, Somerville, Brookline, Newton, and surrounding cities.`;
+    }
+  }
+  
+  // Availability / Booking / Scheduling (without city)
   if (q.includes("available") || q.includes("availability") || 
       q.includes("book") || q.includes("appointment") || 
       q.includes("schedule") || q.includes("reserve")) {
+    ctx.state = "booking";
     return "Yes, we're available! What date and time work best for you?";
   }
   
-  // Service area check
+  // They provided date/time without us asking
+  if (dateTime && ctx.state !== "booking") {
+    ctx.state = "confirming";
+    const dayStr = ctx.data.date || "that day";
+    const timeStr = ctx.data.time || "that time";
+    return `Great! I can schedule you for ${dayStr} at ${timeStr}. What's your address and phone number?`;
+  }
+  
+  // Service area check (general)
   if (q.includes("area") || q.includes("service") || q.includes("where") ||
       q.includes("location") || q.includes("come to")) {
-    return "We service the Greater Boston area including Cambridge, Somerville, Brookline, Newton, and surrounding cities.";
+    return "We service the Greater Boston area including Cambridge, Somerville, Brookline, Newton, and surrounding cities. What area are you in?";
   }
   
   // Hours / Open times
@@ -321,6 +469,7 @@ function routeWithContext(text, ctx) {
   // Pricing
   if (q.includes("price") || q.includes("pricing") || q.includes("cost") || 
       q.includes("how much") || q.includes("charge")) {
+    ctx.state = "pricing";
     return "Our pricing depends on the size of your space and the type of cleaning. How many bedrooms and bathrooms do you have?";
   }
   
@@ -332,6 +481,10 @@ function routeWithContext(text, ctx) {
   
   // Affirmative responses (yes, yeah, sure)
   if (q.match(/^(yes|yeah|yep|sure|ok|okay)\b/)) {
+    if (ctx.state === "pricing") {
+      ctx.state = "booking";
+      return "Great! What date and time work best for you?";
+    }
     return "Great! What specifically would you like help with - booking a cleaning, pricing information, or something else?";
   }
   
