@@ -290,9 +290,11 @@ class ConversationContext {
       bathrooms: null,
       cleaningType: null,
       frequency: null,
+      phone: null,
+      address: null,
     };
     this.greeted = false;
-    this.state = "greeting"; // greeting, booking, pricing, confirming
+    this.state = "greeting"; // greeting, booking, pricing, confirming, complete
   }
   
   t(key) {
@@ -406,6 +408,59 @@ function extractRoomCount(text) {
   return result.bedrooms !== null || result.bathrooms !== null ? result : null;
 }
 
+function extractPhoneNumber(text) {
+  const q = normalize(text);
+  
+  // Standard phone formats: 617-555-1234, (617) 555-1234, 6175551234
+  const phonePattern = /(\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4})/;
+  const match = q.match(phonePattern);
+  if (match) return match[1];
+  
+  // Spoken digits: "six one seven five five five one two three four"
+  // Convert words to numbers
+  const digitWords = {
+    'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
+    'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9',
+    'oh': '0'
+  };
+  
+  const words = q.split(/\s+/);
+  const digits = words
+    .map(w => digitWords[w])
+    .filter(d => d !== undefined)
+    .join('');
+  
+  // If we have 10 or 11 digits (with optional country code), it's probably a phone number
+  if (digits.length === 10 || digits.length === 11) {
+    return digits;
+  }
+  
+  // Partial phone number (user might be giving it in chunks)
+  if (digits.length >= 3 && digits.length < 10) {
+    return digits; // Store partial, expect more
+  }
+  
+  return null;
+}
+
+function extractAddress(text) {
+  const q = normalize(text);
+  
+  // Look for common address patterns
+  // Number + Street name + Street type
+  const addressPattern = /\d+\s+[a-z]+\s+(street|st|avenue|ave|road|rd|drive|dr|lane|ln|way|circle|court|ct|boulevard|blvd|place|pl)/;
+  const match = q.match(addressPattern);
+  if (match) return match[0];
+  
+  // Just capture the full text if it seems like an address
+  // (Contains numbers and common street words)
+  if (q.match(/\d+/) && (q.includes('street') || q.includes('avenue') || q.includes('road'))) {
+    return text.trim();
+  }
+  
+  return null;
+}
+
 // ───────────────────────────────────────────────────────────────────────────────
 // Intent routing with context and entity extraction
 // ───────────────────────────────────────────────────────────────────────────────
@@ -422,6 +477,8 @@ function routeWithContext(text, ctx) {
       bathrooms: null,
       cleaningType: null,
       frequency: null,
+      phone: null,
+      address: null,
     };
   }
   
@@ -429,6 +486,8 @@ function routeWithContext(text, ctx) {
   const city = extractCity(text);
   const dateTime = extractDateTime(text);
   const rooms = extractRoomCount(text);
+  const phone = extractPhoneNumber(text);
+  const address = extractAddress(text);
   
   // Store extracted entities in context - with safe null checks
   if (city) ctx.data.city = city;
@@ -440,6 +499,8 @@ function routeWithContext(text, ctx) {
   if (rooms && rooms.bathrooms !== null && rooms.bathrooms !== undefined) {
     ctx.data.bathrooms = rooms.bathrooms;
   }
+  if (phone) ctx.data.phone = phone;
+  if (address) ctx.data.address = address;
   
   // STATE: Waiting for date/time after asking for it
   if (ctx.state === "booking" && dateTime) {
@@ -447,6 +508,58 @@ function routeWithContext(text, ctx) {
     const dayStr = (ctx.data && ctx.data.date) ? ctx.data.date : "that day";
     const timeStr = (ctx.data && ctx.data.time) ? ctx.data.time : "that time";
     return `Perfect! I have you down for ${dayStr} at ${timeStr}. Can I get your phone number and address to confirm the booking?`;
+  }
+  
+  // STATE: Collecting contact info (phone and address)
+  if (ctx.state === "confirming") {
+    // Check what we have and what we need
+    const hasPhone = ctx.data.phone && ctx.data.phone.length >= 10;
+    const hasAddress = ctx.data.address;
+    
+    if (phone && !hasPhone) {
+      // Just got phone number
+      if (phone.length >= 10) {
+        // Full phone number received
+        if (hasAddress) {
+          // We have everything!
+          ctx.state = "complete";
+          return `Perfect! I have your booking for ${ctx.data.date || 'that day'} at ${ctx.data.time || 'that time'} in ${ctx.data.city || 'your area'}. We'll call you at ${phone} to confirm. Thank you for choosing Clean Easy!`;
+        } else {
+          // Still need address
+          return `Great, I have your number as ${phone}. What's the address for the cleaning?`;
+        }
+      } else {
+        // Partial phone number - ask for more digits
+        return `I got ${phone}. Can you give me the rest of the digits?`;
+      }
+    }
+    
+    if (address && !hasAddress) {
+      // Just got address
+      if (hasPhone) {
+        // We have everything!
+        ctx.state = "complete";
+        return `Perfect! I have your booking for ${ctx.data.date || 'that day'} at ${ctx.data.time || 'that time'} at ${address}. We'll call you at ${ctx.data.phone} to confirm. Thank you for choosing Clean Easy!`;
+      } else {
+        // Still need phone
+        return `Got it, ${address}. And what's your phone number?`;
+      }
+    }
+    
+    // If we extracted both at once
+    if (phone && address && phone.length >= 10) {
+      ctx.state = "complete";
+      return `Perfect! I have your booking for ${ctx.data.date || 'that day'} at ${ctx.data.time || 'that time'} at ${address}. We'll call you at ${phone} to confirm. Thank you for choosing Clean Easy!`;
+    }
+    
+    // Didn't extract anything useful - prompt again
+    if (!hasPhone && !hasAddress) {
+      return "I didn't catch that. Can you give me your phone number?";
+    } else if (!hasPhone) {
+      return "And your phone number?";
+    } else if (!hasAddress) {
+      return "And what's the address for the cleaning?";
+    }
   }
   
   // STATE: Waiting for room count after asking for it
