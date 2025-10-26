@@ -655,7 +655,7 @@ function extractBedrooms(textRaw) {
     const word = justNumber[1];
     const result = numberWords[word] || (parseInt(word) >= 5 ? "5+" : word);
     console.log("[EXTRACT] Bedrooms via standalone: " + word + " -> " + result);
-    return result;
+    return result; 
   }
   
   return null;
