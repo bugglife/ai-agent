@@ -628,8 +628,8 @@ function routeWithContext(text, ctx) {
     return `For a ${bed === 0 ? 'studio' : bed + ' bedroom'} with ${bath} bathroom, our standard cleaning starts at around $${price}. Would you like to book a cleaning?`;
   }
   
-  // Service area question with city mentioned
-  if (city && (q.includes("available") || q.includes("service") || q.includes("area") || q.includes("come"))) {
+  // Service area question with city mentioned - includes conversational queries
+  if (city && (q.includes("available") || q.includes("service") || q.includes("area") || q.includes("come") || q.includes("you say") || q.includes("did you") || q.includes("do you mean") || q.includes("is that") || q.includes("you mean"))) {
     if (SERVICE_AREAS.includes(city)) {
       ctx.state = "booking";
       return `Yes, we service ${city}! What date and time work best for you?`;
