@@ -474,7 +474,7 @@ wss.on("connection", (ws, req) => {
           await ttsToPcm16(text);
         await streamFrames(ws, buf);
         ws._ctx.greeted = true;
-        ws._graceUntil = Date.now() + POST_TTS_GRACE_MS;
+        // NO grace period after greeting - user should be able to respond immediately
       } catch (e) {
         console.error("[TTS] greeting failed:", e.message);
       }
