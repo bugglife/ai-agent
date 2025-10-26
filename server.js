@@ -615,6 +615,35 @@ function routeWithContext(text, ctx) {
     }
     
     if (!phone && !address) {
+      // Handle conversational responses during phone collection
+      if (q.includes("what") || q.includes("have") || q.includes("so far")) {
+        // User is asking what we have
+        if (currentPhone && currentPhone.length > 0) {
+          const formatted = currentPhone.length === 10 ? formatPhoneNumber(currentPhone) : currentPhone;
+          const remaining = 10 - currentPhone.length;
+          if (remaining > 0) {
+            return `I have ${formatted} so far. I need ${remaining} more digits.`;
+          } else {
+            return `I have your number as ${formatted}. What's the address for the cleaning?`;
+          }
+        } else {
+          return "I don't have any digits yet. Can you give me your phone number?";
+        }
+      }
+      
+      // Handle acknowledgments (okay, sure, yes) - just repeat what we need
+      if (q.match(/^(okay|ok|sure|yes|yeah|yep|alright)\b/)) {
+        if (!currentPhone || currentPhone.length === 0) {
+          return "Can you give me your phone number? Say the digits one at a time.";
+        } else if (!hasCompletePhone) {
+          const remaining = 10 - currentPhone.length;
+          return `I need ${remaining} more digits for your phone number.`;
+        } else if (!hasAddress) {
+          return "What's the address for the cleaning?";
+        }
+      }
+      
+      // Default - didn't catch anything useful
       if (!currentPhone || currentPhone.length === 0) {
         return "I didn't catch that. Can you give me your phone number? Say the digits one at a time.";
       } else if (!hasCompletePhone) {
