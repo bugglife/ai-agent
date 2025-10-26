@@ -632,7 +632,7 @@ function extractBedrooms(textRaw) {
   // Try just the number word if context suggests bedrooms
   if (q.includes("bedroom") || q.includes("habitacion") || q.includes("quarto")) {
     for (const [word, num] of Object.entries(numberWords)) {
-      const wordPattern = new RegExp(`\\b${word}\\b`);
+      const wordPattern = new RegExp('\\b' + word + '\\b');
       if (wordPattern.test(q)) {
         console.log("[EXTRACT] Bedrooms via number word: " + word + " -> " + num);
         return num;
