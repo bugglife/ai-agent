@@ -45,7 +45,7 @@ const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1;
 const ASR_PARTIAL_PROMOTE_MS = 1200;
 const NO_INPUT_REPROMPT_MS = 7000;
 const POST_TTS_GRACE_MS = 800;
-const PHONE_COLLECTION_GRACE_MS = 1500; // 🔧 FIX: Longer grace period during phone collection
+const PHONE_COLLECTION_GRACE_MS = 1500;
 
 // ───────────────────────────────────────────────────────────────────────────────
 // SERVICE AREAS & PRICING
@@ -207,115 +207,82 @@ async function ttsElevenLabsRaw(text, lang = "en") {
     headers: {
       "xi-api-key": ELEVEN_API_KEY,
       "Content-Type": "application/json",
+      Accept: "audio/mpeg",
     },
-    body: JSON.stringify({
-      text,
-      model_id: "eleven_turbo_v2_5",
-      output_format: "pcm_16000",
-      voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.0, use_speaker_boost: true },
+    body: JSON.stringify({ 
+      text, 
+      voice_settings: { stability: 0.4, similarity_boost: 0.7 } 
     }),
   });
-  if (!res.ok) throw new Error(`ElevenLabs ${res.status}`);
+  if (!res.ok) {
+    throw new Error(`ElevenLabs TTS failed: ${res.status} ${await res.text()}`);
+  }
   return Buffer.from(await res.arrayBuffer());
 }
 
-async function resampleWithFFmpeg(inBuf, inRate, outRate) {
+function ffmpegTranscode(inputBuf, args) {
   return new Promise((resolve, reject) => {
-    const args = [
-      "-f", "s16le", "-ar", inRate.toString(), "-ac", "1", "-i", "pipe:0",
-      "-f", "s16le", "-ar", outRate.toString(), "-ac", "1", "pipe:1",
-    ];
-    const proc = spawn(ffmpegBin.path, args, { stdio: ["pipe", "pipe", "pipe"] });
     const chunks = [];
-    proc.stdout.on("data", (d) => chunks.push(d));
-    proc.stdout.on("end", () => resolve(Buffer.concat(chunks)));
-    proc.on("error", reject);
-    proc.stdin.write(inBuf);
-    proc.stdin.end();
+    const ff = spawn(ffmpegBin.path, args);
+    ff.stdin.on("error", () => {});
+    ff.stdout.on("data", d => chunks.push(d));
+    ff.stderr.on("data", () => {}); // suppress ffmpeg logs
+    ff.on("close", code => code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`ffmpeg exited ${code}`)));
+    ff.stdin.end(inputBuf);
   });
 }
 
 async function ttsToPcm16(text, lang = "en") {
-  const rawPcm = await ttsElevenLabsRaw(text, lang);
-  return await resampleWithFFmpeg(rawPcm, 16000, SAMPLE_RATE);
-}
-
-async function ttsToMulaw(text, lang = "en") {
-  const pcm16 = await ttsToPcm16(text, lang);
-  const out = Buffer.alloc(pcm16.length / 2);
-  for (let i = 0, j = 0; i < pcm16.length; i += 2, j++) {
-    out[j] = linearToMulawSample(pcm16.readInt16LE(i));
-  }
+  const input = await ttsElevenLabsRaw(text, lang);
+  let out = await ffmpegTranscode(input, [
+    "-hide_banner","-nostdin","-loglevel","error",
+    "-i","pipe:0","-ac","1","-ar","8000",
+    "-f","s16le","-acodec","pcm_s16le","pipe:1",
+  ]);
+  if (out.length % 2 !== 0) out = out.slice(0, out.length - 1);
   return out;
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Phone number extraction - ENHANCED with compound numbers
-// ───────────────────────────────────────────────────────────────────────────────
-function extractPhoneNumber(text) {
-  const q = normalize(text);
-  const digitMap = {
-    zero: "0", one: "1", two: "2", three: "3", four: "4",
-    five: "5", six: "6", seven: "7", eight: "8", nine: "9",
-    ten: "10", eleven: "11", twelve: "12", thirteen: "13", fourteen: "14",
-    fifteen: "15", sixteen: "16", seventeen: "17", eighteen: "18", nineteen: "19",
-    twenty: "20", thirty: "30", forty: "40", fifty: "50",
-    sixty: "60", seventy: "70", eighty: "80", ninety: "90",
-  };
-  
-  let result = "";
-  const words = q.split(/\s+/);
-  
-  for (let i = 0; i < words.length; i++) {
-    const word = words[i];
-    
-    // Direct digit matches
-    if (digitMap[word]) {
-      result += digitMap[word];
-      continue;
-    }
-    
-    // Check for compound numbers like "twenty one" → "21"
-    if (["twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"].includes(word)) {
-      const nextWord = words[i + 1];
-      if (nextWord && ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"].includes(nextWord)) {
-        result += digitMap[word] + digitMap[nextWord];
-        i++; // Skip next word since we consumed it
-        continue;
-      }
-      // Just the tens digit alone
-      result += digitMap[word];
-      continue;
-    }
-    
-    // Check for "hundred" patterns like "two hundred" → "200"
-    if (word === "hundred") {
-      const prevWord = words[i - 1];
-      if (prevWord && digitMap[prevWord]) {
-        // Already added the digit, just add "00"
-        result += "00";
-        continue;
-      }
-    }
-    
-    // Raw numeric digits
-    if (/^\d+$/.test(word)) {
-      result += word;
-    }
-  }
-  
-  return result;
+async function ttsToMulaw(text, lang = "en") {
+  const input = await ttsElevenLabsRaw(text, lang);
+  return await ffmpegTranscode(input, [
+    "-hide_banner","-nostdin","-loglevel","error",
+    "-i","pipe:0","-ac","1","-ar","8000",
+    "-f","mulaw","-acodec","pcm_mulaw","pipe:1",
+  ]);
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// ConversationContext
+// Stream frames to Twilio
+// ───────────────────────────────────────────────────────────────────────────────
+async function streamFrames(ws, raw) {
+  const bytesPerFrame = MEDIA_FORMAT === "mulaw" ? BYTES_PER_FRAME_MULAW : BYTES_PER_FRAME_PCM16;
+  let offset = 0;
+  while (offset < raw.length && ws.readyState === ws.OPEN) {
+    const end = Math.min(offset + bytesPerFrame, raw.length);
+    let frame = raw.slice(offset, end);
+    if (frame.length < bytesPerFrame) {
+      const padded = Buffer.alloc(bytesPerFrame);
+      frame.copy(padded, 0);
+      frame = padded;
+    }
+    ws.send(JSON.stringify({ 
+      event: "media", 
+      streamSid: ws._streamSid, 
+      media: { payload: frame.toString("base64") } 
+    }));
+    await new Promise(r => setTimeout(r, FRAME_MS));
+    offset += bytesPerFrame;
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Conversation context with state tracking
 // ───────────────────────────────────────────────────────────────────────────────
 class ConversationContext {
   constructor() {
     this.language = "en";
-    this.languageDetected = false;
-    this.greeted = false;
-    this.askedFor = null;
+    this.languageDetected = false; // Flag to prevent language switching mid-conversation
     this.data = {
       city: null,
       date: null,
@@ -327,297 +294,540 @@ class ConversationContext {
       phone: "",
       address: null,
     };
-    this.collectingPhone = false; // 🔧 FIX: Track when we're actively collecting phone
+    this.greeted = false;
+    this.state = "greeting"; // greeting, booking, pricing, confirming, complete
+    this.collectingPhone = false;
   }
   
   t(key) {
     const translations = {
       en: {
-        greeting: "Hi! I was wondering if you service Brookline.",
-        stillThere: "Are you still there?",
-        serviceConfirm: (city) => `Yes, we service ${city}! What date and time work best for you?`,
-        serviceUnknown: (city) => `I'm not sure if we service ${city}. Let me check. Can I get your phone number and address?`,
-        askPhone: "Can I get your phone number and address to confirm your booking?",
-        needMoreDigits: (n) => `Got it. I need ${n} more digit${n === 1 ? "" : "s"}.`,
-        phoneComplete: (formatted) => `Great, I have your number as ${formatted}. What's the address for the cleaning?`,
-        askAddress: "What's the address for the cleaning?",
-        confirmBooking: (details) => `Perfect! I have you scheduled for ${details.date} at ${details.time} in ${details.city}. Your phone is ${details.phone} and address is ${details.address}. We'll send you a confirmation shortly.`,
-        help: "I can help with booking, pricing, service areas, and hours. What would you like to know?",
-        didntCatch: "I didn't catch that. Could you repeat?",
+        greeting: "Hi! I'm your AI receptionist at Clean Easy. How can I help you?",
+        stillThere: "Are you still there? I can help with booking or any questions.",
       },
       es: {
-        greeting: "¡Hola! Me preguntaba si dan servicio en Brookline.",
-        stillThere: "¿Sigues ahí?",
-        serviceConfirm: (city) => `¡Sí, damos servicio en ${city}! ¿Qué fecha y hora te viene mejor?`,
-        serviceUnknown: (city) => `No estoy seguro si damos servicio en ${city}. Déjame verificar. ¿Puedo obtener tu número de teléfono y dirección?`,
-        askPhone: "¿Puedo obtener tu número de teléfono y dirección para confirmar tu reserva?",
-        needMoreDigits: (n) => `Entendido. Necesito ${n} dígito${n === 1 ? "" : "s"} más.`,
-        phoneComplete: (formatted) => `Perfecto, tengo tu número como ${formatted}. ¿Cuál es la dirección para la limpieza?`,
-        askAddress: "¿Cuál es la dirección para la limpieza?",
-        confirmBooking: (details) => `¡Perfecto! Te tengo programado para ${details.date} a las ${details.time} en ${details.city}. Tu teléfono es ${details.phone} y la dirección es ${details.address}. Te enviaremos una confirmación pronto.`,
-        help: "Puedo ayudar con reservas, precios, áreas de servicio y horarios. ¿Qué te gustaría saber?",
-        didntCatch: "No entendí eso. ¿Puedes repetir?",
+        greeting: "¡Hola! Soy tu recepcionista de IA en Clean Easy. ¿Cómo puedo ayudarte?",
+        stillThere: "¿Sigues ahí? Puedo ayudarte con reservas o cualquier pregunta.",
       },
       pt: {
-        greeting: "Olá! Gostaria de saber se vocês atendem Brookline.",
-        stillThere: "Você ainda está aí?",
-        serviceConfirm: (city) => `Sim, atendemos ${city}! Qual data e horário funcionam melhor para você?`,
-        serviceUnknown: (city) => `Não tenho certeza se atendemos ${city}. Deixe-me verificar. Posso pegar seu número de telefone e endereço?`,
-        askPhone: "Posso pegar seu número de telefone e endereço para confirmar sua reserva?",
-        needMoreDigits: (n) => `Entendi. Preciso de mais ${n} dígito${n === 1 ? "" : "s"}.`,
-        phoneComplete: (formatted) => `Ótimo, tenho seu número como ${formatted}. Qual é o endereço para a limpeza?`,
-        askAddress: "Qual é o endereço para a limpeza?",
-        confirmBooking: (details) => `Perfeito! Tenho você agendado para ${details.date} às ${details.time} em ${details.city}. Seu telefone é ${details.phone} e o endereço é ${details.address}. Enviaremos uma confirmação em breve.`,
-        help: "Posso ajudar com reservas, preços, áreas de atendimento e horários. O que você gostaria de saber?",
-        didntCatch: "Não entendi isso. Pode repetir?",
-      },
+        greeting: "Olá! Sou sua recepcionista de IA na Clean Easy. Como posso ajudar?",
+        stillThere: "Você ainda está aí? Posso ajudar com reservas ou perguntas.",
+      }
     };
-    
-    const msgs = translations[this.language] || translations.en;
-    return typeof msgs[key] === "function" ? msgs[key] : msgs[key] || msgs.didntCatch;
+    return translations[this.language]?.[key] || translations.en[key];
   }
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// City extraction
+// Entity extraction helpers
 // ───────────────────────────────────────────────────────────────────────────────
 function extractCity(text) {
   const q = normalize(text);
   
-  // Check aliases first (handles misspellings and variations)
-  for (const [alias, canonical] of Object.entries(CITY_ALIASES)) {
-    if (q.includes(alias)) {
-      return canonical;
+  // Check aliases first
+  for (const [alias, city] of Object.entries(CITY_ALIASES)) {
+    if (q.includes(alias)) return city;
+  }
+  
+  // Check service areas
+  for (const city of SERVICE_AREAS) {
+    if (q.includes(city.toLowerCase())) return city;
+  }
+  
+  return null;
+}
+
+function extractDateTime(text) {
+  const q = normalize(text);
+  const result = { day: null, time: null, raw: text };
+  
+  // Days of week
+  const days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+  for (const day of days) {
+    if (q.includes(day)) {
+      result.day = day.charAt(0).toUpperCase() + day.slice(1);
+      break;
     }
   }
   
-  // Check main service areas
-  for (const city of SERVICE_AREAS) {
-    if (q.includes(city.toLowerCase())) {
-      return city;
+  // Relative days
+  if (q.includes("today")) result.day = "today";
+  if (q.includes("tomorrow")) result.day = "tomorrow";
+  if (q.includes("next week")) result.day = "next week";
+  
+  // Time patterns
+  const timeMatch = q.match(/(\d{1,2})\s*(am|pm|o\s*clock|oclock)/i);
+  if (timeMatch) {
+    const hour = parseInt(timeMatch[1]);
+    const meridiem = timeMatch[2];
+    if (meridiem.includes("pm") || meridiem.includes("p m")) {
+      result.time = hour === 12 ? "12 PM" : `${hour} PM`;
+    } else if (meridiem.includes("am") || meridiem.includes("a m")) {
+      result.time = hour === 12 ? "12 AM" : `${hour} AM`;
+    } else { // o'clock - assume context
+      result.time = hour < 8 ? `${hour} PM` : `${hour} AM`;
     }
+  }
+  
+  // Time range patterns (e.g., "between 2 and 4")
+  const rangeMatch = q.match(/between\s+(\d{1,2})\s+and\s+(\d{1,2})/);
+  if (rangeMatch) {
+    result.time = `${rangeMatch[1]}-${rangeMatch[2]}`;
+  }
+  
+  return result.day || result.time ? result : null;
+}
+
+function extractRoomCount(text) {
+  const q = normalize(text);
+  const result = { bedrooms: null, bathrooms: null };
+  
+  // Bedroom patterns
+  const bedroomMatch = q.match(/(\d+|one|two|three|four|five|studio)\s*(bed|bedroom)/);
+  if (bedroomMatch) {
+    const num = bedroomMatch[1];
+    if (num === "studio") result.bedrooms = 0;
+    else if (num === "one") result.bedrooms = 1;
+    else if (num === "two") result.bedrooms = 2;
+    else if (num === "three") result.bedrooms = 3;
+    else if (num === "four") result.bedrooms = 4;
+    else if (num === "five") result.bedrooms = 5;
+    else result.bedrooms = parseInt(num);
+  }
+  
+  // Bathroom patterns
+  const bathroomMatch = q.match(/(\d+|one|two|three|four|half)\s*(bath|bathroom)/);
+  if (bathroomMatch) {
+    const num = bathroomMatch[1];
+    if (num === "half") result.bathrooms = 0.5;
+    else if (num === "one") result.bathrooms = 1;
+    else if (num === "two") result.bathrooms = 2;
+    else if (num === "three") result.bathrooms = 3;
+    else if (num === "four") result.bathrooms = 4;
+    else result.bathrooms = parseInt(num);
+  }
+  
+  return result.bedrooms !== null || result.bathrooms !== null ? result : null;
+}
+
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 📞 PHONE NUMBER EXTRACTION - COMPREHENSIVE FIX
+// ───────────────────────────────────────────────────────────────────────────────
+const NUMBER_WORDS_MAP = {
+  'zero': '0', 'oh': '0', 'o': '0',
+  'one': '1', 'won': '1',
+  'two': '2', 'to': '2', 'too': '2',
+  'three': '3', 'tree': '3',
+  'four': '4', 'for': '4', 'fore': '4',
+  'five': '5',
+  'six': '6', 'sicks': '6',
+  'seven': '7',
+  'eight': '8', 'ate': '8',
+  'nine': '9',
+  'ten': '10', 'eleven': '11', 'twelve': '12', 'thirteen': '13', 'fourteen': '14',
+  'fifteen': '15', 'sixteen': '16', 'seventeen': '17', 'eighteen': '18', 'nineteen': '19',
+  'twenty': '20', 'thirty': '30', 'forty': '40', 'fifty': '50', 'sixty': '60',
+  'seventy': '70', 'eighty': '80', 'ninety': '90',
+  'double': 'repeat_next', 'triple': 'triple_next'
+};
+
+
+function extractPhoneNumber(text) {
+  const q = normalize(text);
+  const phonePattern = /(\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4})/;
+  const match = q.match(phonePattern);
+  if (match) return match[1].replace(/\D/g, '');
+  
+  let digits = '';
+  const words = q.split(/\s+/);
+  let i = 0;
+  
+  while (i < words.length) {
+    const word = words[i];
+    
+    // Handle "double" pattern
+    if (word === 'double' && i + 1 < words.length) {
+      const nextDigit = NUMBER_WORDS_MAP[words[i + 1]];
+      if (nextDigit && nextDigit !== 'repeat_next' && nextDigit !== 'triple_next') {
+        digits += nextDigit + nextDigit;
+        i += 2;
+        continue;
+      }
+    }
+    
+    // Handle "triple" pattern
+    if (word === 'triple' && i + 1 < words.length) {
+      const nextDigit = NUMBER_WORDS_MAP[words[i + 1]];
+      if (nextDigit && nextDigit !== 'repeat_next' && nextDigit !== 'triple_next') {
+        digits += nextDigit + nextDigit + nextDigit;
+        i += 2;
+        continue;
+      }
+    }
+    
+    // Handle "X hundred" pattern - NEW!
+    if (i + 1 < words.length && words[i + 1] === 'hundred') {
+      const multiplierWord = word;
+      const multiplierDigit = NUMBER_WORDS_MAP[multiplierWord];
+      if (multiplierDigit && multiplierDigit.length === 1) {
+        // "two hundred" = 200, "three hundred" = 300
+        digits += multiplierDigit + '00';
+        i += 2;
+        continue;
+      }
+    }
+    
+    
+    // Regular number mapping
+    if (NUMBER_WORDS_MAP[word]) {
+      const mapped = NUMBER_WORDS_MAP[word];
+      if (mapped !== 'repeat_next' && mapped !== 'triple_next') {
+        digits += mapped;
+      }
+    }
+    
+    // Direct digits
+    if (/^\d+$/.test(word)) {
+      digits += word;
+    }
+    
+    i++;
+  }
+  return digits.length > 0 ? digits : null;
+}
+
+
+function formatPhoneNumber(digits) {
+  if (digits.length === 10) {
+    // Format with spaces so TTS says each digit: "6 1 7, 7 7 8, 5 4 5 4"
+    return `${digits[0]} ${digits[1]} ${digits[2]}, ${digits[3]} ${digits[4]} ${digits[5]}, ${digits[6]} ${digits[7]} ${digits[8]} ${digits[9]}`;
+  }
+  return digits;
+}
+
+function extractAddress(text) {
+  const q = normalize(text);
+  
+  // Look for common address patterns
+  // Number + Street name + Street type
+  const addressPattern = /\d+\s+[a-z]+\s+(street|st|avenue|ave|road|rd|drive|dr|lane|ln|way|circle|court|ct|boulevard|blvd|place|pl)/;
+  const match = q.match(addressPattern);
+  if (match) return match[0];
+  
+  // Just capture the full text if it seems like an address
+  // (Contains numbers and common street words)
+  if (q.match(/\d+/) && (q.includes('street') || q.includes('avenue') || q.includes('road'))) {
+    return text.trim();
   }
   
   return null;
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Date/time extraction
+// Intent routing with context and entity extraction
 // ───────────────────────────────────────────────────────────────────────────────
-function extractDateTime(text) {
+function routeWithContext(text, ctx) {
   const q = normalize(text);
   
-  // Days of week
-  const dayMap = {
-    monday: "Monday", tuesday: "Tuesday", wednesday: "Wednesday",
-    thursday: "Thursday", friday: "Friday", saturday: "Saturday", sunday: "Sunday",
-  };
-  
-  // Time patterns
-  const timePatterns = [
-    { regex: /(\d{1,2})\s*(am|pm|a m|p m)/i, format: (m) => `${m[1]} ${m[2].replace(" ", "").toUpperCase()}` },
-    { regex: /(\d{1,2})\s*o\s*clock/i, format: (m) => `${m[1]}:00` },
-    { regex: /(morning|afternoon|evening)/i, format: (m) => m[1] },
-  ];
-  
-  let date = null;
-  let time = null;
-  
-  // Extract day
-  for (const [key, value] of Object.entries(dayMap)) {
-    if (q.includes(key)) {
-      date = value;
-      break;
-    }
+  // Defensive: ensure context data object exists
+  if (!ctx.data) {
+    ctx.data = {
+      city: null,
+      date: null,
+      time: null,
+      bedrooms: null,
+      bathrooms: null,
+      cleaningType: null,
+      frequency: null,
+      phone: null,
+      address: null,
+    };
   }
   
-  // Extract time
-  for (const pattern of timePatterns) {
-    const match = q.match(pattern.regex);
-    if (match) {
-      time = pattern.format(match);
-      break;
-    }
+  // Extract entities from user input
+  const city = extractCity(text);
+  const dateTime = extractDateTime(text);
+  const rooms = extractRoomCount(text);
+  
+  // ONLY extract phone if we're in confirming state and don't have complete phone yet
+  let phone = null;
+  const currentPhoneTemp = ctx.data.phone || "";
+  if (ctx.state === "confirming" && currentPhoneTemp.length < 10) {
+    phone = extractPhoneNumber(text);
+    ctx.collectingPhone = true;
+  } else if (currentPhoneTemp.length >= 10) {
+    ctx.collectingPhone = false;
   }
   
-  return { date, time };
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// Main routing logic
-// ───────────────────────────────────────────────────────────────────────────────
-function routeWithContext(input, ctx) {
-  const q = normalize(input);
+  const address = extractAddress(text);
   
-  // 🔧 FIX BUG #1: ONLY extract phone if we're actively collecting it
-  if (ctx.collectingPhone) {
-    const digits = extractPhoneNumber(input);
-    if (digits.length > 0) {
-      ctx.data.phone += digits;
-      console.log(`[PHONE] Accumulated: ${ctx.data.phone} (added ${digits})`);
-      
-      // Check if complete
-      if (ctx.data.phone.length >= 10) {
-        // Format with spaces so TTS says each digit: "6 1 7, 7 7 8, 5 4 5 4"
-        const formatted = `${ctx.data.phone[0]} ${ctx.data.phone[1]} ${ctx.data.phone[2]}, ${ctx.data.phone[3]} ${ctx.data.phone[4]} ${ctx.data.phone[5]}, ${ctx.data.phone[6]} ${ctx.data.phone[7]} ${ctx.data.phone[8]} ${ctx.data.phone[9]}`;
-        ctx.collectingPhone = false; // Done collecting phone
-        ctx.askedFor = "address";
-        return ctx.t("phoneComplete")(formatted);
+  // Store extracted entities in context - with safe null checks
+  if (city) ctx.data.city = city;
+  if (dateTime && dateTime.day) ctx.data.date = dateTime.day;
+  if (dateTime && dateTime.time) ctx.data.time = dateTime.time;
+  if (rooms && rooms.bedrooms !== null && rooms.bedrooms !== undefined) {
+    ctx.data.bedrooms = rooms.bedrooms;
+  }
+  if (rooms && rooms.bathrooms !== null && rooms.bathrooms !== undefined) {
+    ctx.data.bathrooms = rooms.bathrooms;
+  }
+  if (address) ctx.data.address = address;
+  
+  // STATE: Waiting for date/time after asking for it
+  if (ctx.state === "booking" && dateTime) {
+    ctx.state = "confirming";
+    const dayStr = (ctx.data && ctx.data.date) ? ctx.data.date : "that day";
+    const timeStr = (ctx.data && ctx.data.time) ? ctx.data.time : "that time";
+    return `Perfect! I have you down for ${dayStr} at ${timeStr}. Can I get your phone number and address to confirm the booking?`;
+  }
+  
+  
+  // ───────────────────────────────────────────────────────────────────────────────
+  // STATE: Collecting contact info (phone and address) - PHONE FIX APPLIED
+  // ───────────────────────────────────────────────────────────────────────────────
+  if (ctx.state === "confirming") {
+    // ACCUMULATE phone digits instead of replacing
+    if (phone) {
+      ctx.data.phone += phone;
+      console.log(`[PHONE] Accumulated: ${ctx.data.phone} (added ${phone})`);
+    }
+    
+    const currentPhone = ctx.data.phone || "";
+    const hasCompletePhone = currentPhone.length >= 10;
+    const hasAddress = ctx.data.address;
+    
+    if (phone && !hasCompletePhone) {
+      const remaining = 10 - currentPhone.length;
+      if (remaining > 0) {
+        return `Got it. I need ${remaining} more digits.`;
+      }
+    }
+    
+    if (hasCompletePhone && !hasAddress) {
+      if (address) {
+        ctx.state = "complete";
+        const formatted = formatPhoneNumber(currentPhone);
+        return `Perfect! I have your booking for ${ctx.data.date || 'that day'} at ${ctx.data.time || 'that time'} at ${address}. We'll call you at ${formatted} to confirm. Thank you for choosing Clean Easy!`;
       } else {
-        const needed = 10 - ctx.data.phone.length;
-        return ctx.t("needMoreDigits")(needed);
+        const formatted = formatPhoneNumber(currentPhone);
+        return `Great, I have your number as ${formatted}. What's the address for the cleaning?`;
+      }
+    }
+    
+    if (address && !hasAddress && hasCompletePhone) {
+      ctx.state = "complete";
+      const formatted = formatPhoneNumber(currentPhone);
+      return `Perfect! I have your booking for ${ctx.data.date || 'that day'} at ${ctx.data.time || 'that time'} at ${address}. We'll call you at ${formatted} to confirm. Thank you for choosing Clean Easy!`;
+    }
+    
+    if (hasCompletePhone && hasAddress) {
+      ctx.state = "complete";
+      const formatted = formatPhoneNumber(currentPhone);
+      return `Perfect! I have your booking for ${ctx.data.date || 'that day'} at ${ctx.data.time || 'that time'} at ${ctx.data.address}. We'll call you at ${formatted} to confirm. Thank you for choosing Clean Easy!`;
+    }
+    
+    if (!phone && !address) {
+      // Handle conversational responses during phone collection
+      if (q.includes("what") || q.includes("have") || q.includes("so far")) {
+        // User is asking what we have
+        if (currentPhone && currentPhone.length > 0) {
+          const formatted = currentPhone.length === 10 ? formatPhoneNumber(currentPhone) : currentPhone;
+          const remaining = 10 - currentPhone.length;
+          if (remaining > 0) {
+            return `I have ${formatted} so far. I need ${remaining} more digits.`;
+          } else {
+            return `I have your number as ${formatted}. What's the address for the cleaning?`;
+          }
+        } else {
+          return "I don't have any digits yet. Can you give me your phone number?";
+        }
+      }
+      
+      // Handle acknowledgments (okay, sure, yes) - just repeat what we need
+      if (q.match(/^(okay|ok|sure|yes|yeah|yep|alright)\b/)) {
+        if (!currentPhone || currentPhone.length === 0) {
+          return "Can you give me your phone number? Say the digits one at a time.";
+        } else if (!hasCompletePhone) {
+          const remaining = 10 - currentPhone.length;
+          return `I need ${remaining} more digits for your phone number.`;
+        } else if (!hasAddress) {
+          return "What's the address for the cleaning?";
+        }
+      }
+      
+      // Default - didn't catch anything useful
+      if (!currentPhone || currentPhone.length === 0) {
+        return "I didn't catch that. Can you give me your phone number? Say the digits one at a time.";
+      } else if (!hasCompletePhone) {
+        const remaining = 10 - currentPhone.length;
+        return `I need ${remaining} more digits for your phone number.`;
+      } else if (!hasAddress) {
+        return "And what's the address for the cleaning?";
       }
     }
   }
   
-  // Extract city (always check for city mentions)
-  const city = extractCity(input);
-  if (city) {
-    ctx.data.city = city;
+  // STATE: Waiting for room count after asking for it
+  if (ctx.state === "pricing" && rooms) {
+    // Defensive: ensure data object exists and has default values
+    if (!ctx.data) ctx.data = {};
+    const bed = ctx.data.bedrooms ?? 1;
+    const bath = ctx.data.bathrooms ?? 1;
+    const price = 100 + (bed * 30) + (bath * 20);
+    return `For a ${bed === 0 ? 'studio' : bed + ' bedroom'} with ${bath} bathroom, our standard cleaning starts at around $${price}. Would you like to book a cleaning?`;
   }
   
-  // Extract date/time (always check)
-  const { date, time } = extractDateTime(input);
-  if (date) ctx.data.date = date;
-  if (time) ctx.data.time = time;
-  
-  // SERVICE AREA QUESTIONS
-  if (q.match(/\b(service|available|area|cover|you say|do you)\b/)) {
-    if (ctx.data.city && SERVICE_AREAS.includes(ctx.data.city)) {
-      return ctx.t("serviceConfirm")(ctx.data.city);
-    }
-    if (ctx.data.city) {
-      ctx.askedFor = "phone";
-      ctx.collectingPhone = true; // Start collecting phone
-      return ctx.t("serviceUnknown")(ctx.data.city);
+  // Service area question with city mentioned - includes conversational queries
+  if (city && (q.includes("available") || q.includes("service") || q.includes("area") || q.includes("come") || q.includes("you say") || q.includes("did you") || q.includes("do you mean") || q.includes("is that") || q.includes("you mean"))) {
+    if (SERVICE_AREAS.includes(city)) {
+      ctx.state = "booking";
+      return `Yes, we service ${city}! What date and time work best for you?`;
+    } else {
+      return `I'm sorry, we don't currently service ${city}. We serve the Greater Boston area including Cambridge, Somerville, Brookline, Newton, and surrounding cities.`;
     }
   }
   
-  // PHONE COLLECTION - Start collecting
-  if (q.match(/\b(phone|number|call|contact)\b/) || ctx.askedFor === "phone") {
-    if (!ctx.collectingPhone && ctx.data.phone.length < 10) {
-      ctx.collectingPhone = true;
-      ctx.askedFor = "phone";
-      return ctx.t("askPhone");
+  // FALLBACK: City mentioned but without clear service keywords
+  // Handles: "quincy", "that are quincy", "what about", etc.
+  if (city && words.length <= 5) {
+    // User mentioned a city in a short response - likely answering "What area are you in?"
+    if (SERVICE_AREAS.includes(city)) {
+      ctx.state = "booking";
+      return `Yes, we service ${city}! What date and time work best for you?`;
+    } else {
+      return `I'm sorry, we don't currently service ${city}. We serve the Greater Boston area including Cambridge, Somerville, Brookline, Newton, and surrounding cities.`;
     }
   }
   
-  // ADDRESS COLLECTION
-  if (ctx.askedFor === "address" || q.match(/\b(address|street|avenue|road|apt|unit)\b/)) {
-    // Extract address - but don't extract phone digits here!
-    if (input.length > 3 && !ctx.collectingPhone) {
-      ctx.data.address = input;
-      ctx.askedFor = null;
-      
-      // If we have all booking details, confirm
-      if (ctx.data.city && ctx.data.date && ctx.data.time && ctx.data.phone && ctx.data.address) {
-        // Format with spaces so TTS says each digit
-        const formatted = `${ctx.data.phone[0]} ${ctx.data.phone[1]} ${ctx.data.phone[2]}, ${ctx.data.phone[3]} ${ctx.data.phone[4]} ${ctx.data.phone[5]}, ${ctx.data.phone[6]} ${ctx.data.phone[7]} ${ctx.data.phone[8]} ${ctx.data.phone[9]}`;
-        return ctx.t("confirmBooking")({
-          city: ctx.data.city,
-          date: ctx.data.date,
-          time: ctx.data.time,
-          phone: formatted,
-          address: ctx.data.address,
-        });
-      }
-      
-      return "Thank you. Can you confirm your name and email address?";
+  // Availability / Booking / Scheduling (without city)
+  if (q.includes("available") || q.includes("availability") || 
+      q.includes("book") || q.includes("appointment") || 
+      q.includes("schedule") || q.includes("reserve")) {
+    ctx.state = "booking";
+    return "Yes, we're available! What date and time work best for you?";
+  }
+  
+  // They provided date/time without us asking
+  if (dateTime && ctx.state !== "booking") {
+    ctx.state = "confirming";
+    const dayStr = (ctx.data && ctx.data.date) ? ctx.data.date : "that day";
+    const timeStr = (ctx.data && ctx.data.time) ? ctx.data.time : "that time";
+    return `Great! I can schedule you for ${dayStr} at ${timeStr}. What's your address and phone number?`;
+  }
+  
+  // Service area check (general)
+  if (q.includes("area") || q.includes("service") || q.includes("where") ||
+      q.includes("location") || q.includes("come to")) {
+    return "We service the Greater Boston area including Cambridge, Somerville, Brookline, Newton, and surrounding cities. What area are you in?";
+  }
+  
+  // Hours / Open times
+  if (q.includes("hour") || q.includes("open") || q.includes("close") ||
+      q.includes("when") && (q.includes("open") || q.includes("available"))) {
+    return "We're open 8 AM to 6 PM Monday through Friday, and 9 AM to 2 PM on Saturday.";
+  }
+  
+  // Pricing
+  if (q.includes("price") || q.includes("pricing") || q.includes("cost") || 
+      q.includes("how much") || q.includes("charge")) {
+    ctx.state = "pricing";
+    return "Our pricing depends on the size of your space and the type of cleaning. How many bedrooms and bathrooms do you have?";
+  }
+  
+  // Types of cleaning
+  if (q.includes("deep clean") || q.includes("move out") || q.includes("airbnb") ||
+      q.includes("type") && q.includes("clean")) {
+    return "We offer standard cleaning, deep cleaning, Airbnb turnover, and move-out cleaning. Which are you interested in?";
+  }
+  
+  // Affirmative responses (yes, yeah, sure)
+  if (q.match(/^(yes|yeah|yep|sure|ok|okay)\b/)) {
+    if (ctx.state === "pricing") {
+      ctx.state = "booking";
+      return "Great! What date and time work best for you?";
     }
+    return "Great! What specifically would you like help with - booking a cleaning, pricing information, or something else?";
   }
   
-  // HELP / GENERAL
-  if (q.match(/\b(help|what can|services|hours|price|cost)\b/)) {
-    return ctx.t("help");
+  // Greetings - ONLY if it's just a greeting with no other content (moved to end)
+  // Check if the message is ONLY a greeting (5 words or less, no substantive keywords)
+  const words = q.split(/\s+/);
+  const isJustGreeting = words.length <= 5 && 
+    q.match(/^(hi|hello|hey|good morning|good afternoon|good evening)\b/) &&
+    !q.includes("available") && !q.includes("book") && !q.includes("price") &&
+    !q.includes("hour") && !q.includes("service") && !q.includes("clean");
+  
+  if (isJustGreeting && !ctx.greeted) {
+    return "Hello! How can I help you today?";
   }
   
-  // FALLBACK
-  return ctx.t("didntCatch");
+  // Default - encourage specifics
+  return "I can help with booking, pricing, service areas, and hours. What would you like to know?";
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Deepgram connection
+// Deepgram realtime STT
 // ───────────────────────────────────────────────────────────────────────────────
-function connectDeepgram(onFinal, onPartialTimeout, lang, ws) {
-  const languageMap = { en: "en-US", es: "es", pt: "pt" };
-  const dgLang = languageMap[lang] || "en-US";
-  const url = `wss://api.deepgram.com/v1/listen?language=${dgLang}&punctuate=false&encoding=linear16&sample_rate=${SAMPLE_RATE}`;
+function connectDeepgram(onFinal, onAnyTranscript, lang = "en", ws) {
+  if (!DG_KEY) {
+    console.warn("⚠️ DEEPGRAM_API_KEY missing — STT disabled.");
+    return null;
+  }
   
+  const langCode = lang === "es" ? "es" : lang === "pt" ? "pt" : "en";
+  const url = `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&language=${langCode}&punctuate=true&endpointing=true`;
   const dg = new WebSocket(url, { headers: { Authorization: `Token ${DG_KEY}` } });
-  
-  let partialTimer;
-  let lastPartialText = "";
-  
-  dg.on("open", () => console.log("[DG] connected"));
-  
-  dg.on("message", (data) => {
-    let result;
-    try { result = JSON.parse(data.toString()); } catch { return; }
-    
-    const transcript = result?.channel?.alternatives?.[0]?.transcript || "";
-    if (!transcript || transcript.trim() === "") return;
-    
-    if (result.is_final) {
-      if (partialTimer) {
-        clearTimeout(partialTimer);
-        partialTimer = null;
-      }
-      lastPartialText = "";
-      console.log(`[ASR] ${safeLog(transcript)}`);
-      onFinal(transcript);
-    } else {
-      lastPartialText = transcript;
-      if (partialTimer) clearTimeout(partialTimer);
-      partialTimer = setTimeout(() => {
-        if (lastPartialText && lastPartialText.trim() !== "") {
-          console.log(`[ASR] promoted partial: ${safeLog(lastPartialText)}`);
-          onFinal(lastPartialText);
-          lastPartialText = "";
-        }
-      }, ASR_PARTIAL_PROMOTE_MS);
-      
-      if (onPartialTimeout) onPartialTimeout();
+
+  let lastPartial = "";
+  let partialTimer = null;
+
+  function promotePartial(reason = "idle") {
+    if (!lastPartial) return;
+    const promoted = lastPartial.trim();
+    lastPartial = "";
+    if (partialTimer) { clearTimeout(partialTimer); partialTimer = null; }
+    if (promoted) {
+      console.log(`[ASR promote:${reason}] ${safeLog(promoted)}`);
+      onFinal(promoted);
     }
+  }
+
+  dg.on("open", () => console.log("[DG] connected"));
+  dg.on("message", (d) => {
+    try {
+      const msg = JSON.parse(d.toString());
+      const alt = msg.channel?.alternatives?.[0];
+      const transcript = alt?.transcript?.trim() || "";
+
+      if (transcript) onAnyTranscript?.(transcript);
+
+      if (transcript && (msg.is_final || msg.speech_final)) {
+        if (partialTimer) { clearTimeout(partialTimer); partialTimer = null; }
+        lastPartial = "";
+        console.log(`[ASR] ${safeLog(transcript)}`);
+        onFinal(transcript);
+        return;
+      }
+      if (transcript) {
+        lastPartial = transcript;
+        if (partialTimer) clearTimeout(partialTimer);
+        partialTimer = setTimeout(() => promotePartial("timeout"), ASR_PARTIAL_PROMOTE_MS);
+      }
+    } catch {}
   });
-  
-  dg.on("error", (err) => console.error("[DG] error", err));
   dg.on("close", () => {
     console.log("[DG] close");
-    if (partialTimer) clearTimeout(partialTimer);
+    promotePartial("dg_close");
   });
-  
+  dg.on("error", (e) => console.error("[DG] error", e.message));
   return dg;
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// Stream frames
-// ───────────────────────────────────────────────────────────────────────────────
-async function streamFrames(ws, buf) {
-  const frameSize = MEDIA_FORMAT === "mulaw" ? BYTES_PER_FRAME_MULAW : BYTES_PER_FRAME_PCM16;
-  for (let offset = 0; offset < buf.length; offset += frameSize) {
-    const chunk = buf.slice(offset, offset + frameSize);
-    if (chunk.length === 0) continue;
-    
-    const paddedChunk = chunk.length < frameSize ? 
-      Buffer.concat([chunk, Buffer.alloc(frameSize - chunk.length)]) : chunk;
-    
-    const msg = JSON.stringify({
-      event: "media",
-      streamSid: ws._streamSid,
-      media: { payload: paddedChunk.toString("base64") },
-    });
-    
-    if (ws.readyState === ws.OPEN) {
-      ws.send(msg);
-      await new Promise((r) => setImmediate(r));
-    }
-  }
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
 // WebSocket
 // ───────────────────────────────────────────────────────────────────────────────
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 wss.on("connection", (ws, req) => {
   console.log("🔗 WebSocket connected");
@@ -650,7 +860,7 @@ wss.on("connection", (ws, req) => {
   };
 
   const handleFinal = async (finalText) => {
-    // 🔧 FIX BUG #2: Use longer grace period during phone collection
+    // Use longer grace period when collecting phone to avoid interrupting mid-sentence
     const currentGracePeriod = ws._ctx.collectingPhone ? PHONE_COLLECTION_GRACE_MS : POST_TTS_GRACE_MS;
     
     if (Date.now() < ws._graceUntil) {
@@ -706,8 +916,9 @@ wss.on("connection", (ws, req) => {
       }
     } finally {
       ws._speaking = false;
-      // 🔧 FIX BUG #2: Apply appropriate grace period
-      ws._graceUntil = Date.now() + currentGracePeriod;
+      // Use appropriate grace period based on collection state
+      const gracePeriod = ws._ctx.collectingPhone ? PHONE_COLLECTION_GRACE_MS : POST_TTS_GRACE_MS;
+      ws._graceUntil = Date.now() + gracePeriod;
       resetNoInputTimer();
     }
   };
@@ -733,17 +944,14 @@ wss.on("connection", (ws, req) => {
       // Greeting
       try {
         const text = ws._ctx.t("greeting");
-        console.log(`[GREETING] Attempting to say: "${safeLog(text)}"`);
         const buf = MEDIA_FORMAT === "mulaw" ? 
           await ttsToMulaw(text) : 
           await ttsToPcm16(text);
-        console.log(`[GREETING] TTS generated ${buf.length} bytes`);
         await streamFrames(ws, buf);
-        console.log(`[GREETING] Successfully streamed greeting`);
         ws._ctx.greeted = true;
         // NO grace period after greeting - user should be able to respond immediately
       } catch (e) {
-        console.error("[TTS] greeting failed:", e.message, e.stack);
+        console.error("[TTS] greeting failed:", e.message);
       }
       resetNoInputTimer();
     }
