@@ -1,296 +1,382 @@
-working server.js after last working with tts and stt working from voice - 
-
-
-// server.js — Twilio <-> ElevenLabs media bridge
-// Safe default: inbound-only. Flip ALLOW_BIDIRECTIONAL=true once Twilio enables it for your account.
-// Node 18+ (for FormData/Blob via undici). Set ELEVEN_API_KEY in Render env.
-
 import express from "express";
-import { createServer } from "http";
-import { WebSocketServer } from "ws";
 import fetch from "node-fetch";
+import WebSocket, { WebSocketServer } from "ws";
+import { spawn } from "child_process";
+import ffmpegBin from "@ffmpeg-installer/ffmpeg";
 
-// ------------------ CONFIG ------------------
-const PORT = process.env.PORT || 10000;
-const ALLOW_BIDIRECTIONAL = (process.env.ALLOW_BIDIRECTIONAL || "false").toLowerCase() === "true";
-
-const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY || "";
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "21m00Tcm4TlvDq8ikWAM"; // Rachel
-const ELEVEN_TTS_URL = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
-const ELEVEN_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text";
-const ELEVEN_STT_MODEL = "scribe_v1";
-
-// Twilio media framing (for outbound when enabled)
-const FRAME_MS = 20;           // 20 ms frames
-const BYTES_PER_FRAME = 160;   // 20 ms @ 8kHz μ-law
-const SILENCE_ULAW = 0xff;
-
-// Simple STT chunking
-const CHUNK_MS = 1500;
-const FRAMES_PER_CHUNK = Math.round(CHUNK_MS / FRAME_MS);
-const ENERGY_GATE = 300;       // RMS gate
-
-// ------------------ HTTP ------------------
+// ───────────────────────────────────────────────────────────────────────────────
+// Config
+// ───────────────────────────────────────────────────────────────────────────────
 const app = express();
-app.get("/", (_req, res) => res.send("OK")); // Health check
-const server = createServer(app);
+const PORT = process.env.PORT || 10000;
 
-// ------------------ WS SERVER ------------------
-const wss = new WebSocketServer({ noServer: true });
+const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL";
+const DG_KEY = process.env.DEEPGRAM_API_KEY || "";
 
-// accept upgrades from any path and log it
-server.on("upgrade", (req, socket, head) => {
-  try { console.log("[UPGRADE] url:", req.url); } catch {}
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-});
+const MEDIA_FORMAT = (process.env.TWILIO_MEDIA_FORMAT || "pcm16").toLowerCase();
+if (!ELEVEN_API_KEY) console.error("❌ ELEVEN_API_KEY is not set");
+if (!["pcm16", "mulaw"].includes(MEDIA_FORMAT)) {
+  console.warn(`⚠️ Unknown TWILIO_MEDIA_FORMAT='${MEDIA_FORMAT}', defaulting to pcm16`);
+}
 
-wss.on("connection", (ws, req) => {
-  console.log("🔗 WebSocket connected from", req.socket?.remoteAddress);
+// Timing / frame sizes
+const SAMPLE_RATE = 8000;
+const FRAME_MS = 20;
+const BYTES_PER_SAMPLE_PCM16 = 2;
+const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS; // 160 @ 8kHz, 20ms
+const BYTES_PER_FRAME_PCM16 = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE_PCM16; // 320
+const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1; // 160
 
-  let streamSid = null;
-  let framesSeen = 0;
-  let voicedFrames = 0;
-  let chunkPieces = [];          // Int16Array list
-  let sttBusy = false;
-  let ttsBusy = false;
+// ASR behavior
+const ASR_PARTIAL_PROMOTE_MS = 1200;   // promote latest partial to "final" if ASR goes idle
+const NO_INPUT_REPROMPT_MS = 7000;     // reprompt if caller silent this long
 
-  // keepalive to avoid idle closes
-  const keepAlive = setInterval(() => {
-    if (ws.readyState === ws.OPEN) ws.ping();
-  }, 15000);
-
-  ws.on("message", async (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-    if (msg.event === "start") {
-      streamSid = msg.start?.streamSid;
-      console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${streamSid}  bidi=${ALLOW_BIDIRECTIONAL}`);
-
-      // Send greeting only when bidirectional is allowed
-      if (ALLOW_BIDIRECTIONAL && !ttsBusy) {
-        ttsBusy = true;
-        const greet = await ttsUlaw8k("You are connected. Say something and I will echo it back.");
-        if (greet) await sendUlawFrames(ws, streamSid, greet);
-        ttsBusy = false;
-      }
-      return;
-    }
-
-    if (msg.event === "media") {
-      // inbound μ-law (20ms)
-      const ulaw = Buffer.from(msg.media.payload, "base64");
-      const pcm16 = ulawToPcm16(ulaw);
-
-      // basic VAD
-      if (rms(pcm16) > ENERGY_GATE) {
-        chunkPieces.push(pcm16);
-        voicedFrames++;
-      }
-      framesSeen++;
-
-      // every ~1.5s run STT, then optionally TTS back
-      if (framesSeen >= FRAMES_PER_CHUNK && !sttBusy) {
-        framesSeen = 0;
-
-        if (voicedFrames < 4) { // ~80ms voiced
-          voicedFrames = 0;
-          chunkPieces = [];
-          return;
-        }
-
-        sttBusy = true;
-        const wav = pcm16ChunksToWav(chunkPieces, 8000);
-        voicedFrames = 0;
-        chunkPieces = [];
-
-        const text = await sttOnce(wav);
-        sttBusy = false;
-
-        if (text) {
-          console.log("[STT]", text);
-
-          if (ALLOW_BIDIRECTIONAL && !ttsBusy) {
-            ttsBusy = true;
-            const reply = await ttsUlaw8k(`You said: ${text}`);
-            if (reply) await sendUlawFrames(ws, streamSid, reply);
-            ttsBusy = false;
-          }
-        }
-      }
-      return;
-    }
-
-    if (msg.event === "stop") {
-      console.log("[WS] STOP");
-      return;
-    }
-
-    if (msg.event === "warning" || msg.event === "error") {
-      console.warn(`[WS] ${msg.event.toUpperCase()}:`, msg);
-      return;
-    }
-
-    console.log("[WS] event:", msg);
-  });
-
-  ws.on("close", (code, reason) => {
-    clearInterval(keepAlive);
-    console.log(`[WS] CLOSE code=${code} reason=${reason}`);
-  });
-
-  ws.on("error", (err) => console.error("[WS] ERROR", err));
-});
-
-server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
-
-// ------------------ AUDIO HELPERS ------------------
-
-// μ-law byte -> PCM16 (approx)
-function ulawByteToLinear(u) {
+// ───────────────────────────────────────────────────────────────────────────────
+// Utilities (beeps + μ-law compand/decompand)
+// ───────────────────────────────────────────────────────────────────────────────
+function makeBeepPcm16(ms = 180, hz = 950) {
+  const samples = Math.floor((SAMPLE_RATE * ms) / 1000);
+  const buf = Buffer.alloc(samples * BYTES_PER_SAMPLE_PCM16);
+  for (let i = 0; i < samples; i++) {
+    const t = i / SAMPLE_RATE;
+    const s = Math.round(0.18 * 32767 * Math.sin(2 * Math.PI * hz * t));
+    buf.writeInt16LE(s, i * 2);
+  }
+  return buf;
+}
+function linearToMulawSample(s) {
+  const BIAS = 0x84, CLIP = 32635;
+  let sign = (s >> 8) & 0x80;
+  if (sign) s = -s;
+  if (s > CLIP) s = CLIP;
+  s = s + BIAS;
+  let exponent = 7;
+  for (let mask = 0x4000; (s & mask) === 0 && exponent > 0; exponent--, mask >>= 1) {}
+  const mantissa = (s >> (exponent + 3)) & 0x0f;
+  return (~(sign | (exponent << 4) | mantissa)) & 0xff;
+}
+function mulawToLinearSample(u) {
   u = ~u & 0xff;
   const sign = (u & 0x80) ? -1 : 1;
   const exponent = (u >> 4) & 0x07;
   const mantissa = u & 0x0f;
-  let sample = ((mantissa << 1) + 1) << (exponent + 2);
-  sample -= 33;
-  sample = sign * sample;
-  if (sample > 32767) sample = 32767;
-  if (sample < -32768) sample = -32768;
-  return sample;
+  let sample = ((mantissa << 3) + 0x84) << exponent;
+  sample -= 0x84;
+  return sign * sample;
 }
-
-function ulawToPcm16(ulawBuf) {
-  const out = new Int16Array(ulawBuf.length);
-  for (let i = 0; i < ulawBuf.length; i++) out[i] = ulawByteToLinear(ulawBuf[i]);
+function makeBeepMulaw(ms = 180, hz = 950) {
+  const pcm = makeBeepPcm16(ms, hz);
+  const out = Buffer.alloc(pcm.length / 2);
+  for (let i = 0, j = 0; i < pcm.length; i += 2, j++) {
+    out[j] = linearToMulawSample(pcm.readInt16LE(i));
+  }
   return out;
 }
 
-function rms(int16) {
-  let s = 0;
-  for (let i = 0; i < int16.length; i++) s += int16[i] * int16[i];
-  return Math.sqrt(s / (int16.length || 1));
-}
-
-// Merge Int16 chunks -> mono 8kHz WAV
-function pcm16ChunksToWav(chunks, sr = 8000) {
-  let total = 0;
-  for (const c of chunks) total += c.length;
-  const merged = new Int16Array(total);
-  let off = 0;
-  for (const c of chunks) { merged.set(c, off); off += c.length; }
-
-  const numChannels = 1;
-  const byteRate = sr * numChannels * 2;
-  const blockAlign = numChannels * 2;
-  const dataSize = merged.length * 2;
-  const buf = Buffer.alloc(44 + dataSize);
-
-  buf.write("RIFF", 0);
-  buf.writeUInt32LE(36 + dataSize, 4);
-  buf.write("WAVE", 8);
-  buf.write("fmt ", 12);
-  buf.writeUInt32LE(16, 16);
-  buf.writeUInt16LE(1, 20);
-  buf.writeUInt16LE(numChannels, 22);
-  buf.writeUInt32LE(sr, 24);
-  buf.writeUInt32LE(byteRate, 28);
-  buf.writeUInt16LE(blockAlign, 32);
-  buf.writeUInt16LE(16, 34);
-  buf.write("data", 36);
-  buf.writeUInt32LE(dataSize, 40);
-
-  for (let i = 0; i < merged.length; i++) {
-    buf.writeInt16LE(merged[i], 44 + i * 2);
+// Decode incoming Twilio frame → PCM16 (Deepgram needs linear16)
+function inboundToPCM16(buf) {
+  if (MEDIA_FORMAT === "pcm16") return buf; // already LE s16
+  // μ-law → PCM16
+  const out = Buffer.alloc(buf.length * 2);
+  for (let i = 0, j = 0; i < buf.length; i++, j += 2) {
+    out.writeInt16LE(mulawToLinearSample(buf[i]), j);
   }
-  return buf;
+  return out;
 }
 
-// Extract 'data' from WAV if the TTS response is RIFF; otherwise return raw μ-law
-function extractWavDataIfNeeded(buf) {
-  if (buf.length >= 12 &&
-      buf.slice(0, 4).toString() === "RIFF" &&
-      buf.slice(8, 12).toString() === "WAVE") {
-    let pos = 12;
-    while (pos + 8 <= buf.length) {
-      const id = buf.slice(pos, pos + 4).toString();
-      const size = buf.readUInt32LE(pos + 4);
-      const next = pos + 8 + size;
-      if (id === "data") return buf.slice(pos + 8, pos + 8 + size);
-      pos = next;
-    }
-  }
-  return buf;
-}
-
-// ------------------ ELEVENLABS ------------------
-
-// TTS -> μ-law 8kHz (raw μ-law bytes)
-async function ttsUlaw8k(text) {
-  if (!ELEVEN_API_KEY) { console.warn("[TTS] Missing ELEVEN_API_KEY"); return null; }
-
-  const resp = await fetch(ELEVEN_TTS_URL, {
+// ───────────────────────────────────────────────────────────────────────────────
+// TTS via ElevenLabs (MP3) → ffmpeg → target format buffer
+// ───────────────────────────────────────────────────────────────────────────────
+async function ttsElevenLabsRaw(text) {
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
+  const res = await fetch(url, {
     method: "POST",
     headers: {
       "xi-api-key": ELEVEN_API_KEY,
       "Content-Type": "application/json",
-      "Accept": "application/octet-stream"
+      Accept: "audio/mpeg",
     },
-    body: JSON.stringify({ text, output_format: "ulaw_8000" })
+    body: JSON.stringify({ text, voice_settings: { stability: 0.4, similarity_boost: 0.7 } }),
   });
+  if (!res.ok) {
+    throw new Error(`ElevenLabs TTS failed: ${res.status} ${res.statusText} ${await res.text()}`);
+  }
+  return Buffer.from(await res.arrayBuffer());
+}
 
-  const arr = await resp.arrayBuffer();
-  if (!resp.ok) {
-    console.warn("[TTS] HTTP", resp.status, Buffer.from(arr).toString());
+function ffmpegTranscode(inputBuf, args) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const ff = spawn(ffmpegBin.path, args);
+    ff.stdin.on("error", () => {});
+    ff.stdout.on("data", d => chunks.push(d));
+    ff.stderr.on("data", d => console.error("[ffmpeg]", d.toString().trim()));
+    ff.on("close", code => code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`ffmpeg exited ${code}`)));
+    ff.stdin.end(inputBuf);
+  });
+}
+
+async function ttsToPcm16(text) {
+  const input = await ttsElevenLabsRaw(text);
+  console.log("[TTS] Received MP3. → PCM16/8k/mono");
+  let out = await ffmpegTranscode(input, [
+    "-hide_banner","-nostdin","-loglevel","error",
+    "-i","pipe:0","-ac","1","-ar","8000",
+    "-f","s16le","-acodec","pcm_s16le","pipe:1",
+  ]);
+  if (out.length % 2 !== 0) out = out.slice(0, out.length - 1);
+  return out;
+}
+async function ttsToMulaw(text) {
+  const input = await ttsElevenLabsRaw(text);
+  console.log("[TTS] Received MP3. → μ-law/8k/mono");
+  return await ffmpegTranscode(input, [
+    "-hide_banner","-nostdin","-loglevel","error",
+    "-i","pipe:0","-ac","1","-ar","8000",
+    "-f","mulaw","-acodec","pcm_mulaw","pipe:1",
+  ]);
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Outbound streaming (Twilio frames)
+// ───────────────────────────────────────────────────────────────────────────────
+async function streamFrames(ws, raw) {
+  const bytesPerFrame = MEDIA_FORMAT === "mulaw" ? BYTES_PER_FRAME_MULAW : BYTES_PER_FRAME_PCM16;
+  let offset = 0, frames = 0;
+  while (offset < raw.length && ws.readyState === ws.OPEN) {
+    const end = Math.min(offset + bytesPerFrame, raw.length);
+    let frame = raw.slice(offset, end);
+    if (frame.length < bytesPerFrame) {
+      const padded = Buffer.alloc(bytesPerFrame);
+      frame.copy(padded, 0);
+      frame = padded;
+    }
+    ws.send(JSON.stringify({ event: "media", streamSid: ws._streamSid, media: { payload: frame.toString("base64") } }));
+    frames++;
+    if (frames % 100 === 0) console.log(`[TTS] sent ${frames} frames (~${(frames * FRAME_MS) / 1000}s)`);
+    await new Promise(r => setTimeout(r, FRAME_MS));
+    offset += bytesPerFrame;
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Simple intent routing
+// ───────────────────────────────────────────────────────────────────────────────
+function normalize(s) {
+  return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function routeIntent(text) {
+  const q = normalize(text);
+  if (q.includes("hour") || q.includes("open") || q.includes("close")) {
+    return "We’re open 8 AM to 6 PM Monday through Friday, and 9 AM to 2 PM on Saturday.";
+  }
+  if (q.includes("book") || q.includes("appointment") || q.includes("schedule")) {
+    return "Sure—what date and time are you looking for? Please say something like Saturday at 2 PM.";
+  }
+  if (q.includes("availability") || q.includes("available")) {
+    return "Happy to check—what date and time would you like?";
+  }
+  return "I can help with booking and general questions. What would you like to do?";
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Deepgram realtime with partial buffering + idle promotion
+// ───────────────────────────────────────────────────────────────────────────────
+function connectDeepgram(onFinal, onAnyTranscript) {
+  if (!DG_KEY) {
+    console.warn("⚠️ DEEPGRAM_API_KEY missing — STT disabled.");
     return null;
   }
-  return extractWavDataIfNeeded(Buffer.from(arr));
-}
+  const url = `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&punctuate=true&vad_events=true&endpointing=true`;
+  const dg = new WebSocket(url, { headers: { Authorization: `Token ${DG_KEY}` } });
 
-// STT once (upload small WAV) using scribe_v1
-async function sttOnce(wavBuffer) {
-  if (!ELEVEN_API_KEY) { console.warn("[STT] Missing ELEVEN_API_KEY"); return null; }
+  let lastPartial = "";
+  let partialTimer = null;
 
-  const form = new FormData();
-  form.append("model_id", ELEVEN_STT_MODEL);
-  form.append("file", new Blob([wavBuffer], { type: "audio/wav" }), "audio.wav");
+  function promotePartial(reason = "idle") {
+    if (!lastPartial) return;
+    const promoted = lastPartial.trim();
+    lastPartial = "";
+    if (partialTimer) { clearTimeout(partialTimer); partialTimer = null; }
+    if (promoted) {
+      console.log(`[ASR promote:${reason}] ${promoted}`);
+      onFinal(promoted);
+    }
+  }
 
-  const resp = await fetch(ELEVEN_STT_URL, {
-    method: "POST",
-    headers: { "xi-api-key": ELEVEN_API_KEY },
-    body: form
+  dg.on("open", () => console.log("[DG] connected"));
+
+  dg.on("message", (d) => {
+    try {
+      const msg = JSON.parse(d.toString());
+
+      // Log VAD-ish events if present
+      if (msg.type === "SpeechStarted" || msg.type === "SpeechEnded") {
+        console.log(`[DG] ${msg.type}`);
+      }
+
+      const alt = msg.channel?.alternatives?.[0];
+      const transcript = alt?.transcript?.trim() || "";
+
+      // Callback on ANY transcript (for resetting no-input timer)
+      if (transcript) onAnyTranscript?.(transcript);
+
+      // Final path
+      if (transcript && (msg.is_final || msg.speech_final)) {
+        if (partialTimer) { clearTimeout(partialTimer); partialTimer = null; }
+        lastPartial = "";
+        console.log(`[ASR] ${transcript}`);
+        onFinal(transcript);
+        return;
+      }
+
+      // Partial path
+      if (transcript) {
+        lastPartial = transcript;
+        console.log(`[ASR~] ${lastPartial}`);
+        // reset promote timer
+        if (partialTimer) clearTimeout(partialTimer);
+        partialTimer = setTimeout(() => promotePartial("timeout"), ASR_PARTIAL_PROMOTE_MS);
+      }
+    } catch {
+      // ignore parse errors
+    }
   });
 
-  const txt = await resp.text();
-  if (!resp.ok) { console.warn("[STT] HTTP", resp.status, txt); return null; }
+  dg.on("close", () => {
+    console.log("[DG] close");
+    // If DG closes with a buffered partial, promote it so we don't miss the user's last words
+    promotePartial("dg_close");
+  });
+  dg.on("error", (e) => console.error("[DG] error", e.message));
 
-  try { const j = JSON.parse(txt); return j.text || j.transcription || txt; }
-  catch { return txt; }
+  return dg;
 }
 
-// Send μ-law bytes as 160-byte frames every 20 ms (only when bidirectional is enabled)
-async function sendUlawFrames(ws, streamSid, ulawBuf) {
-  if (!ALLOW_BIDIRECTIONAL) return;               // guard for accounts without bidi feature
-  if (!ulawBuf || !ulawBuf.length || !streamSid) return;
+// ───────────────────────────────────────────────────────────────────────────────
+// WebSocket (Twilio <Stream> → wss://…/stream)
+// ───────────────────────────────────────────────────────────────────────────────
+const wss = new WebSocketServer({ noServer: true });
 
-  for (let o = 0; o < ulawBuf.length; o += BYTES_PER_FRAME) {
-    if (ws.readyState !== ws.OPEN) break;
+wss.on("connection", (ws) => {
+  console.log("🔗 WebSocket connected");
+  ws._rx = 0;
+  ws._speaking = false;
 
-    let frame = ulawBuf.slice(o, Math.min(o + BYTES_PER_FRAME, ulawBuf.length));
-    if (frame.length < BYTES_PER_FRAME) {
-      const pad = Buffer.alloc(BYTES_PER_FRAME, SILENCE_ULAW);
-      frame.copy(pad);
-      frame = pad;
+  let noInputTimer = null;
+  const resetNoInputTimer = () => {
+    if (noInputTimer) clearTimeout(noInputTimer);
+    noInputTimer = setTimeout(async () => {
+      if (ws._speaking) return;
+      ws._speaking = true;
+      try {
+        const prompt = "Are you still there? I can help with booking or any questions.";
+        const out = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(prompt) : await ttsToPcm16(prompt);
+        await streamFrames(ws, out);
+      } catch (e) {
+        console.error("[TTS] reprompt failed:", e.message);
+      } finally {
+        ws._speaking = false;
+        resetNoInputTimer();
+      }
+    }, NO_INPUT_REPROMPT_MS);
+  };
+
+  const dg = connectDeepgram(
+    async (finalText) => {
+      if (ws._speaking) return; // respect turn-taking
+      const reply = routeIntent(finalText);
+      ws._speaking = true;
+      try {
+        const out = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(reply) : await ttsToPcm16(reply);
+        await streamFrames(ws, out);
+      } catch (e) {
+        console.error("[TTS] reply failed:", e.message);
+      } finally {
+        ws._speaking = false;
+        resetNoInputTimer();
+      }
+    },
+    // onAnyTranscript: reset the no-input timer even on partials
+    () => resetNoInputTimer()
+  );
+
+  ws.on("message", async (data) => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
+
+    if (msg.event === "connected") {
+      console.log(`[WS] event: connected proto=${msg.protocol} v=${msg.version}`);
     }
 
-    ws.send(JSON.stringify({
-      event: "media",
-      streamSid,
-      media: { payload: frame.toString("base64"), track: "outbound" } // track is ignored by Twilio unless bidi is enabled
-    }));
+    if (msg.event === "start") {
+      ws._streamSid = msg.start?.streamSid;
+      console.log(`[WS] START callSid=${msg.start?.callSid} streamSid=${ws._streamSid}`);
 
-    await new Promise(r => setTimeout(r, FRAME_MS));
+      // Beep (format sanity)
+      if (MEDIA_FORMAT === "mulaw") await streamFrames(ws, makeBeepMulaw());
+      else await streamFrames(ws, makeBeepPcm16());
+      console.log("[BEEP] done.");
+
+      // Greeting
+      try {
+        console.log(`[TTS] streaming greeting as ${MEDIA_FORMAT}…`);
+        const text = "Hi! I'm your AI receptionist at Clean Easy. I can help with booking or answer questions. What would you like to do?";
+        const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text) : await ttsToPcm16(text);
+        await streamFrames(ws, buf);
+        console.log("[TTS] done.");
+      } catch (e) {
+        console.error("[TTS] greeting failed:", e.message);
+      }
+
+      // start no-input clock after greeting
+      resetNoInputTimer();
+    }
+
+    if (msg.event === "media") {
+      ws._rx++;
+      if (ws._rx % 100 === 0) console.log(`[MEDIA] frames received: ${ws._rx}`);
+      if (dg && dg.readyState === dg.OPEN && !ws._speaking) {
+        const b = Buffer.from(msg.media.payload, "base64");
+        const pcm16 = inboundToPCM16(b);
+        dg.send(pcm16);
+      }
+    }
+
+    if (msg.event === "stop") {
+      console.log(`[WS] STOP (total inbound frames: ${ws._rx || 0})`);
+      if (dg && dg.readyState === dg.OPEN) dg.close();
+      if (noInputTimer) clearTimeout(noInputTimer);
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("[WS] CLOSE code=1005");
+    if (noInputTimer) clearTimeout(noInputTimer);
+  });
+  ws.on("error", (err) => console.error("[WS] error", err));
+});
+
+// ───────────────────────────────────────────────────────────────────────────────
+// HTTP: health + debug speak
+// ───────────────────────────────────────────────────────────────────────────────
+app.get("/", (_req, res) => res.status(200).send("OK"));
+app.get("/debug/say", async (req, res) => {
+  try {
+    const text = (req.query.text || "This is a test.").toString();
+    const buf = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(text) : await ttsToPcm16(text);
+    res.setHeader("Content-Type", MEDIA_FORMAT === "mulaw" ? "audio/basic" : "audio/L16");
+    res.send(buf);
+  } catch (e) {
+    res.status(500).send(e.message);
   }
-}
+});
 
-
+// ───────────────────────────────────────────────────────────────────────────────
+const server = app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+server.on("upgrade", (req, socket, head) => {
+  if (req.url !== "/stream") return socket.destroy();
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+});
