@@ -675,6 +675,18 @@ function routeWithContext(text, ctx) {
     }
   }
   
+  // FALLBACK: City mentioned but without clear service keywords
+  // Handles: "quincy", "that are quincy", "what about", etc.
+  if (city && words.length <= 5) {
+    // User mentioned a city in a short response - likely answering "What area are you in?"
+    if (SERVICE_AREAS.includes(city)) {
+      ctx.state = "booking";
+      return `Yes, we service ${city}! What date and time work best for you?`;
+    } else {
+      return `I'm sorry, we don't currently service ${city}. We serve the Greater Boston area including Cambridge, Somerville, Brookline, Newton, and surrounding cities.`;
+    }
+  }
+  
   // Availability / Booking / Scheduling (without city)
   if (q.includes("available") || q.includes("availability") || 
       q.includes("book") || q.includes("appointment") || 
