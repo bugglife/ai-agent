@@ -476,22 +476,6 @@ function extractPhoneNumber(text) {
       }
     }
     
-    // Handle compound numbers like "twenty-one"
-    if (['twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'].includes(word) && i + 1 < words.length) {
-      const tensDigit = NUMBER_WORDS_MAP[word];
-      const onesWord = words[i + 1];
-      const onesDigit = NUMBER_WORDS_MAP[onesWord];
-      if (onesDigit && onesDigit.length === 1) {
-        const combined = (parseInt(tensDigit) + parseInt(onesDigit)).toString();
-        digits += combined;
-        i += 2;
-        continue;
-      } else {
-        digits += tensDigit;
-        i++;
-        continue;
-      }
-    }
     
     // Regular number mapping
     if (NUMBER_WORDS_MAP[word]) {
@@ -575,7 +559,6 @@ function routeWithContext(text, ctx) {
   if (rooms && rooms.bathrooms !== null && rooms.bathrooms !== undefined) {
     ctx.data.bathrooms = rooms.bathrooms;
   }
-  if (phone) ctx.data.phone = phone;
   if (address) ctx.data.address = address;
   
   // STATE: Waiting for date/time after asking for it
@@ -721,7 +704,7 @@ function routeWithContext(text, ctx) {
     !q.includes("available") && !q.includes("book") && !q.includes("price") &&
     !q.includes("hour") && !q.includes("service") && !q.includes("clean");
   
-  if (isJustGreeting) {
+  if (isJustGreeting && !ctx.greeted) {
     return "Hello! How can I help you today?";
   }
   
