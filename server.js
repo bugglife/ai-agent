@@ -1,4 +1,4 @@
-import express from "express"; 
+import express from "express";
 import fetch from "node-fetch";
 import WebSocket, { WebSocketServer } from "ws";
 import { spawn } from "child_process";
@@ -9,7 +9,6 @@ import ffmpegBin from "@ffmpeg-installer/ffmpeg";
 // ───────────────────────────────────────────────────────────────────────────────
 const app = express();
 const PORT = process.env.PORT || 10000;
-
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
 const ELEVEN_VOICE_ID_EN = process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL"; // English
 const ELEVEN_VOICE_ID_ES = process.env.ELEVEN_VOICE_ID_ES || "VR6AewLTigWG4xSOukaG"; // Spanish
@@ -21,12 +20,12 @@ const MEDIA_FORMAT = (process.env.TWILIO_MEDIA_FORMAT || "pcm16").toLowerCase();
 const AGENT_TOKEN = process.env.AGENT_TOKEN;
 
 // SECURITY: global limits
-const MAX_TTS_TEXT = 500;           // characters
+const MAX_TTS_TEXT = 500;            // characters
 const MAX_AUDIO_INPUT_BYTES = 7_000_000;
-const FFMPEG_TIMEOUT_MS = 15_000;   // bail if ffmpeg hangs
-const MAX_WS_PER_IP = 10;           // concurrent sockets per IP
-const MAX_DG_PER_SOCKET = 1;        // only 1 Deepgram connection per WS
-const SESSION_IDLE_MS = 60_000;     // drop truly idle sessions
+const FFMPEG_TIMEOUT_MS = 15_000;    // bail if ffmpeg hangs
+const MAX_WS_PER_IP = 10;            // concurrent sockets per IP
+const MAX_DG_PER_SOCKET = 1;         // only 1 Deepgram connection per WS
+const SESSION_IDLE_MS = 60_000;      // drop truly idle sessions
 
 if (!ELEVEN_API_KEY) { console.error("❌ Missing ELEVEN_API_KEY"); process.exit(1); }
 if (!AGENT_TOKEN)     { console.error("❌ Missing AGENT_TOKEN");   process.exit(1); }
@@ -55,6 +54,7 @@ const SERVICE_AREAS = [
   "Boston","Cambridge","Somerville","Brookline","Newton","Watertown","Arlington",
   "Belmont","Medford","Waltham","Needham","Wellesley","Dedham","Quincy"
 ];
+
 // Common STT errors / phonetic variations + neighborhood nicknames
 const CITY_ALIASES = {
   // Brookline variations
@@ -64,49 +64,49 @@ const CITY_ALIASES = {
   "brook": "Brookline",
   "brooks": "Brookline",
   "brooke": "Brookline",
-  
+
   // Cambridge variations
   "cambridge": "Cambridge",
-  
+
   // Somerville variations
   "somerville": "Somerville",
   "sommerville": "Somerville",
-  
+
   // Newton variations
   "newton": "Newton",
   "new town": "Newton",
-  
+
   // Watertown variations
   "watertown": "Watertown",
   "water town": "Watertown",
-  
+
   // Arlington variations
   "arlington": "Arlington",
-  
+
   // Belmont variations
   "belmont": "Belmont",
   "beaumont": "Belmont",
-  
+
   // Medford variations
   "medford": "Medford",
-  
+
   // Waltham variations
   "waltham": "Waltham",
-  
+
   // Needham variations
   "needham": "Needham",
-  
+
   // Wellesley variations
   "wellesley": "Wellesley",
   "wellsley": "Wellesley",
-  
+
   // Dedham variations
   "dedham": "Dedham",
-  
+
   // Quincy variations
   "quincy": "Quincy",
   "quinsy": "Quincy",
-  
+
   // Boston neighborhoods - full names
   "jamaica plain": "Boston",
   "south boston": "Boston",
@@ -128,7 +128,7 @@ const CITY_ALIASES = {
   "west end": "Boston",
   "beacon hill": "Boston",
   "seaport": "Boston",
-  
+
   // Boston neighborhood nicknames
   "jp": "Boston",
   "j p": "Boston",
@@ -140,6 +140,7 @@ const CITY_ALIASES = {
   "southend": "Boston",
   "backbay": "Boston",
 };
+
 // Your actual pricing matrix: bedroom-bathroom combos
 const PRICING_MATRIX = {
   standard: {
@@ -167,6 +168,7 @@ const PRICING_MATRIX = {
     "5+-1": 485, "5+-2": 495, "5+-3": 515, "5+-4": 515, "5+-5+": 535,
   },
 };
+
 const FREQUENCY_DISCOUNTS = {
   weekly: 0.15,
   biweekly: 0.12,
@@ -202,15 +204,15 @@ function normalize(s) {
 // ───────────────────────────────────────────────────────────────────────────────
 function detectLanguage(text) {
   const q = normalize(text);
-  
+
   // Spanish indicators
   const spanishWords = ["hola", "si", "bueno", "gracias", "como", "que", "limpieza", "servicio", "precio", "cuando", "donde"];
   if (spanishWords.some(w => q.includes(w))) return "es";
-  
+
   // Portuguese indicators
   const portugueseWords = ["ola", "sim", "obrigado", "obrigada", "como", "que", "limpeza", "servico", "preco", "quando", "onde"];
   if (portugueseWords.some(w => q.includes(w))) return "pt";
-  
+
   return "en";
 }
 const TRANSLATIONS = {
@@ -330,16 +332,16 @@ const TRANSLATIONS = {
 function findCityInText(textRaw) {
   const text = sanitizeUserText(textRaw);
   const q = normalize(text);
-  
+
   // Check if question is about service area
-  const isServiceAreaQuery = q.includes("service") || q.includes("cover") || 
-                             q.includes("serve") || q.includes("area") || q.includes("clean") ||
-                             q.includes("servicio") || q.includes("servico") ||
-                             q.includes("atiende") || q.includes("atende") ||
-                             q.includes("do you") || q.includes("can you");
-  
+  const isServiceAreaQuery = q.includes("service") || q.includes("cover") ||
+                              q.includes("serve") || q.includes("area") || q.includes("clean") ||
+                              q.includes("servicio") || q.includes("servico") ||
+                              q.includes("atiende") || q.includes("atende") ||
+                              q.includes("do you") || q.includes("can you");
+
   console.log(`[CITY DETECTION] Query: "${safeLog(text)}" | isServiceAreaQuery: ${isServiceAreaQuery}`);
-  
+
   // First, check for exact matches in known cities
   for (const city of SERVICE_AREAS) {
     const cityNorm = city.toLowerCase();
@@ -349,7 +351,7 @@ function findCityInText(textRaw) {
       return { city, known: true, isQuery: isServiceAreaQuery };
     }
   }
-  
+
   // Check for phonetic aliases (STT often mishears city names)
   for (const [alias, realCity] of Object.entries(CITY_ALIASES)) {
     const regex = new RegExp(`\\b${alias}\\b`, "i");
@@ -358,7 +360,7 @@ function findCityInText(textRaw) {
       return { city: realCity, known: true, isQuery: isServiceAreaQuery };
     }
   }
-  
+
   // If it's a service area query but city not found, try to extract city name from common patterns
   if (isServiceAreaQuery) {
     // More robust pattern that skips articles
@@ -366,35 +368,35 @@ function findCityInText(textRaw) {
       /(?:in|at|to|of)\s+(?:the\s+)?(?:town\s+of\s+|city\s+of\s+|area\s+of\s+)?([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)/gi,
       /(?:town|city|area)\s+of\s+(?:the\s+)?([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)/gi,
     ];
-    
+
     for (const pattern of cityPatterns) {
       let match;
       while ((match = pattern.exec(text)) !== null) {
         const extractedCity = match[1];
-        
+
         // Skip common words that aren't cities
         const skipWords = ["the", "town", "city", "area", "this", "that"];
         if (skipWords.includes(extractedCity.toLowerCase())) {
           console.log(`[CITY] Skipped non-city word: ${extractedCity}`);
           continue;
         }
-        
+
         console.log(`[CITY] Extracted from pattern: ${extractedCity}`);
-        
+
         // Double-check if this extracted city is in our known list
         const knownCity = SERVICE_AREAS.find(c => c.toLowerCase() === extractedCity.toLowerCase());
         if (knownCity) {
           console.log(`[CITY] Matched to known city: ${knownCity}`);
           return { city: knownCity, known: true, isQuery: true };
         }
-        
+
         // Check aliases too
         const aliasMatch = CITY_ALIASES[extractedCity.toLowerCase()];
         if (aliasMatch) {
           console.log(`[CITY] Matched via alias: ${extractedCity} → ${aliasMatch}`);
           return { city: aliasMatch, known: true, isQuery: true };
         }
-        
+
         // If not in our list, return as unknown (only if 3+ chars to avoid garbage)
         if (extractedCity.length >= 3) {
           console.log(`[CITY] Not in service area: ${extractedCity}`);
@@ -403,7 +405,7 @@ function findCityInText(textRaw) {
       }
     }
   }
-  
+
   console.log(`[CITY] No city found in query`);
   return null;
 }
@@ -414,7 +416,7 @@ function extractName(textRaw) {
     console.log(`[EXTRACT] Rejected number as name: ${safeLog(text)}`);
     return null;
   }
-  
+
   // Don't extract common number words as names
   const numberWords = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
   const normalized = normalize(text);
@@ -422,21 +424,21 @@ function extractName(textRaw) {
     console.log(`[EXTRACT] Rejected number word as name: ${safeLog(text)}`);
     return null;
   }
-  
+
   // Don't extract service types as names
   const serviceWords = ["standard", "deep", "airbnb", "moveout", "move-out", "turnover"];
   if (serviceWords.includes(normalized)) {
     console.log(`[EXTRACT] Rejected service type as name: ${safeLog(text)}`);
     return null;
   }
-  
+
   // Don't extract common objects or phrases as names
   const commonObjects = ["faucet", "sink", "toilet", "shower", "bath", "door", "window", "floor", "wall", "looking for", "thinking about"];
   if (commonObjects.includes(normalized)) {
     console.log(`[EXTRACT] Rejected common object/phrase as name: ${safeLog(text)}`);
     return null;
   }
-  
+
   const patterns = [
     /(?:my name is|i'm|i am|this is|call me|me llamo|mi nombre es|meu nome é)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)/i,
     /^([A-Z][a-z]{2,}(?:\s[A-Z][a-z]+)?)$/,  // At least 3 chars to avoid "Two"
@@ -462,10 +464,10 @@ function extractPhoneDigits(textRaw) {
     "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
     "six": "6", "seven": "7", "eight": "8", "nine": "9"
   };
-  
+
   const words = q.split(/[\s.-]+/);  // Split on space, dash, dot
   let digits = "";
-  
+
   for (const word of words) {
     if (digitWords[word]) {
       digits += digitWords[word];
@@ -474,14 +476,14 @@ function extractPhoneDigits(textRaw) {
       digits += word;
     }
   }
-  
+
   console.log(`[PHONE DIGITS] Extracted "${digits}" from "${safeLog(text)}"`);
   return digits;
 }
 function extractPhone(textRaw) {
   const text = sanitizeUserText(textRaw);
   const q = normalize(text);
-  
+
   // Pattern 1: Standard formats (617-555-1234, 617.555.1234, 6175551234)
   const standardMatch = text.match(/(\d{3}[\s.-]?\d{3}[\s.-]?\d{4}|\d{10})/);
   if (standardMatch) {
@@ -489,17 +491,17 @@ function extractPhone(textRaw) {
     console.log(`[EXTRACT] Phone (standard): ${cleaned}`);
     return cleaned;
   }
-  
+
   // Pattern 2: Spoken digits "six one seven five five five one two three four"
   const digits = extractPhoneDigits(text);
-  
+
   // If we found 10+ digits, construct phone number
   if (digits.length >= 10) {
     const phoneNum = digits.slice(0, 10);
     console.log(`[EXTRACT] Phone (spoken): ${phoneNum}`);
     return phoneNum;
   }
-  
+
   // Pattern 3: Partial phone in context "call me at 617..."
   const contextMatch = text.match(/(?:call|text|reach|phone|number)(?:\s+me)?(?:\s+at)?\s+(\d{3,})/i);
   if (contextMatch && contextMatch[1].length >= 10) {
@@ -507,7 +509,7 @@ function extractPhone(textRaw) {
     console.log(`[EXTRACT] Phone (context): ${cleaned}`);
     return cleaned;
   }
-  
+
   return null;
 }
 function extractDateTime(textRaw) {
@@ -515,20 +517,20 @@ function extractDateTime(textRaw) {
   const q = normalize(text);
   console.log(`[EXTRACT DateTime] Input: "${safeLog(text)}" → Normalized: "${safeLog(q)}"`);
   let day = null, time = null;
-  
+
   const daysEn = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday","tomorrow","today"];
   const daysEs = ["lunes","martes","miercoles","jueves","viernes","sabado","domingo","mañana","hoy"];
   const daysPt = ["segunda","terca","quarta","quinta","sexta","sabado","domingo","amanha","hoje"];
-  
+
   // Find day
   for (const d of [...daysEn, ...daysEs, ...daysPt]) {
-    if (q.includes(d)) { 
+    if (q.includes(d)) {
       day = d;
       console.log(`[EXTRACT] Day: ${day}`);
-      break; 
+      break;
     }
   }
-  
+
   // Check for specific dates like "October 18th", "October eighteenth"
   const monthPattern = /(january|february|march|april|may|june|july|august|september|october|november|december)\s+(eighteenth|nineteenth|twentieth|twenty first|twenty second|twenty third|twenty fourth|twenty fifth|twenty sixth|twenty seventh|twenty eighth|twenty ninth|thirtieth|thirty first|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|\d{1,2}(?:st|nd|rd|th)?)/i;
   const monthMatch = text.match(monthPattern);
@@ -536,14 +538,14 @@ function extractDateTime(textRaw) {
     day = monthMatch[0]; // e.g., "October eighteenth"
     console.log(`[EXTRACT] Day from date pattern: ${day}`);
   }
-  
+
   // Find time - handle multiple patterns including word numbers
   const timeWords = {
-    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", 
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
     "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
     "eleven": "11", "twelve": "12"
   };
-  
+
   // Pattern 1: Digit with AM/PM: "4 PM", "4:30 PM"
   let m = text.match(/(\d{1,2})\s*(?::|h)?\s*(\d{2})?\s*(am|pm|a\.m\.|p\.m\.)/i);
   if (m) {
@@ -551,7 +553,7 @@ function extractDateTime(textRaw) {
     console.log(`[EXTRACT] Time (with AM/PM): ${time}`);
     return { day, time };
   }
-  
+
   // Pattern 2: Word number with AM/PM (without "at"): "four PM", "twelve AM"
   m = text.match(/\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(am|pm|a\.m\.|p\.m\.)/i);
   if (m) {
@@ -561,7 +563,7 @@ function extractDateTime(textRaw) {
     console.log(`[EXTRACT] Time (word + AM/PM): ${time}`);
     return { day, time };
   }
-  
+
   // Pattern 3: "at four", "at 4", "at four PM", "thinking thursday at four"
   m = text.match(/(?:at|on)\s+(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d{1,2})(?:\s*(am|pm|a\.m\.|p\.m\.))?/i);
   if (m) {
@@ -571,7 +573,7 @@ function extractDateTime(textRaw) {
     console.log(`[EXTRACT] Time (at/on + number): ${time}`);
     return { day, time };
   }
-  
+
   // Pattern 4: Just a number in time context (e.g., "Thursday four")
   if (day) {
     m = q.match(/\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d{1,2})\b/);
@@ -581,7 +583,7 @@ function extractDateTime(textRaw) {
       return { day, time };
     }
   }
-  
+
   // Pattern 5: "morning", "afternoon", "evening"
   m = text.match(/(morning|afternoon|evening|noon)/i);
   if (m) {
@@ -589,28 +591,28 @@ function extractDateTime(textRaw) {
     console.log(`[EXTRACT] Time (period): ${time}`);
     return { day, time };
   }
-  
+
   // Pattern 6: "o'clock"
   m = text.match(/(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(o'?clock|oclock)/i);
   if (m) {
     let hour = timeWords[m[1].toLowerCase()] || m[1];
-    time = `${hour} o'clock";
+    time = hour + " o'clock";
     console.log("[EXTRACT] Time (o'clock): " + time);
     return { day, time };
   }
-  
+
   return { day, time };
 }
 function extractBedrooms(textRaw) {
   const text = sanitizeUserText(textRaw);
   const q = normalize(text);
-  
+
   // REJECT filler words that might be misheard as numbers
   if (q === "uh" || q === "um" || q === "er" || q === "ah" || q === "hmm") {
     console.log("[EXTRACT] Rejected filler word: " + q);
     return null;
   }
-  
+
   // Number words to digits
   const numberWords = {
     "studio": "Studio",
@@ -619,16 +621,16 @@ function extractBedrooms(textRaw) {
     "uno": "1", "dos": "2", "tres": "3", "cuatro": "4", "cinco": "5",
     "um": "1", "dois": "2", "tres": "3", "quatro": "4", "cinco": "5",
   };
-  
+
   // Try word patterns first
   for (const [word, num] of Object.entries(numberWords)) {
-    if (q.includes(word + " bed") || q.includes(word + " room") || 
+    if (q.includes(word + " bed") || q.includes(word + " room") ||
         q.includes(word + " habitacion") || q.includes(word + " quarto")) {
       console.log("[EXTRACT] Bedrooms via word: " + word + " -> " + num);
       return num;
     }
   }
-  
+
   // Try just the number word if context suggests bedrooms
   if (q.includes("bedroom") || q.includes("habitacion") || q.includes("quarto")) {
     for (const [word, num] of Object.entries(numberWords)) {
@@ -639,7 +641,7 @@ function extractBedrooms(textRaw) {
       }
     }
   }
-  
+
   // Try digit patterns
   const digitMatch = q.match(/(\d+)\s*(?:bed|bedroom|br|habitacion|quarto)/);
   if (digitMatch) {
@@ -648,36 +650,36 @@ function extractBedrooms(textRaw) {
     console.log("[EXTRACT] Bedrooms via digit: " + num + " -> " + result);
     return result;
   }
-  
+
   // If JUST a standalone number (and nothing else suspicious)
   const justNumber = q.match(/^(one|two|three|four|five|six|1|2|3|4|5|6|studio)$/);
   if (justNumber) {
     const word = justNumber[1];
     const result = numberWords[word] || (parseInt(word) >= 5 ? "5+" : word);
     console.log("[EXTRACT] Bedrooms via standalone: " + word + " -> " + result);
-    return result; 
+    return result;  
   }
-  
+
   return null;
 }
 function extractBathrooms(textRaw) {
   const text = sanitizeUserText(textRaw);
   const q = normalize(text);
-  
+
   const numberWords = {
     "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
     "uno": "1", "dos": "2", "tres": "3", "cuatro": "4", "cinco": "5",
     "um": "1", "dois": "2", "tres": "3", "quatro": "4", "cinco": "5",
   };
-  
+
   // Try word patterns
   for (const [word, num] of Object.entries(numberWords)) {
     if (q.includes(word + " bath") || q.includes(word + " bano") || q.includes(word + " banheiro")) {
       console.log("[EXTRACT] Bedrooms via word: " + word + " -> " + num);
-      return num >= 5 ? "5+" : num;
+      return parseInt(num) >= 5 ? "5+" : num;
     }
   }
-  
+
   // Try digit patterns
   const digitMatch = q.match(/(\d+)\s*(?:bath|bathroom|baño|banheiro)/);
   if (digitMatch) {
@@ -686,7 +688,7 @@ function extractBathrooms(textRaw) {
     console.log("[EXTRACT] Bathrooms via digit: " + num + " -> " + result);
     return result;
   }
-  
+
   // If in bathroom context and just a number
   const justNumber = q.match(/^(one|two|three|four|five|1|2|3|4|5)$/);
   if (justNumber) {
@@ -695,7 +697,7 @@ function extractBathrooms(textRaw) {
     console.log("[EXTRACT] Bathrooms via standalone: " + word + " -> " + result);
     return result;
   }
-  
+
   return null;
 }
 function extractServiceType(textRaw, lang) {
@@ -743,17 +745,17 @@ class ConversationContext {
       estimatedPrice: null,
     };
   }
-  
+
   t(key) {
     if (!this.language) return TRANSLATIONS.en[key] || "";
     return TRANSLATIONS[this.language][key] || TRANSLATIONS.en[key] || "";
   }
-  
+
   calculatePrice() {
     if (!this.data.serviceType || !this.data.bedrooms) return null;
     const type = this.data.serviceType;
     const bathrooms = this.data.bathrooms || "1"; // Default to 1 if not specified
-    const key = this.data.bedrooms === "Studio" ? "Studio" : 
+    const key = this.data.bedrooms === "Studio" ? "Studio" :
                 (this.data.bedrooms + "-" + bathrooms);
     const basePrice = PRICING_MATRIX[type]?.[key];
     if (!basePrice) {
@@ -765,12 +767,12 @@ class ConversationContext {
     console.log(`[PRICE] ${type} ${key}: ${basePrice} - ${discount*100}% = ${finalPrice}`);
     return finalPrice;
   }
-  
+
   hasAllBookingInfo() {
-    return this.data.serviceType && this.data.bedrooms && this.data.city && 
+    return this.data.serviceType && this.data.bedrooms && this.data.city &&
            this.data.date && this.data.time && this.data.name && this.data.phone;
   }
-  
+
   getSummary(includePrice = false) {
     const t = this.t("serviceTypes");
     const parts = [];
@@ -794,27 +796,27 @@ function routeWithContext(textRaw, ctx) {
   const text = sanitizeUserText(textRaw);
   const q = normalize(text);
   console.log(`[ROUTE] Input: "${safeLog(text)}" → Normalized: "${safeLog(q)}"`);
-  
+
   // Detect language on first turn
   if (!ctx.language) {
     ctx.language = detectLanguage(text);
     console.log(`[LANG] Detected: ${ctx.language}`);
   }
-  
+
   const lang = ctx.language;
-  
+
   // Extract entities - ORDER MATTERS!
   // Extract date/time FIRST before phone extraction to avoid conflicts
   const dateTime = extractDateTime(text);
   const name = extractName(text);
   const serviceType = extractServiceType(text, lang);
   const city = findCityInText(text);
-  
+
   // Smart extraction based on context
   let bedrooms = null;
   let bathrooms = null;
   let phone = null;
-  
+
   // Save date/time FIRST (before phone logic interferes)
   if (dateTime.day && !ctx.data.date) {
     ctx.data.date = dateTime.day;
@@ -826,7 +828,7 @@ function routeWithContext(textRaw, ctx) {
     ctx.lastExtraction = "time";
     console.log(`[DATA] Set time: ${dateTime.time}`);
   }
-  
+
   // If we're in booking flow and missing phone, try to accumulate phone digits
   // BUT only if we didn't just extract a time (to avoid "4 PM" becoming phone digits)
   if (ctx.state === "booking_flow" && !ctx.data.phone && ctx.data.name && !dateTime.time) {
@@ -846,7 +848,7 @@ function routeWithContext(textRaw, ctx) {
       }
     }
   }
-  
+
   // If we're in booking flow and missing bathrooms but have bedrooms, prioritize bathroom extraction
   if (ctx.state === "booking_flow" && ctx.data.bedrooms && !ctx.data.bathrooms) {
     bathrooms = extractBathrooms(text);
@@ -859,7 +861,7 @@ function routeWithContext(textRaw, ctx) {
     bedrooms = extractBedrooms(text);
     bathrooms = extractBathrooms(text);
   }
-  
+
   if (name && !ctx.data.name) {
     ctx.data.name = name;
     ctx.lastExtraction = "name";
@@ -886,11 +888,11 @@ function routeWithContext(textRaw, ctx) {
     ctx.data.city = city.city;
     ctx.lastExtraction = "city";
   }
-  
+
   if (ctx.data.serviceType && ctx.data.bedrooms && !ctx.data.estimatedPrice) {
     ctx.data.estimatedPrice = ctx.calculatePrice();
   }
-  
+
   // PRIORITY 1: Service area queries (check FIRST before small talk)
   if (city) {
     if (city.known) {
@@ -903,17 +905,17 @@ function routeWithContext(textRaw, ctx) {
       // Otherwise note the city and enter booking flow if there's booking intent
       if (ctx.state !== "booking_flow") {
         // Check if there's booking intent in the query
-        const hasBookingIntent = q.includes("book") || q.includes("booking") || q.includes("schedule") || 
+        const hasBookingIntent = q.includes("book") || q.includes("booking") || q.includes("schedule") ||
                                 q.includes("appointment") || q.includes("availability") || q.includes("available") ||
                                 q.includes("reserva") || q.includes("agendar") || q.includes("marcar") ||
                                 q.includes("i would like") || q.includes("i want to");
-        
+
         if (hasBookingIntent) {
           console.log(`[ROUTING] City + booking intent, entering booking flow`);
           ctx.state = "booking_flow";
           return `${ctx.t("coverCity")} ${city.city}! ${ctx.t("askServiceType")}`;
         } else {
-          console.log(`[ROUTING] City mentioned, asking about service type`);
+          console.log(`[ROUTING] City mentioned, asking about service type]`);
           return `${ctx.t("coverCity")} ${city.city}! ${lang === "es" ? "¿Qué tipo de limpieza te interesa?" : lang === "pt" ? "Que tipo de limpeza você gostaria?" : "What type of cleaning are you interested in—standard, deep, move-out, or Airbnb?"}`;
         }
       }
@@ -925,10 +927,10 @@ function routeWithContext(textRaw, ctx) {
              `We're expanding our coverage. What's the ZIP code for ${city.city}? I can confirm if we serve that area.`;
     }
   }
-  
+
   // Handle requests to repeat/confirm information (not city queries)
-  if ((q.includes("repeat") || q.includes("confirm") || q.includes("what was") || 
-       q.includes("can you repeat") || q.includes("say that again")) && 
+  if ((q.includes("repeat") || q.includes("confirm") || q.includes("what was") ||
+       q.includes("can you repeat") || q.includes("say that again")) &&
       (q.includes("number") || q.includes("phone") || q.includes("telephone"))) {
     console.log(`[ROUTING] Request to repeat phone number`);
     if (ctx.data.phone) {
@@ -940,12 +942,12 @@ function routeWithContext(textRaw, ctx) {
            lang === "pt" ? "Qual é o seu número de telefone?" :
            "What's your phone number?";
   }
-  
+
   // Handle "I don't know the ZIP" when previously asked
-  if ((q.includes("don't know") || q.includes("no se") || q.includes("nao sei") || q.includes("i don't know")) && 
+  if ((q.includes("don't know") || q.includes("no se") || q.includes("nao sei") || q.includes("i don't know")) &&
       (q.includes("zip") || q.includes("codigo") || q.includes("cep") || q.includes("code"))) {
     console.log(`[ROUTING] User doesn't know ZIP, checking for city mentions`);
-    
+
     // Check the current query for any city mentions (even partial like "brook")
     for (const [alias, realCity] of Object.entries(CITY_ALIASES)) {
       if (q.includes(alias)) {
@@ -954,7 +956,7 @@ function routeWithContext(textRaw, ctx) {
         return `${lang === "es" ? "No hay problema" : lang === "pt" ? "Sem problema" : "No problem"}! ${ctx.t("coverCity")} ${realCity}. ${lang === "es" ? "¿Te gustaría reservar?" : lang === "pt" ? "Gostaria de reservar?" : "Would you like to book?"}`;
       }
     }
-    
+
     // Check if they mentioned a city we actually serve
     for (const serviceCity of SERVICE_AREAS) {
       const cityNorm = serviceCity.toLowerCase();
@@ -964,30 +966,30 @@ function routeWithContext(textRaw, ctx) {
         return `${lang === "es" ? "No hay problema" : lang === "pt" ? "Sem problema" : "No problem"}! ${ctx.t("coverCity")} ${serviceCity}. ${lang === "es" ? "¿Te gustaría reservar?" : lang === "pt" ? "Gostaria de reservar?" : "Would you like to book?"}`;
       }
     }
-    
+
     // Check history/context for city mentions
     if (ctx.data.city && SERVICE_AREAS.includes(ctx.data.city)) {
       console.log(`[ROUTING] Using city from context: ${ctx.data.city}`);
       return `${lang === "es" ? "No hay problema" : lang === "pt" ? "Sem problema" : "No problem"}! ${ctx.t("coverCity")} ${ctx.data.city}. ${lang === "es" ? "¿Te gustaría reservar?" : lang === "pt" ? "Gostaria de reservar?" : "Would you like to book?"}`;
     }
-    
+
     console.log(`[ROUTING] No city found in context for ZIP response`);
   }
-  
+
   // PRIORITY 2: KB questions (substantive queries) - but SKIP service keyword if it's a service area query
   if (ctx.state === "initial") {
     if (q.includes("hour") || q.includes("open") || q.includes("horario")) return ctx.t("hours");
-    
+
     // Only answer with services KB if NOT a service area query
     // Use the city detection result if available, otherwise check patterns
-    const isServiceAreaQuery = (city && city.isQuery) || 
-                               (q.includes("do you service") || q.includes("do you serve") || 
+    const isServiceAreaQuery = (city && city.isQuery) ||
+                               (q.includes("do you service") || q.includes("do you serve") ||
                                 q.includes("can you service") || q.includes("do you cover") ||
                                 q.includes("can you clean"));
     if ((q.includes("service") || q.includes("servicio") || q.includes("servico")) && !isServiceAreaQuery) {
       return ctx.t("services");
     }
-    
+
     if (q.includes("pay") || q.includes("pago") || q.includes("pagamento")) return ctx.t("payment");
     if (q.includes("supplies") || q.includes("productos") || q.includes("produtos")) return ctx.t("supplies");
     if (q.includes("how long") || q.includes("cuanto tiempo") || q.includes("quanto tempo")) return ctx.t("duration");
@@ -995,23 +997,23 @@ function routeWithContext(textRaw, ctx) {
     if (q.includes("cancel") || q.includes("cancelar")) return ctx.t("cancellation");
     if (q.includes("pet") || q.includes("mascota") || q.includes("animal")) return ctx.t("pets");
   }
-  
+
   // PRIORITY 3: Small talk (ONLY if not already greeted AND is standalone greeting)
   if (ctx.state === "initial") {
     // Check if this is ONLY small talk (short message with no other content)
-    const words = q.split(" ").filter(w => w.length > 0);
-    const substantiveWords = ["service", "serve", "cover", "book", "price", "cost", "clean", "hour", 
+    const words = q.split("").length ? q.split(" ").filter(w => w.length > 0) : [];
+    const substantiveWords = ["service", "serve", "cover", "book", "price", "cost", "clean", "hour",
                               "servicio", "servico", "precio", "preco", "limpieza", "limpeza",
                               "brooklyn", "brookline", "brook", "brooks", "cambridge", "boston", "newton",
                               "watertown", "somerville", "medford", "waltham", "quincy", "dedham",
                               "wellesley", "needham", "belmont", "arlington", "repeat", "telephone", "number",
                               "availability", "available", "appointment", "jp", "southie", "eastie", "westie"];
     const hasSubstantiveContent = words.some(w => substantiveWords.includes(w));
-    
+
     console.log(`[SMALL TALK CHECK] Words: ${words.length}, HasSubstantive: ${hasSubstantiveContent}, Greeted: ${ctx.greeted}, Words: [${words.join(", ")}]`);
-    
+
     // ONLY respond to greeting if NOT greeted yet AND no other entities detected
-    if (!ctx.greeted && !hasSubstantiveContent && words.length <= 3 && 
+    if (!ctx.greeted && !hasSubstantiveContent && words.length <= 3 &&
         !city && !serviceType && !name && !dateTime.day && !dateTime.time) {
       if (q.includes("hi") || q.includes("hello") || q.includes("hola") || q === "ola") {
         console.log(`[SMALL TALK] Triggered greeting`);
@@ -1024,7 +1026,7 @@ function routeWithContext(textRaw, ctx) {
         return ctx.t("smallTalk").howAreYou;
       }
     }
-    
+
     // These can be longer, so check separately (but not if already greeted)
     if (!ctx.greeted) {
       if (q.includes("who are you") || q.includes("quien eres") || q.includes("quem e")) {
@@ -1033,7 +1035,7 @@ function routeWithContext(textRaw, ctx) {
         return ctx.t("smallTalk").whoAreYou;
       }
     }
-    
+
     if (q.includes("thank") || q.includes("gracias") || q.includes("obrigad")) {
       console.log(`[SMALL TALK] Triggered thanks`);
       return ctx.t("smallTalk").thanks;
@@ -1043,25 +1045,24 @@ function routeWithContext(textRaw, ctx) {
       return ctx.t("smallTalk").bye;
     }
   }
-  
+
   // Booking intent - handle variations including "availability"
-  if (ctx.state === "initial" && (
-      q.includes("book") || q.includes("booking") || q.includes("schedule") || 
-      q.includes("make an appointment") || q.includes("appointment") ||
-      q.includes("availability") || q.includes("available") || q.includes("see if you have") ||
-      q.includes("reserva") || q.includes("agendar") || q.includes("marcar") ||
-      q.includes("disponibilidad") || q.includes("disponibilidade") ||
-      q.includes("i would like to book") || q.includes("i want to book") ||
-      q.includes("i want to see") || q.includes("looking for a cleaning")
-    )) {
+  if (ctx.state === "initial" &&
+      (q.includes("book") || q.includes("booking") || q.includes("schedule") ||
+       q.includes("make an appointment") || q.includes("appointment") ||
+       q.includes("availability") || q.includes("available") || q.includes("see if you have") ||
+       q.includes("reserva") || q.includes("agendar") || q.includes("marcar") ||
+       q.includes("disponibilidad") || q.includes("disponibilidade") ||
+       q.includes("i would like to book") || q.includes("i want to book") ||
+       q.includes("i want to see") || q.includes("looking for a cleaning"))) {
     console.log(`[ROUTING] Detected booking intent`);
     ctx.state = "booking_flow";
     if (!ctx.data.serviceType) return ctx.t("askServiceType");
   }
-  
+
   // Handle affirmative responses to "Would you like to book?" 
-  if (ctx.state === "initial" && 
-      (q.includes("yes") || q.includes("yeah") || q.includes("yep") || q.includes("sure") || 
+  if (ctx.state === "initial" &&
+      (q.includes("yes") || q.includes("yeah") || q.includes("yep") || q.includes("sure") ||
        q.includes("that would be great") || q.includes("sounds good") || q.includes("i would") ||
        q.includes("si") || q.includes("sim") || q.includes("claro"))) {
     // Check if we previously mentioned booking
@@ -1070,14 +1071,14 @@ function routeWithContext(textRaw, ctx) {
       return ctx.t("askServiceType");
     }
   }
-  
+
   // If initial state with city + serviceType, enter booking flow
   if (ctx.state === "initial" && ctx.data.city && ctx.data.serviceType) {
     console.log(`[ROUTING] Have city + serviceType in initial state, entering booking flow`);
     ctx.state = "booking_flow";
     // Continue with booking flow logic below
   }
-  
+
   // Pricing
   if (q.includes("price") || q.includes("cost") || q.includes("precio") || q.includes("preco") || q.includes("cuanto")) {
     if (ctx.data.estimatedPrice) {
@@ -1086,7 +1087,7 @@ function routeWithContext(textRaw, ctx) {
     if (!ctx.data.bedrooms) return ctx.t("askBedrooms");
     if (!ctx.data.serviceType) return ctx.t("askServiceType");
   }
-  
+
   // Booking flow
   if (ctx.state === "booking_flow") {
     // Final confirmation after user says yes
@@ -1096,19 +1097,19 @@ function routeWithContext(textRaw, ctx) {
                   `Perfect! We'll send a confirmation to ${ctx.data.phone}. Is there anything else you'd like to know?`;
       return msg;
     }
-    
+
     console.log(`[BOOKING FLOW] Missing: serviceType=${!ctx.data.serviceType}, bedrooms=${!ctx.data.bedrooms}, bathrooms=${!ctx.data.bathrooms}, city=${!ctx.data.city}, date=${!ctx.data.date}, time=${!ctx.data.time}, name=${!ctx.data.name}, phone=${!ctx.data.phone}`);
-    
+
     if (!ctx.data.serviceType) return ctx.t("askServiceType");
     if (!ctx.data.bedrooms) return ctx.t("askBedrooms");
     if (!ctx.data.bathrooms && ctx.data.bedrooms !== "Studio") return ctx.t("askBathrooms");
     if (!ctx.data.city) return ctx.t("askCity");
-    
+
     // Calculate price silently (for later use) but don't mention it yet
     if (ctx.data.serviceType && ctx.data.bedrooms && !ctx.data.estimatedPrice) {
       ctx.data.estimatedPrice = ctx.calculatePrice();
     }
-    
+
     // Handle date/time collection more gracefully
     if (!ctx.data.date || !ctx.data.time) {
       if (ctx.data.date && !ctx.data.time) {
@@ -1129,26 +1130,26 @@ function routeWithContext(textRaw, ctx) {
         return ctx.t("askDateTime");
       }
     }
-    
+
     if (!ctx.data.name) return ctx.t("askName");
     if (!ctx.data.phone) return ctx.t("askPhone");
-    
+
     // Final confirmation WITH price
     if (ctx.hasAllBookingInfo()) {
       const priceMsg = ctx.data.estimatedPrice ? ` ${lang === "es" ? "por alrededor de" : lang === "pt" ? "por cerca de" : "for about"} $${ctx.data.estimatedPrice}` : "";
       return `${ctx.t("confirmation")} ${ctx.getSummary()}${priceMsg}. ${ctx.t("confirmQuestion")}`;
     }
   }
-  
+
   // Fallback: if they keep asking about service/coverage but we haven't detected a city
-  if ((q.includes("service") || q.includes("cover") || q.includes("serve") || q.includes("what about")) && 
+  if ((q.includes("service") || q.includes("cover") || q.includes("serve") || q.includes("what about")) &&
       !city && ctx.state === "initial") {
     console.log(`[ROUTING] Service query without detected city, asking for clarification`);
     return lang === "es" ? "¿En qué ciudad te encuentras?" :
            lang === "pt" ? "Em que cidade você está?" :
            "What city are you in? We serve the Greater Boston area including Brookline, Cambridge, Somerville, and more.";
   }
-  
+
   // Generic fallback
   if (ctx.state === "initial") {
     console.log(`[ROUTING] Generic fallback`);
@@ -1156,7 +1157,7 @@ function routeWithContext(textRaw, ctx) {
            lang === "pt" ? "Posso ajudar com reservas ou perguntas sobre nossos serviços. O que você gostaria de saber?" :
            "I can help with booking or questions about our services. What would you like to know?";
   }
-  
+
   return lang === "es" ? "¿En qué más puedo ayudarte?" :
          lang === "pt" ? "Em que mais posso ajudá-lo?" :
          "What else can I help you with?";
@@ -1211,7 +1212,6 @@ function inboundToPCM16(buf) {
   }
   return out;
 }
-
 function assertTtsTextSafe(textRaw) {
   let text = sanitizeUserText(textRaw);
   if (text.length > MAX_TTS_TEXT) {
@@ -1219,11 +1219,10 @@ function assertTtsTextSafe(textRaw) {
   }
   return text;
 }
-
 async function ttsElevenLabsRaw(textRaw, lang = "en") {
   const text = assertTtsTextSafe(textRaw); // SECURITY: cap & sanitize
   const voiceId = lang === "es" ? ELEVEN_VOICE_ID_ES : lang === "pt" ? ELEVEN_VOICE_ID_PT : ELEVEN_VOICE_ID_EN;
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
+  const url = "https://api.elevenlabs.io/v1/text-to-speech/" + voiceId;
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -1234,7 +1233,7 @@ async function ttsElevenLabsRaw(textRaw, lang = "en") {
     body: JSON.stringify({ text, voice_settings: { stability: 0.4, similarity_boost: 0.7 } }),
   });
   if (!res.ok) {
-    throw new Error(`ElevenLabs TTS failed: ${res.status} ${res.statusText}`);
+    throw new Error("ElevenLabs TTS failed: " + res.status + " " + res.statusText);
   }
   const arr = await res.arrayBuffer();
   if (arr.byteLength > MAX_AUDIO_INPUT_BYTES) throw new Error("TTS output too large");
@@ -1244,21 +1243,18 @@ function ffmpegTranscode(inputBuf, args) {
   return new Promise((resolve, reject) => {
     if (!Buffer.isBuffer(inputBuf) || inputBuf.length === 0) return reject(new Error("Invalid audio buffer"));
     if (inputBuf.length > MAX_AUDIO_INPUT_BYTES) return reject(new Error("Audio buffer too large"));
-
     const chunks = [];
     const ff = spawn(ffmpegBin.path, args, { stdio: ["pipe", "pipe", "pipe"] });
-
     const timer = setTimeout(() => {
       ff.kill("SIGKILL");
       reject(new Error("ffmpeg timeout"));
     }, FFMPEG_TIMEOUT_MS);
-
     ff.stdin.on("error", () => {});
     ff.stdout.on("data", d => chunks.push(d));
     ff.stderr.on("data", d => console.error("[ffmpeg]", d.toString().trim()));
     ff.on("close", code => {
       clearTimeout(timer);
-      code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`ffmpeg exited ${code}`));
+      code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error("ffmpeg exited " + code));
     });
     ff.stdin.end(inputBuf);
   });
@@ -1318,6 +1314,7 @@ function connectDeepgram(onFinal, onAnyTranscript, lang = "en", ws) {
   const langCode = lang === "es" ? "es" : lang === "pt" ? "pt" : "en-US";
   const url = `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&punctuate=true&language=${langCode}`;
   const dg = new WebSocket(url, { headers: { Authorization: `Token ${DG_KEY}` } });
+
   let lastPartial = "";
   let partialTimer = null;
   let idleTimer = null;
@@ -1328,6 +1325,7 @@ function connectDeepgram(onFinal, onAnyTranscript, lang = "en", ws) {
       try { dg.close(); } catch {}
     }, SESSION_IDLE_MS);
   };
+
   function promotePartial(reason = "idle") {
     if (!lastPartial) return;
     const promoted = lastPartial.trim();
@@ -1338,6 +1336,7 @@ function connectDeepgram(onFinal, onAnyTranscript, lang = "en", ws) {
       onFinal(promoted);
     }
   }
+
   dg.on("open", () => { console.log(`[DG] connected (${langCode})`); resetIdle(); });
   dg.on("message", (d) => {
     resetIdle();
@@ -1400,7 +1399,7 @@ wss.on("connection", (ws, req) => {
     noInputTimer = setTimeout(async () => {
       // Don't reprompt if in grace period or speaking
       if (ws._speaking || Date.now() < ws._graceUntil) return;
-      
+
       ws._speaking = true;
       try {
         const prompt = ws._ctx.t("stillThere");
@@ -1416,6 +1415,7 @@ wss.on("connection", (ws, req) => {
       }
     }, NO_INPUT_REPROMPT_MS);
   };
+
   const handleFinal = async (finalText) => {
     // Don't process during grace period (agent just finished speaking)
     if (Date.now() < ws._graceUntil) {
@@ -1423,7 +1423,7 @@ wss.on("connection", (ws, req) => {
       return;
     }
     if (ws._speaking) return;
-    
+
     // If language just detected, reconnect Deepgram
     if (!ws._ctx.language) {
       ws._ctx.language = detectLanguage(finalText);
@@ -1431,12 +1431,12 @@ wss.on("connection", (ws, req) => {
       if (ws._dgConnection) ws._dgConnection.close();
       ws._dgConnection = connectDeepgram(handleFinal, () => resetNoInputTimer(), ws._ctx.language, ws);
     }
-    
+
     console.log(`[USER] "${safeLog(finalText)}"`);
     const reply = routeWithContext(finalText, ws._ctx);
     console.log(`[BOT] "${safeLog(reply)}"`);
     console.log(`[CONTEXT] ${safeLog(JSON.stringify(ws._ctx.data))}`);
-    
+
     ws._speaking = true;
     try {
       const out = MEDIA_FORMAT === "mulaw" ? await ttsToMulaw(reply, ws._ctx.language) : await ttsToPcm16(reply, ws._ctx.language);
@@ -1451,7 +1451,9 @@ wss.on("connection", (ws, req) => {
       bumpIdle();
     }
   };
+
   ws._dgConnection = connectDeepgram(handleFinal, () => resetNoInputTimer(), "en", ws);
+
   ws.on("message", async (data) => {
     bumpIdle();
     let msg;
@@ -1482,16 +1484,14 @@ wss.on("connection", (ws, req) => {
       if (typeof payload !== "string" || payload.length === 0) return;
       let b;
       try { b = Buffer.from(payload, "base64"); } catch { return; }
-
       const expected = MEDIA_FORMAT === "mulaw" ? BYTES_PER_FRAME_MULAW : BYTES_PER_FRAME_PCM16;
       if (b.length !== expected) {
         // Drop malformed frame quietly
         return;
       }
-
       ws._rx++;
       // Only send to Deepgram if not speaking and not in grace period
-      if (ws._dgConnection && ws._dgConnection.readyState === ws._dgConnection.OPEN && 
+      if (ws._dgConnection && ws._dgConnection.readyState === ws._dgConnection.OPEN &&
           !ws._speaking && Date.now() >= ws._graceUntil) {
         const pcm16 = inboundToPCM16(b);
         ws._dgConnection.send(pcm16);
@@ -1519,7 +1519,6 @@ wss.on("connection", (ws, req) => {
 // HTTP
 // ───────────────────────────────────────────────────────────────────────────────
 app.use(express.json({ limit: "1mb" })); // SECURITY: request size limit
-
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/debug/say", async (req, res) => {
   try {
@@ -1537,7 +1536,7 @@ const server = app.listen(PORT, () => console.log(`🚀 Server running on port $
 // SECURITY: Auth & rate-limit on WS upgrade
 server.on("upgrade", (req, socket, head) => {
   try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
+    const url = new URL(req.url, "http://" + req.headers.host);
     if (url.pathname !== "/stream") {
       socket.destroy();
       return;
