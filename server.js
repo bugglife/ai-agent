@@ -654,7 +654,7 @@ function extractBedrooms(textRaw) {
   if (justNumber) {
     const word = justNumber[1];
     const result = numberWords[word] || (parseInt(word) >= 5 ? "5+" : word);
-    console.log(`[EXTRACT] Bedrooms via standalone: ${word} → ${result}`);
+    console.log("[EXTRACT] Bedrooms via standalone: " + word + " -> " + result);
     return result;
   }
   
@@ -673,7 +673,7 @@ function extractBathrooms(textRaw) {
   // Try word patterns
   for (const [word, num] of Object.entries(numberWords)) {
     if (q.includes(word + " bath") || q.includes(word + " bano") || q.includes(word + " banheiro")) {
-      console.log(`[EXTRACT] Bathrooms via word: ${word} → ${num}`);
+      console.log("[EXTRACT] Bedrooms via word: " + word + " -> " + num);
       return num >= 5 ? "5+" : num;
     }
   }
@@ -683,7 +683,7 @@ function extractBathrooms(textRaw) {
   if (digitMatch) {
     const num = parseInt(digitMatch[1]);
     const result = num >= 5 ? "5+" : num.toString();
-    console.log(`[EXTRACT] Bathrooms via digit: ${num} → ${result}`);
+    console.log("[EXTRACT] Bathrooms via digit: " + num + " -> " + result);
     return result;
   }
   
@@ -692,7 +692,7 @@ function extractBathrooms(textRaw) {
   if (justNumber) {
     const word = justNumber[1];
     const result = numberWords[word] || word;
-    console.log(`[EXTRACT] Bathrooms via standalone: ${word} → ${result}`);
+    console.log("[EXTRACT] Bathrooms via standalone: " + word + " -> " + result);
     return result;
   }
   
