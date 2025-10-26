@@ -430,6 +430,7 @@ const NUMBER_WORDS_MAP = {
   'double': 'repeat_next', 'triple': 'triple_next'
 };
 
+
 function extractPhoneNumber(text) {
   const q = normalize(text);
   const phonePattern = /(\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4})/;
@@ -442,6 +443,8 @@ function extractPhoneNumber(text) {
   
   while (i < words.length) {
     const word = words[i];
+    
+    // Handle "double" pattern
     if (word === 'double' && i + 1 < words.length) {
       const nextDigit = NUMBER_WORDS_MAP[words[i + 1]];
       if (nextDigit && nextDigit !== 'repeat_next' && nextDigit !== 'triple_next') {
@@ -450,6 +453,8 @@ function extractPhoneNumber(text) {
         continue;
       }
     }
+    
+    // Handle "triple" pattern
     if (word === 'triple' && i + 1 < words.length) {
       const nextDigit = NUMBER_WORDS_MAP[words[i + 1]];
       if (nextDigit && nextDigit !== 'repeat_next' && nextDigit !== 'triple_next') {
@@ -458,6 +463,20 @@ function extractPhoneNumber(text) {
         continue;
       }
     }
+    
+    // Handle "X hundred" pattern - NEW!
+    if (i + 1 < words.length && words[i + 1] === 'hundred') {
+      const multiplierWord = word;
+      const multiplierDigit = NUMBER_WORDS_MAP[multiplierWord];
+      if (multiplierDigit && multiplierDigit.length === 1) {
+        // "two hundred" = 200, "three hundred" = 300
+        digits += multiplierDigit + '00';
+        i += 2;
+        continue;
+      }
+    }
+    
+    // Handle compound numbers like "twenty-one"
     if (['twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'].includes(word) && i + 1 < words.length) {
       const tensDigit = NUMBER_WORDS_MAP[word];
       const onesWord = words[i + 1];
@@ -473,19 +492,25 @@ function extractPhoneNumber(text) {
         continue;
       }
     }
+    
+    // Regular number mapping
     if (NUMBER_WORDS_MAP[word]) {
       const mapped = NUMBER_WORDS_MAP[word];
       if (mapped !== 'repeat_next' && mapped !== 'triple_next') {
         digits += mapped;
       }
     }
+    
+    // Direct digits
     if (/^\d+$/.test(word)) {
       digits += word;
     }
+    
     i++;
   }
   return digits.length > 0 ? digits : null;
 }
+
 
 function formatPhoneNumber(digits) {
   if (digits.length === 10) {
