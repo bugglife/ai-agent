@@ -113,14 +113,30 @@ function safeLog(s) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// LANGUAGE DETECTION
+// LANGUAGE DETECTION - Conservative approach
 // ───────────────────────────────────────────────────────────────────────────────
 function detectLanguage(text) {
   const q = normalize(text);
-  const spanishWords = ["hola", "si", "bueno", "gracias", "como", "que", "limpieza"];
-  if (spanishWords.some(w => q.includes(w))) return "es";
-  const portugueseWords = ["ola", "sim", "obrigado", "obrigada", "limpeza"];
-  if (portugueseWords.some(w => q.includes(w))) return "pt";
+  
+  // Require MULTIPLE strong Spanish indicators
+  const spanishWords = ["hola", "si", "bueno", "gracias", "como estas", "que tal", "limpieza", "servicio", "precio", "cuando", "donde", "necesito", "quiero"];
+  const spanishCount = spanishWords.filter(w => q.includes(w)).length;
+  
+  // Only detect Spanish if we see 2+ Spanish words OR very clear Spanish phrases
+  if (spanishCount >= 2 || q.includes("como estas") || q.includes("que tal") || q.includes("hablas espanol")) {
+    return "es";
+  }
+  
+  // Require MULTIPLE strong Portuguese indicators
+  const portugueseWords = ["ola", "sim", "obrigado", "obrigada", "como vai", "tudo bem", "limpeza", "servico", "preco", "quando", "onde", "preciso", "quero"];
+  const portugueseCount = portugueseWords.filter(w => q.includes(w)).length;
+  
+  // Only detect Portuguese if we see 2+ Portuguese words OR very clear Portuguese phrases
+  if (portugueseCount >= 2 || q.includes("como vai") || q.includes("tudo bem") || q.includes("fala portugues")) {
+    return "pt";
+  }
+  
+  // Default to English
   return "en";
 }
 
@@ -265,6 +281,7 @@ async function streamFrames(ws, raw) {
 class ConversationContext {
   constructor() {
     this.language = "en";
+    this.languageDetected = false; // Flag to prevent language switching mid-conversation
     this.data = {
       city: null,
       date: null,
@@ -618,12 +635,15 @@ wss.on("connection", (ws, req) => {
     }
     if (ws._speaking) return;
 
-    // Detect language on first input
-    if (!ws._ctx.language || ws._ctx.language === "en") {
+    // Detect language ONLY on first input, then lock it in
+    if (!ws._ctx.languageDetected) {
       const detectedLang = detectLanguage(finalText);
-      if (detectedLang !== ws._ctx.language) {
-        ws._ctx.language = detectedLang;
-        console.log(`[LANG] Switching to ${ws._ctx.language}`);
+      ws._ctx.language = detectedLang;
+      ws._ctx.languageDetected = true;
+      console.log(`[LANG] Detected and locked to: ${ws._ctx.language}`);
+      
+      // Reconnect Deepgram with correct language if needed
+      if (detectedLang !== "en") {
         if (ws._dgConnection) ws._dgConnection.close();
         ws._dgConnection = connectDeepgram(handleFinal, () => resetNoInputTimer(), ws._ctx.language, ws);
       }
