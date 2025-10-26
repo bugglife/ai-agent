@@ -395,32 +395,51 @@ function extractRoomCount(text) {
 function routeWithContext(text, ctx) {
   const q = normalize(text);
   
+  // Defensive: ensure context data object exists
+  if (!ctx.data) {
+    ctx.data = {
+      city: null,
+      date: null,
+      time: null,
+      bedrooms: null,
+      bathrooms: null,
+      cleaningType: null,
+      frequency: null,
+    };
+  }
+  
   // Extract entities from user input
   const city = extractCity(text);
   const dateTime = extractDateTime(text);
   const rooms = extractRoomCount(text);
   
-  // Store extracted entities in context
+  // Store extracted entities in context - with safe null checks
   if (city) ctx.data.city = city;
-  if (dateTime?.day) ctx.data.date = dateTime.day;
-  if (dateTime?.time) ctx.data.time = dateTime.time;
-  if (rooms?.bedrooms !== null) ctx.data.bedrooms = rooms.bedrooms;
-  if (rooms?.bathrooms !== null) ctx.data.bathrooms = rooms.bathrooms;
+  if (dateTime && dateTime.day) ctx.data.date = dateTime.day;
+  if (dateTime && dateTime.time) ctx.data.time = dateTime.time;
+  if (rooms && rooms.bedrooms !== null && rooms.bedrooms !== undefined) {
+    ctx.data.bedrooms = rooms.bedrooms;
+  }
+  if (rooms && rooms.bathrooms !== null && rooms.bathrooms !== undefined) {
+    ctx.data.bathrooms = rooms.bathrooms;
+  }
   
   // STATE: Waiting for date/time after asking for it
   if (ctx.state === "booking" && dateTime) {
     ctx.state = "confirming";
-    const dayStr = ctx.data.date || "that day";
-    const timeStr = ctx.data.time || "that time";
+    const dayStr = (ctx.data && ctx.data.date) ? ctx.data.date : "that day";
+    const timeStr = (ctx.data && ctx.data.time) ? ctx.data.time : "that time";
     return `Perfect! I have you down for ${dayStr} at ${timeStr}. Can I get your phone number and address to confirm the booking?`;
   }
   
   // STATE: Waiting for room count after asking for it
   if (ctx.state === "pricing" && rooms) {
-    // Simple price estimation (would be more sophisticated with full pricing logic)
-    const bed = ctx.data.bedrooms || 1;
-    const bath = ctx.data.bathrooms || 1;
-    return `For a ${bed === 0 ? 'studio' : bed + ' bedroom'} with ${bath} bathroom, our standard cleaning starts at around $${100 + (bed * 30) + (bath * 20)}. Would you like to book a cleaning?`;
+    // Defensive: ensure data object exists and has default values
+    if (!ctx.data) ctx.data = {};
+    const bed = ctx.data.bedrooms ?? 1;
+    const bath = ctx.data.bathrooms ?? 1;
+    const price = 100 + (bed * 30) + (bath * 20);
+    return `For a ${bed === 0 ? 'studio' : bed + ' bedroom'} with ${bath} bathroom, our standard cleaning starts at around $${price}. Would you like to book a cleaning?`;
   }
   
   // Service area question with city mentioned
@@ -444,8 +463,8 @@ function routeWithContext(text, ctx) {
   // They provided date/time without us asking
   if (dateTime && ctx.state !== "booking") {
     ctx.state = "confirming";
-    const dayStr = ctx.data.date || "that day";
-    const timeStr = ctx.data.time || "that time";
+    const dayStr = (ctx.data && ctx.data.date) ? ctx.data.date : "that day";
+    const timeStr = (ctx.data && ctx.data.time) ? ctx.data.time : "that time";
     return `Great! I can schedule you for ${dayStr} at ${timeStr}. What's your address and phone number?`;
   }
   
