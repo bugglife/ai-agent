@@ -294,28 +294,49 @@ class ConversationContext {
 function routeWithContext(text, ctx) {
   const q = normalize(text);
   
-  // Service area check
-  if (q.includes("area") || q.includes("service") || q.includes("where")) {
-    return "We service the Greater Boston area including Cambridge, Somerville, Brookline, and surrounding cities.";
+  // Greetings - respond naturally
+  if (q.match(/^(hi|hello|hey|good morning|good afternoon|good evening)\b/)) {
+    return "Hello! How can I help you today?";
   }
   
-  // Hours
-  if (q.includes("hour") || q.includes("open") || q.includes("close")) {
+  // Availability / Booking / Scheduling
+  if (q.includes("available") || q.includes("availability") || 
+      q.includes("book") || q.includes("appointment") || 
+      q.includes("schedule") || q.includes("reserve")) {
+    return "Yes, we're available! What date and time work best for you?";
+  }
+  
+  // Service area check
+  if (q.includes("area") || q.includes("service") || q.includes("where") ||
+      q.includes("location") || q.includes("come to")) {
+    return "We service the Greater Boston area including Cambridge, Somerville, Brookline, Newton, and surrounding cities.";
+  }
+  
+  // Hours / Open times
+  if (q.includes("hour") || q.includes("open") || q.includes("close") ||
+      q.includes("when") && (q.includes("open") || q.includes("available"))) {
     return "We're open 8 AM to 6 PM Monday through Friday, and 9 AM to 2 PM on Saturday.";
   }
   
-  // Booking
-  if (q.includes("book") || q.includes("appointment") || q.includes("schedule")) {
-    return "Sure! What date and time work for you? Please say something like Saturday at 2 PM.";
-  }
-  
   // Pricing
-  if (q.includes("price") || q.includes("cost") || q.includes("how much")) {
+  if (q.includes("price") || q.includes("pricing") || q.includes("cost") || 
+      q.includes("how much") || q.includes("charge")) {
     return "Our pricing depends on the size of your space and the type of cleaning. How many bedrooms and bathrooms do you have?";
   }
   
-  // Default
-  return "I can help with booking, pricing, and general questions. What would you like to know?";
+  // Types of cleaning
+  if (q.includes("deep clean") || q.includes("move out") || q.includes("airbnb") ||
+      q.includes("type") && q.includes("clean")) {
+    return "We offer standard cleaning, deep cleaning, Airbnb turnover, and move-out cleaning. Which are you interested in?";
+  }
+  
+  // Affirmative responses (yes, yeah, sure)
+  if (q.match(/^(yes|yeah|yep|sure|ok|okay)\b/)) {
+    return "Great! What specifically would you like help with - booking a cleaning, pricing information, or something else?";
+  }
+  
+  // Default - encourage specifics
+  return "I can help with booking, pricing, service areas, and hours. What would you like to know?";
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
