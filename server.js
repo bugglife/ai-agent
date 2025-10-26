@@ -754,7 +754,7 @@ class ConversationContext {
     const type = this.data.serviceType;
     const bathrooms = this.data.bathrooms || "1"; // Default to 1 if not specified
     const key = this.data.bedrooms === "Studio" ? "Studio" : 
-                `${this.data.bedrooms}-${bathrooms}`;
+                (this.data.bedrooms + "-" + bathrooms);
     const basePrice = PRICING_MATRIX[type]?.[key];
     if (!basePrice) {
       console.log(`[PRICE] No match for ${type} ${key}`);
