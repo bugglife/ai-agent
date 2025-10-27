@@ -14,10 +14,11 @@ const DG_KEY = process.env.DEEPGRAM_API_KEY || "";
 const MEDIA_FORMAT = (process.env.TWILIO_MEDIA_FORMAT || "pcm16").toLowerCase();
 
 // OpenAI TTS Voice IDs for different languages
-const OPENAI_VOICE_EN = process.env.OPENAI_VOICE_EN || "nova"; // English - warm, friendly female
-const OPENAI_VOICE_ES = process.env.OPENAI_VOICE_ES || "nova"; // Spanish - same voice works well
-const OPENAI_VOICE_PT = process.env.OPENAI_VOICE_PT || "nova"; // Portuguese - same voice works well
+const OPENAI_VOICE_EN = process.env.OPENAI_VOICE_EN || "shimmer"; // English - clear, warm, natural
+const OPENAI_VOICE_ES = process.env.OPENAI_VOICE_ES || "shimmer"; // Spanish - same voice works well
+const OPENAI_VOICE_PT = process.env.OPENAI_VOICE_PT || "shimmer"; // Portuguese - same voice works well
 // Available voices: alloy, echo, fable, onyx, nova, shimmer
+// Best for phone: shimmer (most natural), alloy (clearest)
 
 // SECURITY: Optional authentication - if AGENT_TOKEN is set, it will be required
 // If AGENT_TOKEN is not set, authentication is disabled (for backwards compatibility)
