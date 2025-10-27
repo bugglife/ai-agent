@@ -9,20 +9,23 @@ import ffmpegBin from "@ffmpeg-installer/ffmpeg";
 // ───────────────────────────────────────────────────────────────────────────────
 const app = express();
 const PORT = process.env.PORT || 10000;
-const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
-const ELEVEN_VOICE_ID_EN = process.env.ELEVEN_VOICE_ID || "EXAVITQu4vr4xnSDxMaL"; // English
-const ELEVEN_VOICE_ID_ES = process.env.ELEVEN_VOICE_ID_ES || "VR6AewLTigWG4xSOukaG"; // Spanish
-const ELEVEN_VOICE_ID_PT = process.env.ELEVEN_VOICE_ID_PT || "yoZ06aMxZJJ28mfd3POQ"; // Portuguese
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const DG_KEY = process.env.DEEPGRAM_API_KEY || "";
 const MEDIA_FORMAT = (process.env.TWILIO_MEDIA_FORMAT || "pcm16").toLowerCase();
+
+// OpenAI TTS Voice IDs for different languages
+const OPENAI_VOICE_EN = process.env.OPENAI_VOICE_EN || "nova"; // English - warm, friendly female
+const OPENAI_VOICE_ES = process.env.OPENAI_VOICE_ES || "nova"; // Spanish - same voice works well
+const OPENAI_VOICE_PT = process.env.OPENAI_VOICE_PT || "nova"; // Portuguese - same voice works well
+// Available voices: alloy, echo, fable, onyx, nova, shimmer
 
 // SECURITY: Optional authentication - if AGENT_TOKEN is set, it will be required
 // If AGENT_TOKEN is not set, authentication is disabled (for backwards compatibility)
 const AGENT_TOKEN = process.env.AGENT_TOKEN;
 const AUTH_ENABLED = !!AGENT_TOKEN;
 
-if (!ELEVEN_API_KEY) { 
-  console.error("❌ Missing ELEVEN_API_KEY"); 
+if (!OPENAI_API_KEY) { 
+  console.error("❌ Missing OPENAI_API_KEY"); 
   process.exit(1); 
 }
 
@@ -196,27 +199,34 @@ function inboundToPCM16(buf) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// TTS via ElevenLabs
+// TTS via OpenAI
 // ───────────────────────────────────────────────────────────────────────────────
-async function ttsElevenLabsRaw(text, lang = "en") {
-  const voiceId = lang === "es" ? ELEVEN_VOICE_ID_ES : 
-                  lang === "pt" ? ELEVEN_VOICE_ID_PT : ELEVEN_VOICE_ID_EN;
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
+async function ttsOpenAIRaw(text, lang = "en") {
+  // Select voice based on language (you can customize these)
+  const voice = lang === "es" ? OPENAI_VOICE_ES : 
+                lang === "pt" ? OPENAI_VOICE_PT : OPENAI_VOICE_EN;
+  
+  const url = "https://api.openai.com/v1/audio/speech";
   const res = await fetch(url, {
     method: "POST",
     headers: {
-      "xi-api-key": ELEVEN_API_KEY,
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json",
-      Accept: "audio/mpeg",
     },
     body: JSON.stringify({ 
-      text, 
-      voice_settings: { stability: 0.4, similarity_boost: 0.7 } 
+      model: "tts-1", // Use tts-1 for speed, tts-1-hd for quality
+      voice: voice,
+      input: text,
+      response_format: "pcm", // Get raw PCM audio
+      speed: 1.0
     }),
   });
+  
   if (!res.ok) {
-    throw new Error(`ElevenLabs TTS failed: ${res.status} ${await res.text()}`);
+    const errorText = await res.text();
+    throw new Error(`OpenAI TTS failed: ${res.status} ${errorText}`);
   }
+  
   return Buffer.from(await res.arrayBuffer());
 }
 
@@ -233,22 +243,26 @@ function ffmpegTranscode(inputBuf, args) {
 }
 
 async function ttsToPcm16(text, lang = "en") {
-  const input = await ttsElevenLabsRaw(text, lang);
+  // OpenAI returns PCM at 24kHz 16-bit mono, we need to resample to 8kHz for Twilio
+  const input = await ttsOpenAIRaw(text, lang);
+  
+  // Resample from 24kHz to 8kHz
   let out = await ffmpegTranscode(input, [
     "-hide_banner","-nostdin","-loglevel","error",
-    "-i","pipe:0","-ac","1","-ar","8000",
-    "-f","s16le","-acodec","pcm_s16le","pipe:1",
+    "-f","s16le","-ar","24000","-ac","1","-i","pipe:0", // Input: 24kHz PCM16 mono
+    "-f","s16le","-ar","8000","-ac","1","pipe:1", // Output: 8kHz PCM16 mono
   ]);
+  
   if (out.length % 2 !== 0) out = out.slice(0, out.length - 1);
   return out;
 }
 
 async function ttsToMulaw(text, lang = "en") {
-  const input = await ttsElevenLabsRaw(text, lang);
+  const input = await ttsOpenAIRaw(text, lang);
   return await ffmpegTranscode(input, [
     "-hide_banner","-nostdin","-loglevel","error",
-    "-i","pipe:0","-ac","1","-ar","8000",
-    "-f","mulaw","-acodec","pcm_mulaw","pipe:1",
+    "-f","s16le","-ar","24000","-ac","1","-i","pipe:0", // Input: 24kHz PCM16 mono
+    "-f","mulaw","-ar","8000","-ac","1","pipe:1", // Output: 8kHz mulaw
   ]);
 }
 
