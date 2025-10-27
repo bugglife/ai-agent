@@ -1,8 +1,3 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// 🎙️ HIGH DEFINITION VERSION - OpenAI TTS HD Model
-// Uses tts-1-hd for better voice quality (2x cost but still 33x cheaper than ElevenLabs)
-// Cost: $30 per 1M characters vs $15 for standard
-// ═══════════════════════════════════════════════════════════════════════════════
 import express from "express";
 import fetch from "node-fetch";
 import WebSocket, { WebSocketServer } from "ws";
@@ -70,7 +65,9 @@ const CITY_ALIASES = {
   "sommerville": "Somerville", "new town": "Newton", "water town": "Watertown",
   "beaumont": "Belmont", "wellsley": "Wellesley", "quinsy": "Quincy",
   "jamaica plain": "Boston", "south boston": "Boston", "west roxbury": "Boston",
-  "roslindale": "Boston", "dorchester": "Boston", "roxbury": "Boston",
+  "roslindale": "Boston", "dorchester": "Boston", "dor chester": "Boston",
+  "door chester": "Boston", "dorchest": "Boston", "dot": "Boston",
+  "roxbury": "Boston",
   "allston": "Boston", "brighton": "Boston", "back bay": "Boston",
   "south end": "Boston", "north end": "Boston", "charlestown": "Boston",
   "east boston": "Boston", "hyde park": "Boston", "mattapan": "Boston",
@@ -220,7 +217,7 @@ async function ttsOpenAIRaw(text, lang = "en") {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ 
-      model: "tts-1-hd", // HD model for better quality (2x cost but still cheap)
+      model: "tts-1", // Use tts-1 for speed, tts-1-hd for quality
       voice: voice,
       input: text,
       response_format: "pcm", // Get raw PCM audio
@@ -519,11 +516,22 @@ function extractPhoneNumber(text) {
 
 
 function formatPhoneNumber(digits) {
-  if (digits.length === 10) {
-    // Format with spaces so TTS says each digit individually
-    return `${digits[0]} ${digits[1]} ${digits[2]}, ${digits[3]} ${digits[4]} ${digits[5]}, ${digits[6]} ${digits[7]} ${digits[8]} ${digits[9]}`;
+  // Clean any non-digits just in case
+  const clean = digits.replace(/\D/g, '');
+  
+  if (clean.length === 10) {
+    // Format with spaces so TTS says each digit individually: "6 1 7, 7 7 8, 5 4 5 4"
+    return `${clean[0]} ${clean[1]} ${clean[2]}, ${clean[3]} ${clean[4]} ${clean[5]}, ${clean[6]} ${clean[7]} ${clean[8]} ${clean[9]}`;
+  } else if (clean.length > 10) {
+    // Too many digits - truncate to 10 and warn
+    console.error(`[PHONE FORMAT] ERROR: Phone has ${clean.length} digits (expected 10): ${clean}`);
+    const truncated = clean.slice(0, 10);
+    return `${truncated[0]} ${truncated[1]} ${truncated[2]}, ${truncated[3]} ${truncated[4]} ${truncated[5]}, ${truncated[6]} ${truncated[7]} ${truncated[8]} ${truncated[9]}`;
+  } else {
+    // Too few digits - return with spaces between each
+    console.error(`[PHONE FORMAT] ERROR: Phone has ${clean.length} digits (expected 10): ${clean}`);
+    return clean.split('').join(' ');
   }
-  return digits;
 }
 
 function extractAddress(text) {
@@ -605,30 +613,57 @@ function routeWithContext(text, ctx) {
   // STATE: Collecting contact info (phone and address) - PHONE FIX APPLIED
   // ───────────────────────────────────────────────────────────────────────────────
   if (ctx.state === "confirming") {
-    // ACCUMULATE phone digits instead of replacing
-    if (phone) {
-      ctx.data.phone += phone;
-      console.log(`[PHONE] Accumulated: ${ctx.data.phone} (added ${phone})`);
-    }
-    
     const currentPhone = ctx.data.phone || "";
     const hasCompletePhone = currentPhone.length >= 10;
     const hasAddress = ctx.data.address;
     
-    if (phone && !hasCompletePhone) {
-      const remaining = 10 - currentPhone.length;
+    // DETECT if user is saying the phone number is wrong
+    const isCorrection = q.includes("no") || q.includes("wrong") || q.includes("incorrect") || 
+                        q.includes("not right") || q.includes("that's not") || q.includes("thats not") ||
+                        q.includes("not my number") || q.includes("not correct");
+    
+    // If user says phone is wrong, reset and ask again
+    if (isCorrection && hasCompletePhone) {
+      console.log(`[PHONE] User rejected phone: ${currentPhone}. Resetting.`);
+      ctx.data.phone = "";
+      ctx.collectingPhone = false;
+      return "I apologize for the mistake. Let's try again. Can you give me your phone number? Say the digits one at a time.";
+    }
+    
+    // ACCUMULATE phone digits instead of replacing (but only if we don't have 10+ already)
+    if (phone && currentPhone.length < 10) {
+      // Validate: don't add more than needed
+      const spaceLeft = 10 - currentPhone.length;
+      const digitsToAdd = phone.slice(0, spaceLeft); // Only add what fits
+      ctx.data.phone += digitsToAdd;
+      console.log(`[PHONE] Accumulated: ${ctx.data.phone} (added ${digitsToAdd} from ${phone})`);
+      
+      // Warn if we're dropping digits
+      if (phone.length > spaceLeft) {
+        console.warn(`[PHONE] WARNING: Dropped ${phone.length - spaceLeft} excess digits: ${phone.slice(spaceLeft)}`);
+      }
+    } else if (phone && currentPhone.length >= 10) {
+      console.warn(`[PHONE] Ignoring additional digits "${phone}" - already have 10 digits: ${currentPhone}`);
+    }
+    
+    // Update hasCompletePhone after potential accumulation
+    const updatedPhone = ctx.data.phone || "";
+    const nowHasCompletePhone = updatedPhone.length >= 10;
+    
+    if (phone && !nowHasCompletePhone) {
+      const remaining = 10 - updatedPhone.length;
       if (remaining > 0) {
         return `Got it. I need ${remaining} more digits.`;
       }
     }
     
-    if (hasCompletePhone && !hasAddress) {
+    if (nowHasCompletePhone && !hasAddress) {
       if (address) {
         ctx.state = "complete";
-        const formatted = formatPhoneNumber(currentPhone);
+        const formatted = formatPhoneNumber(updatedPhone);
         return `Perfect! I have your booking for ${ctx.data.date || 'that day'} at ${ctx.data.time || 'that time'} at ${address}. We'll call you at ${formatted} to confirm. Thank you for choosing Clean Easy!`;
       } else {
-        const formatted = formatPhoneNumber(currentPhone);
+        const formatted = formatPhoneNumber(updatedPhone);
         return `Great, I have your number as ${formatted}. What's the address for the cleaning?`;
       }
     }
