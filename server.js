@@ -296,7 +296,7 @@ class ConversationContext {
     };
     this.greeted = false;
     this.state = "greeting"; // greeting, booking, pricing, confirming, complete
-    this.collectingPhone = false;
+    this.collectingPhone = false; // Track when actively collecting phone
   }
   
   t(key) {
@@ -500,7 +500,7 @@ function extractPhoneNumber(text) {
 
 function formatPhoneNumber(digits) {
   if (digits.length === 10) {
-    // Format with spaces so TTS says each digit: "6 1 7, 7 7 8, 5 4 5 4"
+    // Format with spaces so TTS says each digit individually
     return `${digits[0]} ${digits[1]} ${digits[2]}, ${digits[3]} ${digits[4]} ${digits[5]}, ${digits[6]} ${digits[7]} ${digits[8]} ${digits[9]}`;
   }
   return digits;
@@ -529,7 +529,6 @@ function extractAddress(text) {
 // ───────────────────────────────────────────────────────────────────────────────
 function routeWithContext(text, ctx) {
   const q = normalize(text);
-  const words = q.split(/\s+/); // Declare words at the top so it's available throughout
   
   // Defensive: ensure context data object exists
   if (!ctx.data) {
@@ -550,17 +549,14 @@ function routeWithContext(text, ctx) {
   const city = extractCity(text);
   const dateTime = extractDateTime(text);
   const rooms = extractRoomCount(text);
-  
-  // ONLY extract phone if we're in confirming state and don't have complete phone yet
+  // ONLY extract phone during confirming state to prevent address numbers from being added
   let phone = null;
-  const currentPhoneTemp = ctx.data.phone || "";
-  if (ctx.state === "confirming" && currentPhoneTemp.length < 10) {
+  if (ctx.state === "confirming" && (!ctx.data.phone || ctx.data.phone.length < 10)) {
     phone = extractPhoneNumber(text);
     ctx.collectingPhone = true;
-  } else if (currentPhoneTemp.length >= 10) {
+  } else if (ctx.data.phone && ctx.data.phone.length >= 10) {
     ctx.collectingPhone = false;
   }
-  
   const address = extractAddress(text);
   
   // Store extracted entities in context - with safe null checks
@@ -753,6 +749,7 @@ function routeWithContext(text, ctx) {
   
   // Greetings - ONLY if it's just a greeting with no other content (moved to end)
   // Check if the message is ONLY a greeting (5 words or less, no substantive keywords)
+  const words = q.split(/\s+/);
   const isJustGreeting = words.length <= 5 && 
     q.match(/^(hi|hello|hey|good morning|good afternoon|good evening)\b/) &&
     !q.includes("available") && !q.includes("book") && !q.includes("price") &&
@@ -860,8 +857,8 @@ wss.on("connection", (ws, req) => {
   };
 
   const handleFinal = async (finalText) => {
-    // Use longer grace period when collecting phone to avoid interrupting mid-sentence
-    const currentGracePeriod = ws._ctx.collectingPhone ? PHONE_COLLECTION_GRACE_MS : POST_TTS_GRACE_MS;
+    // Use longer grace when collecting phone to avoid interrupting
+    const gracePeriod = ws._ctx.collectingPhone ? PHONE_COLLECTION_GRACE_MS : POST_TTS_GRACE_MS;
     
     if (Date.now() < ws._graceUntil) {
       console.log("[GRACE] Ignoring input during grace period");
@@ -916,9 +913,8 @@ wss.on("connection", (ws, req) => {
       }
     } finally {
       ws._speaking = false;
-      // Use appropriate grace period based on collection state
-      const gracePeriod = ws._ctx.collectingPhone ? PHONE_COLLECTION_GRACE_MS : POST_TTS_GRACE_MS;
-      ws._graceUntil = Date.now() + gracePeriod;
+      const nextGracePeriod = ws._ctx.collectingPhone ? PHONE_COLLECTION_GRACE_MS : POST_TTS_GRACE_MS;
+      ws._graceUntil = Date.now() + nextGracePeriod;
       resetNoInputTimer();
     }
   };
