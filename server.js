@@ -529,6 +529,7 @@ function extractAddress(text) {
 // ───────────────────────────────────────────────────────────────────────────────
 function routeWithContext(text, ctx) {
   const q = normalize(text);
+  const words = q.split(/\s+/); // Declare words at the top so it's available throughout
   
   // Defensive: ensure context data object exists
   if (!ctx.data) {
@@ -752,7 +753,6 @@ function routeWithContext(text, ctx) {
   
   // Greetings - ONLY if it's just a greeting with no other content (moved to end)
   // Check if the message is ONLY a greeting (5 words or less, no substantive keywords)
-  const words = q.split(/\s+/);
   const isJustGreeting = words.length <= 5 && 
     q.match(/^(hi|hello|hey|good morning|good afternoon|good evening)\b/) &&
     !q.includes("available") && !q.includes("book") && !q.includes("price") &&
