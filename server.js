@@ -1,3 +1,8 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// 🎙️ HIGH DEFINITION VERSION - OpenAI TTS HD Model
+// Uses tts-1-hd for better voice quality (2x cost but still 33x cheaper than ElevenLabs)
+// Cost: $30 per 1M characters vs $15 for standard
+// ═══════════════════════════════════════════════════════════════════════════════
 import express from "express";
 import fetch from "node-fetch";
 import WebSocket, { WebSocketServer } from "ws";
@@ -215,7 +220,7 @@ async function ttsOpenAIRaw(text, lang = "en") {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ 
-      model: "tts-1", // Use tts-1 for speed, tts-1-hd for quality
+      model: "tts-1-hd", // HD model for better quality (2x cost but still cheap)
       voice: voice,
       input: text,
       response_format: "pcm", // Get raw PCM audio
@@ -592,7 +597,7 @@ function routeWithContext(text, ctx) {
     ctx.state = "confirming";
     const dayStr = (ctx.data && ctx.data.date) ? ctx.data.date : "that day";
     const timeStr = (ctx.data && ctx.data.time) ? ctx.data.time : "that time";
-    return `Perfect! I have you down for ${dayStr} at ${timeStr}. Can I get your phone number and address to confirm the booking?`;
+    return `Perfect! I have you down for ${dayStr} at ${timeStr}. Can you give me your phone number? Say the digits one at a time.`;
   }
   
   
@@ -726,7 +731,7 @@ function routeWithContext(text, ctx) {
     ctx.state = "confirming";
     const dayStr = (ctx.data && ctx.data.date) ? ctx.data.date : "that day";
     const timeStr = (ctx.data && ctx.data.time) ? ctx.data.time : "that time";
-    return `Great! I can schedule you for ${dayStr} at ${timeStr}. What's your address and phone number?`;
+    return `Great! I can schedule you for ${dayStr} at ${timeStr}. Can you give me your phone number? Say the digits one at a time.`;
   }
   
   // Service area check (general)
