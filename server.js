@@ -1,1092 +1,623 @@
 import express from "express";
-import fetch from "node-fetch";
+import { createClient } from "@supabase/supabase-js";
+import twilio from "twilio";
 import WebSocket, { WebSocketServer } from "ws";
-import { spawn } from "child_process";
-import ffmpegBin from "@ffmpeg-installer/ffmpeg";
+import fetch from "node-fetch";
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Config
+// 0. HELPERS
+// ───────────────────────────────────────────────────────────────────────────────
+function normalizePhone(phone = "") {
+  const digits = String(phone).replace(/\D/g, "");
+  if (!digits) return "";
+  if (digits.length === 10) return `1${digits}`;
+  return digits;
+}
+
+function wantsHumanFromText(text = "") {
+  return /(operator|representative|human|real person|agent|someone|talk to a person|call me)/i.test(text);
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 0b. SAFETY HELPERS (GUARD RAILS)
+// ───────────────────────────────────────────────────────────────────────────────
+function safeJsonParse(maybeJson) {
+  try {
+    return JSON.parse(maybeJson);
+  } catch {
+    return null;
+  }
+}
+
+function isFatalOpenAIError(err) {
+  const code = err?.code || err?.error?.code;
+  const type = err?.type || err?.error?.type;
+
+  return (
+    code === "insufficient_quota" ||
+    code === "billing_hard_limit_reached" ||
+    code === "account_deactivated" ||
+    type === "insufficient_quota"
+  );
+}
+
+function isTransientOpenAIError(status, err) {
+  if ([408, 429, 500, 502, 503, 504].includes(status)) return true;
+  const code = err?.code || err?.error?.code;
+  return code === "rate_limit_exceeded";
+}
+
+async function callOpenAIChat({ apiKey, messages, model = "gpt-4o", max_tokens = 120, timeoutMs = 12000 }) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model, messages, max_tokens }),
+      signal: controller.signal
+    });
+
+    const json = await resp.json().catch(() => null);
+
+    if (!resp.ok) {
+      const err = json?.error || json || {};
+      err.status = resp.status;
+      throw err;
+    }
+
+    const content = json?.choices?.[0]?.message?.content?.trim();
+    return { ok: true, content, raw: json };
+  } catch (e) {
+    const err =
+      e?.name === "AbortError"
+        ? { code: "timeout", type: "timeout", message: "OpenAI request timed out", status: 408 }
+        : e;
+
+    return { ok: false, error: err };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 1. CONFIGURATION & SETUP
 // ───────────────────────────────────────────────────────────────────────────────
 const app = express();
 const PORT = process.env.PORT || 10000;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const DG_KEY = process.env.DEEPGRAM_API_KEY || "";
-const MEDIA_FORMAT = (process.env.TWILIO_MEDIA_FORMAT || "pcm16").toLowerCase();
 
-// OpenAI TTS Voice IDs for different languages
-const OPENAI_VOICE_EN = process.env.OPENAI_VOICE_EN || "shimmer"; // English - clear, warm, natural
-const OPENAI_VOICE_ES = process.env.OPENAI_VOICE_ES || "shimmer"; // Spanish - same voice works well
-const OPENAI_VOICE_PT = process.env.OPENAI_VOICE_PT || "shimmer"; // Portuguese - same voice works well
-// Available voices: alloy, echo, fable, onyx, nova, shimmer
-// Best for phone: shimmer (most natural), alloy (clearest)
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// SECURITY: Optional authentication - if AGENT_TOKEN is set, it will be required
-// If AGENT_TOKEN is not set, authentication is disabled (for backwards compatibility)
-const AGENT_TOKEN = process.env.AGENT_TOKEN;
-const AUTH_ENABLED = !!AGENT_TOKEN;
+const {
+  OPENAI_API_KEY,
+  DEEPGRAM_API_KEY,
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
+  TWILIO_PHONE_NUMBER,
+  SUPABASE_URL,
+  SUPABASE_KEY,
 
-if (!OPENAI_API_KEY) { 
-  console.error("❌ Missing OPENAI_API_KEY"); 
-  process.exit(1); 
+  // NEW (set these in Render):
+  PUBLIC_BASE_URL, // e.g. https://mass-mechanic-bot.onrender.com
+  ADMIN_ESCALATION_PHONE, // e.g. +16782003064
+
+  // OPTIONAL KILL SWITCH:
+  AI_ENABLED // set "false" to disable OpenAI calls instantly
+} = process.env;
+
+const IS_AI_ENABLED = String(AI_ENABLED || "true").toLowerCase() !== "false";
+
+if (!DEEPGRAM_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !SUPABASE_URL || !SUPABASE_KEY) {
+  console.error("❌ CRITICAL: Missing required API Keys (Deepgram/Twilio/Supabase).");
+  process.exit(1);
 }
 
-if (AUTH_ENABLED) {
-  console.log("🔒 Authentication ENABLED - token required");
-} else {
-  console.log("⚠️  Authentication DISABLED - no token required (set AGENT_TOKEN to enable)");
+// OpenAI is optional if AI_ENABLED=false, but you probably want it set.
+if (IS_AI_ENABLED && !OPENAI_API_KEY) {
+  console.error("❌ CRITICAL: AI_ENABLED=true but OPENAI_API_KEY is missing.");
+  process.exit(1);
 }
 
-if (!["pcm16", "mulaw"].includes(MEDIA_FORMAT)) {
-  console.warn(`⚠️ Unknown TWILIO_MEDIA_FORMAT='${MEDIA_FORMAT}', defaulting to pcm16`);
-}
-
-const SAMPLE_RATE = 8000;
-const FRAME_MS = 20;
-const BYTES_PER_SAMPLE_PCM16 = 2;
-const SAMPLES_PER_FRAME = (SAMPLE_RATE / 1000) * FRAME_MS;
-const BYTES_PER_FRAME_PCM16 = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE_PCM16;
-const BYTES_PER_FRAME_MULAW = SAMPLES_PER_FRAME * 1;
-const ASR_PARTIAL_PROMOTE_MS = 1200;
-const NO_INPUT_REPROMPT_MS = 7000;
-const POST_TTS_GRACE_MS = 800;
-const PHONE_COLLECTION_GRACE_MS = 1500;
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 // ───────────────────────────────────────────────────────────────────────────────
-// SERVICE AREAS & PRICING
+// 2. HEALTH CHECK
 // ───────────────────────────────────────────────────────────────────────────────
-const SERVICE_AREAS = [
-  "Boston","Cambridge","Somerville","Brookline","Newton","Watertown","Arlington",
-  "Belmont","Medford","Waltham","Needham","Wellesley","Dedham","Quincy"
-];
-
-const CITY_ALIASES = {
-  "brooklyn": "Brookline", "brook line": "Brookline", "brooklin": "Brookline",
-  "brook": "Brookline", "brooks": "Brookline", "brooke": "Brookline",
-  "sommerville": "Somerville", "new town": "Newton", "water town": "Watertown",
-  "beaumont": "Belmont", "wellsley": "Wellesley", "quinsy": "Quincy",
-  "jamaica plain": "Boston", "south boston": "Boston", "west roxbury": "Boston",
-  "roslindale": "Boston", "dorchester": "Boston", "dor chester": "Boston",
-  "door chester": "Boston", "dorchest": "Boston", "dot": "Boston",
-  "roxbury": "Boston",
-  "allston": "Boston", "brighton": "Boston", "back bay": "Boston",
-  "south end": "Boston", "north end": "Boston", "charlestown": "Boston",
-  "east boston": "Boston", "hyde park": "Boston", "mattapan": "Boston",
-  "fenway": "Boston", "mission hill": "Boston", "west end": "Boston",
-  "beacon hill": "Boston", "seaport": "Boston",
-  "jp": "Boston", "j p": "Boston", "southie": "Boston", "eastie": "Boston",
-  "westie": "Boston", "rozzie": "Boston", "dot": "Boston",
-};
-
-const PRICING_MATRIX = {
-  standard: {
-    Studio: 100, "1-1": 120, "1-2": 140, "2-1": 160, "2-2": 180, "2-3": 200, 
-    "2-4": 220, "2-5+": 240, "3-1": 200, "3-2": 220, "3-3": 260, "3-4": 280, 
-    "3-5+": 300, "4-1": 260, "4-2": 270, "4-3": 280, "4-4": 300, "4-5+": 320,
-    "5+-1": 300, "5+-2": 310, "5+-3": 320, "5+-4": 320, "5+-5+": 340,
-  },
-  airbnb: {
-    Studio: 120, "1-1": 140, "1-2": 160, "2-1": 180, "2-2": 200, "2-3": 220,
-    "2-4": 240, "2-5+": 260, "3-1": 220, "3-2": 240, "3-3": 270, "3-4": 290,
-    "3-5+": 310, "4-1": 280, "4-2": 290, "4-3": 300, "4-4": 320, "4-5+": 350,
-    "5+-1": 330, "5+-2": 340, "5+-3": 350, "5+-4": 350, "5+-5+": 370,
-  },
-  deep: {
-    Studio: 150, "1-1": 180, "1-2": 200, "2-1": 220, "2-2": 240, "2-3": 260,
-    "2-4": 280, "2-5+": 300, "3-1": 275, "3-2": 295, "3-3": 335, "3-4": 355,
-    "3-5+": 375, "4-1": 335, "4-2": 345, "4-3": 365, "4-4": 385, "4-5+": 415,
-    "5+-1": 385, "5+-2": 395, "5+-3": 415, "5+-4": 415, "5+-5+": 435,
-  },
-  moveout: {
-    Studio: 180, "1-1": 220, "1-2": 260, "2-1": 280, "2-2": 320, "2-3": 340,
-    "2-4": 360, "2-5+": 380, "3-1": 355, "3-2": 375, "3-3": 415, "3-4": 435,
-    "3-5+": 455, "4-1": 415, "4-2": 435, "4-3": 465, "4-4": 485, "4-5+": 515,
-    "5+-1": 485, "5+-2": 495, "5+-3": 515, "5+-4": 515, "5+-5+": 535,
-  },
-};
-
-const FREQUENCY_DISCOUNTS = {
-  weekly: 0.15, biweekly: 0.12, monthly: 0.05, onetime: 0,
-};
+app.get("/", (req, res) => res.send("Mass Mechanic Server is Awake 🤖"));
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Utilities
+// 3. SMS WORKER (Service Advisor) — unchanged
 // ───────────────────────────────────────────────────────────────────────────────
-function normalize(s) {
-  return String(s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-}
+async function extractAndDispatchLead(history, userPhone) {
+  console.log("🧠 Processing Lead for Dispatch...");
+  const extractionPrompt =
+    "Analyze extract lead details: name, car_year, car_make_model, zip_code, description, service_type, drivable (Yes/No), urgency_window (Today/Flexible). If drivable implies towing, set No.";
 
-function safeLog(s) {
-  return String(s).replace(/[\r\n]/g, " ").slice(0, 300);
-}
+  try {
+    const gptExtract = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [
+          { role: "system", content: extractionPrompt },
+          { role: "user", content: JSON.stringify(history) }
+        ],
+        response_format: { type: "json_object" }
+      })
+    });
 
-// ───────────────────────────────────────────────────────────────────────────────
-// LANGUAGE DETECTION - Conservative approach
-// ───────────────────────────────────────────────────────────────────────────────
-function detectLanguage(text) {
-  const q = normalize(text);
-  
-  // Require MULTIPLE strong Spanish indicators
-  const spanishWords = ["hola", "si", "bueno", "gracias", "como estas", "que tal", "limpieza", "servicio", "precio", "cuando", "donde", "necesito", "quiero"];
-  const spanishCount = spanishWords.filter(w => q.includes(w)).length;
-  
-  // Only detect Spanish if we see 2+ Spanish words OR very clear Spanish phrases
-  if (spanishCount >= 2 || q.includes("como estas") || q.includes("que tal") || q.includes("hablas espanol")) {
-    return "es";
-  }
-  
-  // Require MULTIPLE strong Portuguese indicators
-  const portugueseWords = ["ola", "sim", "obrigado", "obrigada", "como vai", "tudo bem", "limpeza", "servico", "preco", "quando", "onde", "preciso", "quero"];
-  const portugueseCount = portugueseWords.filter(w => q.includes(w)).length;
-  
-  // Only detect Portuguese if we see 2+ Portuguese words OR very clear Portuguese phrases
-  if (portugueseCount >= 2 || q.includes("como vai") || q.includes("tudo bem") || q.includes("fala portugues")) {
-    return "pt";
-  }
-  
-  // Default to English
-  return "en";
-}
+    const extractData = await gptExtract.json();
+    const leadDetails = JSON.parse(extractData.choices[0].message.content);
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Beeps + μ-law
-// ───────────────────────────────────────────────────────────────────────────────
-function makeBeepPcm16(ms = 180, hz = 950) {
-  const samples = Math.floor((SAMPLE_RATE * ms) / 1000);
-  const buf = Buffer.alloc(samples * BYTES_PER_SAMPLE_PCM16);
-  for (let i = 0; i < samples; i++) {
-    const t = i / SAMPLE_RATE;
-    const s = Math.round(0.18 * 32767 * Math.sin(2 * Math.PI * hz * t));
-    buf.writeInt16LE(s, i * 2);
-  }
-  return buf;
-}
+    const { data: insertedLead, error: insertError } = await supabase
+      .from("leads")
+      .insert({
+        phone: userPhone,
+        source: "sms_bot",
+        name: leadDetails.name || "SMS User",
+        car_year: leadDetails.car_year,
+        car_make_model: leadDetails.car_make_model,
+        zip_code: leadDetails.zip_code,
+        description: leadDetails.description,
+        service_type: leadDetails.service_type || "other",
+        drivable: leadDetails.drivable || "Not sure",
+        urgency_window: leadDetails.urgency_window || "Flexible"
+      })
+      .select()
+      .single();
 
-function linearToMulawSample(s) {
-  const BIAS = 0x84, CLIP = 32635;
-  let sign = (s >> 8) & 0x80;
-  if (sign) s = -s;
-  if (s > CLIP) s = CLIP;
-  s = s + BIAS;
-  let exponent = 7;
-  for (let mask = 0x4000; (s & mask) === 0 && exponent > 0; exponent--, mask >>= 1) {}
-  const mantissa = (s >> (exponent + 3)) & 0x0f;
-  return (~(sign | (exponent << 4) | mantissa)) & 0xff;
-}
+    if (insertError) throw insertError;
 
-function mulawToLinearSample(u) {
-  u = ~u & 0xff;
-  const sign = (u & 0x80) ? -1 : 1;
-  const exponent = (u >> 4) & 0x07;
-  const mantissa = u & 0x0f;
-  let sample = ((mantissa << 3) + 0x84) << exponent;
-  sample -= 0x84;
-  return sign * sample;
-}
-
-function makeBeepMulaw(ms = 180, hz = 950) {
-  const pcm = makeBeepPcm16(ms, hz);
-  const out = Buffer.alloc(pcm.length / 2);
-  for (let i = 0, j = 0; i < pcm.length; i += 2, j++) {
-    out[j] = linearToMulawSample(pcm.readInt16LE(i));
-  }
-  return out;
-}
-
-function inboundToPCM16(buf) {
-  if (MEDIA_FORMAT === "pcm16") return buf;
-  const out = Buffer.alloc(buf.length * 2);
-  for (let i = 0, j = 0; i < buf.length; i++, j += 2) {
-    out.writeInt16LE(mulawToLinearSample(buf[i]), j);
-  }
-  return out;
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// TTS via OpenAI
-// ───────────────────────────────────────────────────────────────────────────────
-async function ttsOpenAIRaw(text, lang = "en") {
-  // Select voice based on language (you can customize these)
-  const voice = lang === "es" ? OPENAI_VOICE_ES : 
-                lang === "pt" ? OPENAI_VOICE_PT : OPENAI_VOICE_EN;
-  
-  const url = "https://api.openai.com/v1/audio/speech";
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ 
-      model: "tts-1", // Use tts-1 for speed, tts-1-hd for quality
-      voice: voice,
-      input: text,
-      response_format: "pcm", // Get raw PCM audio
-      speed: 1.0
-    }),
-  });
-  
-  if (!res.ok) {
-    const errorText = await res.text();
-    throw new Error(`OpenAI TTS failed: ${res.status} ${errorText}`);
-  }
-  
-  return Buffer.from(await res.arrayBuffer());
-}
-
-function ffmpegTranscode(inputBuf, args) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    const ff = spawn(ffmpegBin.path, args);
-    ff.stdin.on("error", () => {});
-    ff.stdout.on("data", d => chunks.push(d));
-    ff.stderr.on("data", () => {}); // suppress ffmpeg logs
-    ff.on("close", code => code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`ffmpeg exited ${code}`)));
-    ff.stdin.end(inputBuf);
-  });
-}
-
-async function ttsToPcm16(text, lang = "en") {
-  // OpenAI returns PCM at 24kHz 16-bit mono, we need to resample to 8kHz for Twilio
-  const input = await ttsOpenAIRaw(text, lang);
-  
-  // Resample from 24kHz to 8kHz
-  let out = await ffmpegTranscode(input, [
-    "-hide_banner","-nostdin","-loglevel","error",
-    "-f","s16le","-ar","24000","-ac","1","-i","pipe:0", // Input: 24kHz PCM16 mono
-    "-f","s16le","-ar","8000","-ac","1","pipe:1", // Output: 8kHz PCM16 mono
-  ]);
-  
-  if (out.length % 2 !== 0) out = out.slice(0, out.length - 1);
-  return out;
-}
-
-async function ttsToMulaw(text, lang = "en") {
-  const input = await ttsOpenAIRaw(text, lang);
-  return await ffmpegTranscode(input, [
-    "-hide_banner","-nostdin","-loglevel","error",
-    "-f","s16le","-ar","24000","-ac","1","-i","pipe:0", // Input: 24kHz PCM16 mono
-    "-f","mulaw","-ar","8000","-ac","1","pipe:1", // Output: 8kHz mulaw
-  ]);
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// Stream frames to Twilio
-// ───────────────────────────────────────────────────────────────────────────────
-async function streamFrames(ws, raw) {
-  const bytesPerFrame = MEDIA_FORMAT === "mulaw" ? BYTES_PER_FRAME_MULAW : BYTES_PER_FRAME_PCM16;
-  let offset = 0;
-  while (offset < raw.length && ws.readyState === ws.OPEN) {
-    const end = Math.min(offset + bytesPerFrame, raw.length);
-    let frame = raw.slice(offset, end);
-    if (frame.length < bytesPerFrame) {
-      const padded = Buffer.alloc(bytesPerFrame);
-      frame.copy(padded, 0);
-      frame = padded;
-    }
-    ws.send(JSON.stringify({ 
-      event: "media", 
-      streamSid: ws._streamSid, 
-      media: { payload: frame.toString("base64") } 
-    }));
-    await new Promise(r => setTimeout(r, FRAME_MS));
-    offset += bytesPerFrame;
-  }
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// Conversation context with state tracking
-// ───────────────────────────────────────────────────────────────────────────────
-class ConversationContext {
-  constructor() {
-    this.language = "en";
-    this.languageDetected = false; // Flag to prevent language switching mid-conversation
-    this.data = {
-      city: null,
-      date: null,
-      time: null,
-      bedrooms: null,
-      bathrooms: null,
-      cleaningType: null,
-      frequency: null,
-      phone: "",
-      address: null,
-    };
-    this.greeted = false;
-    this.state = "greeting"; // greeting, booking, pricing, confirming, complete
-    this.collectingPhone = false; // Track when actively collecting phone
-  }
-  
-  t(key) {
-    const translations = {
-      en: {
-        greeting: "Hi! I'm your AI receptionist at Clean Easy. How can I help you?",
-        stillThere: "Are you still there? I can help with booking or any questions.",
-      },
-      es: {
-        greeting: "¡Hola! Soy tu recepcionista de IA en Clean Easy. ¿Cómo puedo ayudarte?",
-        stillThere: "¿Sigues ahí? Puedo ayudarte con reservas o cualquier pregunta.",
-      },
-      pt: {
-        greeting: "Olá! Sou sua recepcionista de IA na Clean Easy. Como posso ajudar?",
-        stillThere: "Você ainda está aí? Posso ajudar com reservas ou perguntas.",
-      }
-    };
-    return translations[this.language]?.[key] || translations.en[key];
-  }
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// Entity extraction helpers
-// ───────────────────────────────────────────────────────────────────────────────
-function extractCity(text) {
-  const q = normalize(text);
-  
-  // Check aliases first
-  for (const [alias, city] of Object.entries(CITY_ALIASES)) {
-    if (q.includes(alias)) return city;
-  }
-  
-  // Check service areas
-  for (const city of SERVICE_AREAS) {
-    if (q.includes(city.toLowerCase())) return city;
-  }
-  
-  return null;
-}
-
-function extractDateTime(text) {
-  const q = normalize(text);
-  const result = { day: null, time: null, raw: text };
-  
-  // Days of week
-  const days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
-  for (const day of days) {
-    if (q.includes(day)) {
-      result.day = day.charAt(0).toUpperCase() + day.slice(1);
-      break;
-    }
-  }
-  
-  // Relative days
-  if (q.includes("today")) result.day = "today";
-  if (q.includes("tomorrow")) result.day = "tomorrow";
-  if (q.includes("next week")) result.day = "next week";
-  
-  // Time patterns
-  const timeMatch = q.match(/(\d{1,2})\s*(am|pm|o\s*clock|oclock)/i);
-  if (timeMatch) {
-    const hour = parseInt(timeMatch[1]);
-    const meridiem = timeMatch[2];
-    if (meridiem.includes("pm") || meridiem.includes("p m")) {
-      result.time = hour === 12 ? "12 PM" : `${hour} PM`;
-    } else if (meridiem.includes("am") || meridiem.includes("a m")) {
-      result.time = hour === 12 ? "12 AM" : `${hour} AM`;
-    } else { // o'clock - assume context
-      result.time = hour < 8 ? `${hour} PM` : `${hour} AM`;
-    }
-  }
-  
-  // Time range patterns (e.g., "between 2 and 4")
-  const rangeMatch = q.match(/between\s+(\d{1,2})\s+and\s+(\d{1,2})/);
-  if (rangeMatch) {
-    result.time = `${rangeMatch[1]}-${rangeMatch[2]}`;
-  }
-  
-  return result.day || result.time ? result : null;
-}
-
-function extractRoomCount(text) {
-  const q = normalize(text);
-  const result = { bedrooms: null, bathrooms: null };
-  
-  // Bedroom patterns
-  const bedroomMatch = q.match(/(\d+|one|two|three|four|five|studio)\s*(bed|bedroom)/);
-  if (bedroomMatch) {
-    const num = bedroomMatch[1];
-    if (num === "studio") result.bedrooms = 0;
-    else if (num === "one") result.bedrooms = 1;
-    else if (num === "two") result.bedrooms = 2;
-    else if (num === "three") result.bedrooms = 3;
-    else if (num === "four") result.bedrooms = 4;
-    else if (num === "five") result.bedrooms = 5;
-    else result.bedrooms = parseInt(num);
-  }
-  
-  // Bathroom patterns
-  const bathroomMatch = q.match(/(\d+|one|two|three|four|half)\s*(bath|bathroom)/);
-  if (bathroomMatch) {
-    const num = bathroomMatch[1];
-    if (num === "half") result.bathrooms = 0.5;
-    else if (num === "one") result.bathrooms = 1;
-    else if (num === "two") result.bathrooms = 2;
-    else if (num === "three") result.bathrooms = 3;
-    else if (num === "four") result.bathrooms = 4;
-    else result.bathrooms = parseInt(num);
-  }
-  
-  return result.bedrooms !== null || result.bathrooms !== null ? result : null;
-}
-
-
-// ───────────────────────────────────────────────────────────────────────────────
-// 📞 PHONE NUMBER EXTRACTION - COMPREHENSIVE FIX
-// ───────────────────────────────────────────────────────────────────────────────
-const NUMBER_WORDS_MAP = {
-  'zero': '0', 'oh': '0', 'o': '0',
-  'one': '1', 'won': '1',
-  'two': '2', 'to': '2', 'too': '2',
-  'three': '3', 'tree': '3',
-  'four': '4', 'for': '4', 'fore': '4',
-  'five': '5',
-  'six': '6', 'sicks': '6',
-  'seven': '7',
-  'eight': '8', 'ate': '8',
-  'nine': '9',
-  'ten': '10', 'eleven': '11', 'twelve': '12', 'thirteen': '13', 'fourteen': '14',
-  'fifteen': '15', 'sixteen': '16', 'seventeen': '17', 'eighteen': '18', 'nineteen': '19',
-  'twenty': '20', 'thirty': '30', 'forty': '40', 'fifty': '50', 'sixty': '60',
-  'seventy': '70', 'eighty': '80', 'ninety': '90',
-  'double': 'repeat_next', 'triple': 'triple_next'
-};
-
-
-function extractPhoneNumber(text) {
-  const q = normalize(text);
-  const phonePattern = /(\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4})/;
-  const match = q.match(phonePattern);
-  if (match) return match[1].replace(/\D/g, '');
-  
-  let digits = '';
-  const words = q.split(/\s+/);
-  let i = 0;
-  
-  while (i < words.length) {
-    const word = words[i];
-    
-    // Handle "double" pattern
-    if (word === 'double' && i + 1 < words.length) {
-      const nextDigit = NUMBER_WORDS_MAP[words[i + 1]];
-      if (nextDigit && nextDigit !== 'repeat_next' && nextDigit !== 'triple_next') {
-        digits += nextDigit + nextDigit;
-        i += 2;
-        continue;
-      }
-    }
-    
-    // Handle "triple" pattern
-    if (word === 'triple' && i + 1 < words.length) {
-      const nextDigit = NUMBER_WORDS_MAP[words[i + 1]];
-      if (nextDigit && nextDigit !== 'repeat_next' && nextDigit !== 'triple_next') {
-        digits += nextDigit + nextDigit + nextDigit;
-        i += 2;
-        continue;
-      }
-    }
-    
-    // Handle "X hundred" pattern - NEW!
-    if (i + 1 < words.length && words[i + 1] === 'hundred') {
-      const multiplierWord = word;
-      const multiplierDigit = NUMBER_WORDS_MAP[multiplierWord];
-      if (multiplierDigit && multiplierDigit.length === 1) {
-        // "two hundred" = 200, "three hundred" = 300
-        digits += multiplierDigit + '00';
-        i += 2;
-        continue;
-      }
-    }
-    
-    
-    // Regular number mapping
-    if (NUMBER_WORDS_MAP[word]) {
-      const mapped = NUMBER_WORDS_MAP[word];
-      if (mapped !== 'repeat_next' && mapped !== 'triple_next') {
-        digits += mapped;
-      }
-    }
-    
-    // Direct digits
-    if (/^\d+$/.test(word)) {
-      digits += word;
-    }
-    
-    i++;
-  }
-  return digits.length > 0 ? digits : null;
-}
-
-
-function formatPhoneNumber(digits) {
-  // Clean any non-digits just in case
-  const clean = digits.replace(/\D/g, '');
-  
-  if (clean.length === 10) {
-    // Format with spaces so TTS says each digit individually: "6 1 7, 7 7 8, 5 4 5 4"
-    return `${clean[0]} ${clean[1]} ${clean[2]}, ${clean[3]} ${clean[4]} ${clean[5]}, ${clean[6]} ${clean[7]} ${clean[8]} ${clean[9]}`;
-  } else if (clean.length > 10) {
-    // Too many digits - truncate to 10 and warn
-    console.error(`[PHONE FORMAT] ERROR: Phone has ${clean.length} digits (expected 10): ${clean}`);
-    const truncated = clean.slice(0, 10);
-    return `${truncated[0]} ${truncated[1]} ${truncated[2]}, ${truncated[3]} ${truncated[4]} ${truncated[5]}, ${truncated[6]} ${truncated[7]} ${truncated[8]} ${truncated[9]}`;
-  } else {
-    // Too few digits - return with spaces between each
-    console.error(`[PHONE FORMAT] ERROR: Phone has ${clean.length} digits (expected 10): ${clean}`);
-    return clean.split('').join(' ');
-  }
-}
-
-function extractAddress(text) {
-  const q = normalize(text);
-  
-  // Look for common address patterns
-  // Number + Street name + Street type
-  const addressPattern = /\d+\s+[a-z]+\s+(street|st|avenue|ave|road|rd|drive|dr|lane|ln|way|circle|court|ct|boulevard|blvd|place|pl)/;
-  const match = q.match(addressPattern);
-  if (match) return match[0];
-  
-  // Just capture the full text if it seems like an address
-  // (Contains numbers and common street words)
-  if (q.match(/\d+/) && (q.includes('street') || q.includes('avenue') || q.includes('road'))) {
-    return text.trim();
-  }
-  
-  return null;
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// Intent routing with context and entity extraction
-// ───────────────────────────────────────────────────────────────────────────────
-function routeWithContext(text, ctx) {
-  const q = normalize(text);
-  const words = q.split(/\s+/); // Declare words at top so it's available throughout function
-  
-  // Defensive: ensure context data object exists
-  if (!ctx.data) {
-    ctx.data = {
-      city: null,
-      date: null,
-      time: null,
-      bedrooms: null,
-      bathrooms: null,
-      cleaningType: null,
-      frequency: null,
-      phone: null,
-      address: null,
-    };
-  }
-  
-  // Extract entities from user input
-  const city = extractCity(text);
-  const dateTime = extractDateTime(text);
-  const rooms = extractRoomCount(text);
-  // ONLY extract phone during confirming state to prevent address numbers from being added
-  let phone = null;
-  if (ctx.state === "confirming" && (!ctx.data.phone || ctx.data.phone.length < 10)) {
-    phone = extractPhoneNumber(text);
-    ctx.collectingPhone = true;
-  } else if (ctx.data.phone && ctx.data.phone.length >= 10) {
-    ctx.collectingPhone = false;
-  }
-  const address = extractAddress(text);
-  
-  // Store extracted entities in context - with safe null checks
-  if (city) ctx.data.city = city;
-  if (dateTime && dateTime.day) ctx.data.date = dateTime.day;
-  if (dateTime && dateTime.time) ctx.data.time = dateTime.time;
-  if (rooms && rooms.bedrooms !== null && rooms.bedrooms !== undefined) {
-    ctx.data.bedrooms = rooms.bedrooms;
-  }
-  if (rooms && rooms.bathrooms !== null && rooms.bathrooms !== undefined) {
-    ctx.data.bathrooms = rooms.bathrooms;
-  }
-  if (address) ctx.data.address = address;
-  
-  // STATE: Waiting for date/time after asking for it
-  if (ctx.state === "booking" && dateTime) {
-    ctx.state = "confirming";
-    const dayStr = (ctx.data && ctx.data.date) ? ctx.data.date : "that day";
-    const timeStr = (ctx.data && ctx.data.time) ? ctx.data.time : "that time";
-    return `Perfect! I have you down for ${dayStr} at ${timeStr}. Can you give me your phone number? Say the digits one at a time.`;
-  }
-  
-  
-  // ───────────────────────────────────────────────────────────────────────────────
-  // STATE: Collecting contact info (phone and address) - PHONE FIX APPLIED
-  // ───────────────────────────────────────────────────────────────────────────────
-  if (ctx.state === "confirming") {
-    const currentPhone = ctx.data.phone || "";
-    const hasCompletePhone = currentPhone.length >= 10;
-    const hasAddress = ctx.data.address;
-    
-    // DETECT if user is saying the phone number is wrong
-    const isCorrection = q.includes("no") || q.includes("wrong") || q.includes("incorrect") || 
-                        q.includes("not right") || q.includes("that's not") || q.includes("thats not") ||
-                        q.includes("not my number") || q.includes("not correct");
-    
-    // If user says phone is wrong, reset and ask again
-    if (isCorrection && hasCompletePhone) {
-      console.log(`[PHONE] User rejected phone: ${currentPhone}. Resetting.`);
-      ctx.data.phone = "";
-      ctx.collectingPhone = false;
-      return "I apologize for the mistake. Let's try again. Can you give me your phone number? Say the digits one at a time.";
-    }
-    
-    // ACCUMULATE phone digits instead of replacing (but only if we don't have 10+ already)
-    if (phone && currentPhone.length < 10) {
-      // Validate: don't add more than needed
-      const spaceLeft = 10 - currentPhone.length;
-      const digitsToAdd = phone.slice(0, spaceLeft); // Only add what fits
-      ctx.data.phone += digitsToAdd;
-      console.log(`[PHONE] Accumulated: ${ctx.data.phone} (added ${digitsToAdd} from ${phone})`);
-      
-      // Warn if we're dropping digits
-      if (phone.length > spaceLeft) {
-        console.warn(`[PHONE] WARNING: Dropped ${phone.length - spaceLeft} excess digits: ${phone.slice(spaceLeft)}`);
-      }
-    } else if (phone && currentPhone.length >= 10) {
-      console.warn(`[PHONE] Ignoring additional digits "${phone}" - already have 10 digits: ${currentPhone}`);
-    }
-    
-    // Update hasCompletePhone after potential accumulation
-    const updatedPhone = ctx.data.phone || "";
-    const nowHasCompletePhone = updatedPhone.length >= 10;
-    
-    if (phone && !nowHasCompletePhone) {
-      const remaining = 10 - updatedPhone.length;
-      if (remaining > 0) {
-        return `Got it. I need ${remaining} more digits.`;
-      }
-    }
-    
-    if (nowHasCompletePhone && !hasAddress) {
-      if (address) {
-        ctx.state = "complete";
-        const formatted = formatPhoneNumber(updatedPhone);
-        return `Perfect! I have your booking for ${ctx.data.date || 'that day'} at ${ctx.data.time || 'that time'} at ${address}. We'll call you at ${formatted} to confirm. Thank you for choosing Clean Easy!`;
-      } else {
-        const formatted = formatPhoneNumber(updatedPhone);
-        return `Great, I have your number as ${formatted}. What's the address for the cleaning?`;
-      }
-    }
-    
-    if (address && !hasAddress && hasCompletePhone) {
-      ctx.state = "complete";
-      const formatted = formatPhoneNumber(currentPhone);
-      return `Perfect! I have your booking for ${ctx.data.date || 'that day'} at ${ctx.data.time || 'that time'} at ${address}. We'll call you at ${formatted} to confirm. Thank you for choosing Clean Easy!`;
-    }
-    
-    if (hasCompletePhone && hasAddress) {
-      ctx.state = "complete";
-      const formatted = formatPhoneNumber(currentPhone);
-      return `Perfect! I have your booking for ${ctx.data.date || 'that day'} at ${ctx.data.time || 'that time'} at ${ctx.data.address}. We'll call you at ${formatted} to confirm. Thank you for choosing Clean Easy!`;
-    }
-    
-    if (!phone && !address) {
-      // Handle conversational responses during phone collection
-      if (q.includes("what") || q.includes("have") || q.includes("so far")) {
-        // User is asking what we have
-        if (currentPhone && currentPhone.length > 0) {
-          const formatted = currentPhone.length === 10 ? formatPhoneNumber(currentPhone) : currentPhone;
-          const remaining = 10 - currentPhone.length;
-          if (remaining > 0) {
-            return `I have ${formatted} so far. I need ${remaining} more digits.`;
-          } else {
-            return `I have your number as ${formatted}. What's the address for the cleaning?`;
-          }
-        } else {
-          return "I don't have any digits yet. Can you give me your phone number?";
-        }
-      }
-      
-      // Handle acknowledgments (okay, sure, yes) - just repeat what we need
-      if (q.match(/^(okay|ok|sure|yes|yeah|yep|alright)\b/)) {
-        if (!currentPhone || currentPhone.length === 0) {
-          return "Can you give me your phone number? Say the digits one at a time.";
-        } else if (!hasCompletePhone) {
-          const remaining = 10 - currentPhone.length;
-          return `I need ${remaining} more digits for your phone number.`;
-        } else if (!hasAddress) {
-          return "What's the address for the cleaning?";
-        }
-      }
-      
-      // Default - didn't catch anything useful
-      if (!currentPhone || currentPhone.length === 0) {
-        return "I didn't catch that. Can you give me your phone number? Say the digits one at a time.";
-      } else if (!hasCompletePhone) {
-        const remaining = 10 - currentPhone.length;
-        return `I need ${remaining} more digits for your phone number.`;
-      } else if (!hasAddress) {
-        return "And what's the address for the cleaning?";
-      }
-    }
-  }
-  
-  // STATE: Waiting for room count after asking for it
-  if (ctx.state === "pricing" && rooms) {
-    // Defensive: ensure data object exists and has default values
-    if (!ctx.data) ctx.data = {};
-    const bed = ctx.data.bedrooms ?? 1;
-    const bath = ctx.data.bathrooms ?? 1;
-    const price = 100 + (bed * 30) + (bath * 20);
-    return `For a ${bed === 0 ? 'studio' : bed + ' bedroom'} with ${bath} bathroom, our standard cleaning starts at around $${price}. Would you like to book a cleaning?`;
-  }
-  
-  // Service area question with city mentioned - includes conversational queries
-  if (city && (q.includes("available") || q.includes("service") || q.includes("area") || q.includes("come") || q.includes("you say") || q.includes("did you") || q.includes("do you mean") || q.includes("is that") || q.includes("you mean"))) {
-    if (SERVICE_AREAS.includes(city)) {
-      ctx.state = "booking";
-      return `Yes, we service ${city}! What date and time work best for you?`;
+    const maintenanceServices = ["oil-change", "state-inspection", "tune-up", "tire-rotation"];
+    if (maintenanceServices.includes(leadDetails.service_type)) {
+      await supabase.functions.invoke("send-maintenance-lead-to-mechanics", { body: { lead_id: insertedLead.id } });
     } else {
-      return `I'm sorry, we don't currently service ${city}. We serve the Greater Boston area including Cambridge, Somerville, Brookline, Newton, and surrounding cities.`;
+      await supabase.functions.invoke("send-lead-to-mechanics", { body: { lead_id: insertedLead.id } });
     }
+  } catch (e) {
+    console.error("❌ Dispatch Failed:", e);
   }
-  
-  // FALLBACK: City mentioned but without clear service keywords
-  // Handles: "quincy", "that are quincy", "what about", etc.
-  if (city && words.length <= 5) {
-    // User mentioned a city in a short response - likely answering "What area are you in?"
-    if (SERVICE_AREAS.includes(city)) {
-      ctx.state = "booking";
-      return `Yes, we service ${city}! What date and time work best for you?`;
-    } else {
-      return `I'm sorry, we don't currently service ${city}. We serve the Greater Boston area including Cambridge, Somerville, Brookline, Newton, and surrounding cities.`;
-    }
-  }
-  
-  // Availability / Booking / Scheduling (without city)
-  if (q.includes("available") || q.includes("availability") || 
-      q.includes("book") || q.includes("appointment") || 
-      q.includes("schedule") || q.includes("reserve")) {
-    ctx.state = "booking";
-    return "Yes, we're available! What date and time work best for you?";
-  }
-  
-  // They provided date/time without us asking
-  if (dateTime && ctx.state !== "booking") {
-    ctx.state = "confirming";
-    const dayStr = (ctx.data && ctx.data.date) ? ctx.data.date : "that day";
-    const timeStr = (ctx.data && ctx.data.time) ? ctx.data.time : "that time";
-    return `Great! I can schedule you for ${dayStr} at ${timeStr}. Can you give me your phone number? Say the digits one at a time.`;
-  }
-  
-  // Service area check (general)
-  if (q.includes("area") || q.includes("service") || q.includes("where") ||
-      q.includes("location") || q.includes("come to")) {
-    return "We service the Greater Boston area including Cambridge, Somerville, Brookline, Newton, and surrounding cities. What area are you in?";
-  }
-  
-  // Hours / Open times
-  if (q.includes("hour") || q.includes("open") || q.includes("close") ||
-      q.includes("when") && (q.includes("open") || q.includes("available"))) {
-    return "We're open 8 AM to 6 PM Monday through Friday, and 9 AM to 2 PM on Saturday.";
-  }
-  
-  // Pricing
-  if (q.includes("price") || q.includes("pricing") || q.includes("cost") || 
-      q.includes("how much") || q.includes("charge")) {
-    ctx.state = "pricing";
-    return "Our pricing depends on the size of your space and the type of cleaning. How many bedrooms and bathrooms do you have?";
-  }
-  
-  // Types of cleaning
-  if (q.includes("deep clean") || q.includes("move out") || q.includes("airbnb") ||
-      q.includes("type") && q.includes("clean")) {
-    return "We offer standard cleaning, deep cleaning, Airbnb turnover, and move-out cleaning. Which are you interested in?";
-  }
-  
-  // Affirmative responses (yes, yeah, sure)
-  if (q.match(/^(yes|yeah|yep|sure|ok|okay)\b/)) {
-    if (ctx.state === "pricing") {
-      ctx.state = "booking";
-      return "Great! What date and time work best for you?";
-    }
-    return "Great! What specifically would you like help with - booking a cleaning, pricing information, or something else?";
-  }
-  
-  // Greetings - ONLY if it's just a greeting with no other content (moved to end)
-  // Check if the message is ONLY a greeting (5 words or less, no substantive keywords)
-  const isJustGreeting = words.length <= 5 && 
-    q.match(/^(hi|hello|hey|good morning|good afternoon|good evening)\b/) &&
-    !q.includes("available") && !q.includes("book") && !q.includes("price") &&
-    !q.includes("hour") && !q.includes("service") && !q.includes("clean");
-  
-  if (isJustGreeting && !ctx.greeted) {
-    return "Hello! How can I help you today?";
-  }
-  
-  // Default - encourage specifics
-  return "I can help with booking, pricing, service areas, and hours. What would you like to know?";
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Deepgram realtime STT
-// ───────────────────────────────────────────────────────────────────────────────
-function connectDeepgram(onFinal, onAnyTranscript, lang = "en", ws) {
-  if (!DG_KEY) {
-    console.warn("⚠️ DEEPGRAM_API_KEY missing — STT disabled.");
-    return null;
-  }
-  
-  const langCode = lang === "es" ? "es" : lang === "pt" ? "pt" : "en";
-  const url = `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&language=${langCode}&punctuate=true&endpointing=true`;
-  const dg = new WebSocket(url, { headers: { Authorization: `Token ${DG_KEY}` } });
+app.post("/sms", async (req, res) => {
+  const incomingMsg = req.body.body || req.body.Body;
+  const fromNumber = req.body.from || req.body.From;
 
-  let lastPartial = "";
-  let partialTimer = null;
+  res.status(200).send("OK");
+  if (!incomingMsg || !fromNumber) return;
 
-  function promotePartial(reason = "idle") {
-    if (!lastPartial) return;
-    const promoted = lastPartial.trim();
-    lastPartial = "";
-    if (partialTimer) { clearTimeout(partialTimer); partialTimer = null; }
-    if (promoted) {
-      console.log(`[ASR promote:${reason}] ${safeLog(promoted)}`);
-      onFinal(promoted);
+  const systemPrompt =
+    "You are the Senior Service Advisor for Mass Mechanic. Qualify this lead. Gather: Name, Car, Zip, Issue, Drivability (Yes/No), Urgency (Today/Flexible).\n" +
+    'Rules: Check history first. Ask 1 question at a time. Once done say: "Perfect. I have sent your request to our network."';
+
+  try {
+    const { data: history } = await supabase
+      .from("sms_chat_history")
+      .select("role, content")
+      .eq("phone", fromNumber)
+      .order("created_at", { ascending: true })
+      .limit(12);
+
+    const pastMessages = (history || []).map((msg) => ({ role: msg.role, content: msg.content }));
+
+    const gptResponse = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "system", content: systemPrompt }, ...pastMessages, { role: "user", content: incomingMsg }],
+        max_tokens: 200
+      })
+    });
+
+    const replyText = (await gptResponse.json()).choices[0].message.content;
+
+    await supabase.from("sms_chat_history").insert([
+      { phone: fromNumber, role: "user", content: incomingMsg },
+      { phone: fromNumber, role: "assistant", content: replyText }
+    ]);
+
+    await twilioClient.messages.create({
+      body: replyText,
+      from: TWILIO_PHONE_NUMBER,
+      to: fromNumber
+    });
+
+    if (replyText.includes("sent your request")) {
+      extractAndDispatchLead(
+        [...pastMessages, { role: "user", content: incomingMsg }, { role: "assistant", content: replyText }],
+        fromNumber
+      );
     }
+  } catch (error) {
+    console.error("❌ SMS Error:", error);
+  }
+});
+
+// ────────────────────────────────────────────────────────────
+// 4. VOICE SERVER (STREAM + INSTANT GREETING + HUMAN ESCALATION)
+// ────────────────────────────────────────────────────────────
+const VOICE_GREETING =
+  "Thanks for calling MassMechanic — we connect you with trusted local mechanics for fast, free repair quotes. " +
+  "Are you calling about a repair you need help with right now, or do you have a quick question?";
+
+function getStreamUrl(req) {
+  const host = req.headers["x-forwarded-host"] || req.headers.host;
+  const xfProto = req.headers["x-forwarded-proto"] || "https";
+  const proto = String(xfProto).includes("https") ? "wss" : "ws";
+  return `${proto}://${host}/`;
+}
+
+async function speakOverStream({ ws, streamSid, text, deepgramKey }) {
+  const ttsResponse = await fetch(
+    "https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000&container=none",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Token ${deepgramKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ text })
+    }
+  );
+
+  if (!ttsResponse.ok) {
+    const errText = await ttsResponse.text().catch(() => "");
+    console.error("❌ TTS Failed:", ttsResponse.status, errText);
+    return;
   }
 
-  dg.on("open", () => console.log("[DG] connected"));
-  dg.on("message", (d) => {
+  const audioBuffer = await ttsResponse.arrayBuffer();
+  const base64Audio = Buffer.from(audioBuffer).toString("base64");
+
+  if (ws.readyState === WebSocket.OPEN && streamSid) {
+    ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: base64Audio } }));
+  }
+}
+
+async function sendVoiceEscalationSummary({ callerPhone, trigger, lastMessage }) {
+  try {
+    await supabase.functions.invoke("send-escalation-summary", {
+      body: {
+        phone: callerPhone,
+        channel: "voice",
+        trigger,
+        last_message: lastMessage
+      }
+    });
+    console.log("✅ Escalation summary invoked");
+  } catch (e) {
+    console.error("❌ send-escalation-summary failed:", e);
+  }
+}
+
+async function transferCallToHuman(callSid) {
+  if (!ADMIN_ESCALATION_PHONE) {
+    console.error("❌ Missing ADMIN_ESCALATION_PHONE env var");
+    return;
+  }
+  if (!callSid) {
+    console.error("❌ Missing callSid — cannot transfer");
+    return;
+  }
+
+  const baseUrl = PUBLIC_BASE_URL || "https://mass-mechanic-bot.onrender.com";
+  const transferUrl = `${baseUrl}/transfer`;
+
+  await twilioClient.calls(callSid).update({
+    url: transferUrl,
+    method: "POST"
+  });
+
+  console.log("📞 Call transfer initiated", { callSid, transferUrl });
+}
+
+// ✅ Voice webhook TwiML — passes From/Caller/CallSid into stream
+app.post("/voice", (req, res) => {
+  res.type("text/xml");
+
+  const streamUrl = getStreamUrl(req);
+  const from = normalizePhone(req.body?.From || "");
+  const caller = normalizePhone(req.body?.Caller || "");
+  const callSid = req.body?.CallSid || "";
+
+  res.send(`
+    <Response>
+      <Connect>
+        <Stream url="${streamUrl}">
+          <Parameter name="from" value="${from}" />
+          <Parameter name="caller" value="${caller}" />
+          <Parameter name="callSid" value="${callSid}" />
+        </Stream>
+      </Connect>
+    </Response>
+  `);
+});
+
+// ✅ Transfer TwiML endpoint (prevents 11200)
+app.post("/transfer", (req, res) => {
+  res.type("text/xml");
+
+  if (!ADMIN_ESCALATION_PHONE) {
+    return res.send(`
+      <Response>
+        <Say>Sorry, no operator is available right now.</Say>
+        <Hangup/>
+      </Response>
+    `);
+  }
+
+  return res.send(`
+    <Response>
+      <Say>Connecting you now.</Say>
+      <Dial timeout="25" answerOnBridge="true">${ADMIN_ESCALATION_PHONE}</Dial>
+      <Say>Sorry — nobody answered. Please text us and we will follow up.</Say>
+      <Hangup/>
+    </Response>
+  `);
+});
+
+// ────────────────────────────────────────────────────────────
+// 5. WEBSOCKET SERVER FOR TWILIO MEDIA STREAMS
+// ────────────────────────────────────────────────────────────
+const server = app.listen(PORT, () => console.log(`✅ MassMechanic Running on ${PORT}`));
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+});
+
+wss.on("connection", (ws) => {
+  console.log("🔗 Voice Connected");
+
+  let streamSid = null;
+  let deepgramLive = null;
+  let greeted = false;
+
+  let callerPhone = "unknown";
+  let callSid = "";
+
+  let transferred = false;
+
+  // --- GUARD RAILS ---
+  let aiDisabled = false; // circuit breaker for this call
+  let aiFailures = 0; // limit fail loops per call
+  let aiInFlight = false; // prevent overlapping GPT calls
+  let lastTranscript = ""; // duplicate suppression
+  let lastTranscriptAt = 0; // timestamp
+
+  // --- MEMORY ---
+  let messages = [
+    {
+      role: "system",
+      content:
+        "You are the MassMechanic phone agent. Keep answers SHORT (1–2 sentences). " +
+        "Your goal: collect Name, ZIP code, and the car issue. Be friendly and direct. " +
+        "The opening greeting has ALREADY been spoken to the caller, so do NOT repeat it. " +
+        "Ask ONE follow-up question at a time."
+    }
+  ];
+
+  // 1) SETUP DEEPGRAM (LISTENER)
+  const setupDeepgram = () => {
+    deepgramLive = new WebSocket(
+      "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&model=nova-2&smart_format=true",
+      { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } }
+    );
+
+    deepgramLive.on("open", () => console.log("🟢 Deepgram Listening"));
+
+    deepgramLive.on("message", (data) => {
+      if (transferred) return;
+
+      const received = safeJsonParse(data);
+      if (!received) return;
+
+      const transcript = received.channel?.alternatives?.[0]?.transcript;
+
+      if (transcript && received.is_final && transcript.trim().length > 0) {
+        console.log(`🗣️ User: ${transcript}`);
+        processAiResponse(transcript);
+      }
+    });
+
+    deepgramLive.on("error", (err) => console.error("DG Error:", err));
+  };
+
+  setupDeepgram();
+
+  // 2) AI BRAIN (WITH MEMORY + GUARD RAILS)
+  const processAiResponse = async (text) => {
     try {
-      const msg = JSON.parse(d.toString());
-      const alt = msg.channel?.alternatives?.[0];
-      const transcript = alt?.transcript?.trim() || "";
+      if (transferred) return;
+      if (!text || !text.trim()) return;
 
-      if (transcript) onAnyTranscript?.(transcript);
+      // Optional kill switch
+      if (!IS_AI_ENABLED) return;
 
-      if (transcript && (msg.is_final || msg.speech_final)) {
-        if (partialTimer) { clearTimeout(partialTimer); partialTimer = null; }
-        lastPartial = "";
-        console.log(`[ASR] ${safeLog(transcript)}`);
-        onFinal(transcript);
+      // If OpenAI is disabled for this call, don’t keep trying
+      if (aiDisabled) return;
+
+      // Prevent overlapping GPT calls (Deepgram can fire fast)
+      if (aiInFlight) return;
+
+      // Duplicate / rapid-fire suppression
+      const now = Date.now();
+      const cleaned = text.trim();
+      if (cleaned === lastTranscript && now - lastTranscriptAt < 2500) return;
+      lastTranscript = cleaned;
+      lastTranscriptAt = now;
+
+      // Human request escalation
+      if (wantsHumanFromText(cleaned)) {
+        transferred = true;
+        console.log("🚨 Human requested — escalating", { callSid, callerPhone, text: cleaned });
+
+        await sendVoiceEscalationSummary({
+          callerPhone,
+          trigger: "REQUESTED_HUMAN",
+          lastMessage: cleaned
+        });
+
+        await speakOverStream({
+          ws,
+          streamSid,
+          text: "Got it — connecting you to an operator now.",
+          deepgramKey: DEEPGRAM_API_KEY
+        });
+
+        await transferCallToHuman(callSid);
+
+        try {
+          if (deepgramLive) deepgramLive.close();
+        } catch {}
+        try {
+          ws.close();
+        } catch {}
         return;
       }
-      if (transcript) {
-        lastPartial = transcript;
-        if (partialTimer) clearTimeout(partialTimer);
-        partialTimer = setTimeout(() => promotePartial("timeout"), ASR_PARTIAL_PROMOTE_MS);
+
+      messages.push({ role: "user", content: cleaned });
+
+      aiInFlight = true;
+
+      const result = await callOpenAIChat({
+        apiKey: OPENAI_API_KEY,
+        messages,
+        model: "gpt-4o",
+        max_tokens: 120,
+        timeoutMs: 12000
+      });
+
+      if (!result.ok) {
+        aiFailures += 1;
+
+        const err = result.error || {};
+        const status = err.status || 0;
+
+        console.error("❌ OpenAI call failed:", { status, code: err.code, type: err.type, message: err.message });
+
+        // 1) Never retry fatal billing/quota/account errors
+        if (isFatalOpenAIError(err)) {
+          aiDisabled = true;
+
+          await speakOverStream({
+            ws,
+            streamSid,
+            text:
+              "Quick heads-up — our automated assistant is temporarily offline. " +
+              "Please text us your ZIP code and what’s going on, and we’ll follow up shortly.",
+            deepgramKey: DEEPGRAM_API_KEY
+          });
+
+          await sendVoiceEscalationSummary({
+            callerPhone,
+            trigger: "OPENAI_FATAL_ERROR",
+            lastMessage: `fatal_openai_error: ${err.code || err.type || "unknown"}`
+          });
+
+          return;
+        }
+
+        // 2) Transient errors: allow at most ONE failure per call, then stop
+        if (isTransientOpenAIError(status, err) || aiFailures >= 1) {
+          aiDisabled = true;
+
+          await speakOverStream({
+            ws,
+            streamSid,
+            text:
+              "Sorry — we’re having trouble right now. Please try again in a moment, " +
+              "or text us your ZIP code and car issue and we’ll get you connected.",
+            deepgramKey: DEEPGRAM_API_KEY
+          });
+
+          await sendVoiceEscalationSummary({
+            callerPhone,
+            trigger: "OPENAI_TRANSIENT_ERROR",
+            lastMessage: `transient_openai_error: ${status || "unknown"}`
+          });
+
+          return;
+        }
+
+        return;
       }
+
+      const aiText = result.content;
+      if (!aiText) return;
+
+      console.log(`🤖 AI: ${aiText}`);
+      messages.push({ role: "assistant", content: aiText });
+
+      await speakOverStream({
+        ws,
+        streamSid,
+        text: aiText,
+        deepgramKey: DEEPGRAM_API_KEY
+      });
+    } catch (e) {
+      console.error("AI/TTS Error (guarded):", e);
+      aiFailures += 1;
+      if (aiFailures >= 1) aiDisabled = true;
+    } finally {
+      aiInFlight = false;
+    }
+  };
+
+  // 3) TWILIO STREAM HANDLER (hardened JSON parse)
+  ws.on("message", async (msg) => {
+    const data = safeJsonParse(msg);
+    if (!data) return;
+
+    if (data.event === "start") {
+      streamSid = data.start.streamSid;
+
+      const params = data.start?.customParameters || {};
+      const pFrom = normalizePhone(params.from || "");
+      const pCaller = normalizePhone(params.caller || "");
+      callerPhone = pFrom || pCaller || "unknown";
+
+      callSid = params.callSid || data.start.callSid || callSid;
+
+      console.log("☎️ Stream start", { streamSid, callSid, callerPhone });
+
+      if (!greeted) {
+        greeted = true;
+
+        // We keep this in memory, but we only speak it once.
+        messages.push({ role: "assistant", content: VOICE_GREETING });
+
+        await speakOverStream({
+          ws,
+          streamSid,
+          text: VOICE_GREETING,
+          deepgramKey: DEEPGRAM_API_KEY
+        });
+      }
+      return;
+    }
+
+    if (data.event === "media" && deepgramLive?.readyState === WebSocket.OPEN) {
+      deepgramLive.send(Buffer.from(data.media.payload, "base64"));
+      return;
+    }
+
+    if (data.event === "stop") {
+      try {
+        if (deepgramLive) deepgramLive.close();
+      } catch {}
+      return;
+    }
+  });
+
+  ws.on("close", () => {
+    try {
+      if (deepgramLive) deepgramLive.close();
     } catch {}
   });
-  dg.on("close", () => {
-    console.log("[DG] close");
-    promotePartial("dg_close");
-  });
-  dg.on("error", (e) => console.error("[DG] error", e.message));
-  return dg;
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// WebSocket
-// ───────────────────────────────────────────────────────────────────────────────
-const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
-
-wss.on("connection", (ws, req) => {
-  console.log("🔗 WebSocket connected");
-  ws._rx = 0;
-  ws._speaking = false;
-  ws._graceUntil = 0;
-  ws._ctx = new ConversationContext();
-  ws._dgConnection = null;
-  let noInputTimer = null;
-
-  const resetNoInputTimer = () => {
-    if (noInputTimer) clearTimeout(noInputTimer);
-    noInputTimer = setTimeout(async () => {
-      if (ws._speaking || Date.now() < ws._graceUntil) return;
-      ws._speaking = true;
-      try {
-        const prompt = ws._ctx.t("stillThere");
-        const out = MEDIA_FORMAT === "mulaw" ? 
-          await ttsToMulaw(prompt, ws._ctx.language) : 
-          await ttsToPcm16(prompt, ws._ctx.language);
-        await streamFrames(ws, out);
-      } catch (e) {
-        console.error("[TTS] reprompt failed:", e.message);
-      } finally {
-        ws._speaking = false;
-        ws._graceUntil = Date.now() + POST_TTS_GRACE_MS;
-        resetNoInputTimer();
-      }
-    }, NO_INPUT_REPROMPT_MS);
-  };
-
-  const handleFinal = async (finalText) => {
-    // Use longer grace when collecting phone to avoid interrupting
-    const gracePeriod = ws._ctx.collectingPhone ? PHONE_COLLECTION_GRACE_MS : POST_TTS_GRACE_MS;
-    
-    if (Date.now() < ws._graceUntil) {
-      console.log("[GRACE] Ignoring input during grace period");
-      return;
-    }
-    if (ws._speaking) return;
-
-    // Detect language ONLY on first input, then lock it in
-    if (!ws._ctx.languageDetected) {
-      const detectedLang = detectLanguage(finalText);
-      ws._ctx.language = detectedLang;
-      ws._ctx.languageDetected = true;
-      console.log(`[LANG] Detected and locked to: ${ws._ctx.language}`);
-      
-      // Reconnect Deepgram with correct language if needed
-      if (detectedLang !== "en") {
-        if (ws._dgConnection) ws._dgConnection.close();
-        ws._dgConnection = connectDeepgram(handleFinal, () => resetNoInputTimer(), ws._ctx.language, ws);
-      }
-    }
-
-    console.log(`[USER] "${safeLog(finalText)}"`);
-    
-    let reply;
-    try {
-      reply = routeWithContext(finalText, ws._ctx);
-      console.log(`[BOT] "${safeLog(reply)}"`);
-      console.log(`[CONTEXT] ${safeLog(JSON.stringify(ws._ctx.data))}`);
-    } catch (e) {
-      console.error("[ROUTING] Error in routeWithContext:", e.message);
-      reply = "I'm sorry, I had trouble processing that. Could you please repeat?";
-    }
-
-    ws._speaking = true;
-    try {
-      const out = MEDIA_FORMAT === "mulaw" ? 
-        await ttsToMulaw(reply, ws._ctx.language) : 
-        await ttsToPcm16(reply, ws._ctx.language);
-      await streamFrames(ws, out);
-      console.log("[TTS] Successfully streamed response");
-    } catch (e) {
-      console.error("[TTS] reply failed:", e.message, e.stack);
-      // Try to send an error message to the user
-      try {
-        const errorMsg = "I'm having trouble with my voice. Please try again.";
-        const errorBuf = MEDIA_FORMAT === "mulaw" ? 
-          await ttsToMulaw(errorMsg, "en") : 
-          await ttsToPcm16(errorMsg, "en");
-        await streamFrames(ws, errorBuf);
-      } catch (e2) {
-        console.error("[TTS] Error message also failed:", e2.message);
-      }
-    } finally {
-      ws._speaking = false;
-      const nextGracePeriod = ws._ctx.collectingPhone ? PHONE_COLLECTION_GRACE_MS : POST_TTS_GRACE_MS;
-      ws._graceUntil = Date.now() + nextGracePeriod;
-      resetNoInputTimer();
-    }
-  };
-
-  ws._dgConnection = connectDeepgram(handleFinal, () => resetNoInputTimer(), "en", ws);
-
-  ws.on("message", async (data) => {
-    let msg;
-    try { msg = JSON.parse(data.toString()); } catch { return; }
-    
-    if (msg.event === "connected") {
-      console.log(`[WS] event: connected`);
-    }
-    
-    if (msg.event === "start") {
-      ws._streamSid = msg.start?.streamSid;
-      console.log(`[WS] START callSid=${safeLog(msg.start?.callSid || "")}`);
-      
-      // Beep
-      if (MEDIA_FORMAT === "mulaw") await streamFrames(ws, makeBeepMulaw());
-      else await streamFrames(ws, makeBeepPcm16());
-      
-      // Greeting
-      try {
-        const text = ws._ctx.t("greeting");
-        const buf = MEDIA_FORMAT === "mulaw" ? 
-          await ttsToMulaw(text) : 
-          await ttsToPcm16(text);
-        await streamFrames(ws, buf);
-        ws._ctx.greeted = true;
-        // NO grace period after greeting - user should be able to respond immediately
-      } catch (e) {
-        console.error("[TTS] greeting failed:", e.message);
-      }
-      resetNoInputTimer();
-    }
-    
-    if (msg.event === "media") {
-      const payload = msg?.media?.payload;
-      if (typeof payload !== "string" || payload.length === 0) return;
-      let b;
-      try { b = Buffer.from(payload, "base64"); } catch { return; }
-      ws._rx++;
-      
-      if (ws._dgConnection && ws._dgConnection.readyState === ws._dgConnection.OPEN &&
-          !ws._speaking && Date.now() >= ws._graceUntil) {
-        const pcm16 = inboundToPCM16(b);
-        ws._dgConnection.send(pcm16);
-      }
-    }
-    
-    if (msg.event === "stop") {
-      console.log(`[WS] STOP`);
-      if (ws._dgConnection && ws._dgConnection.readyState === ws._dgConnection.OPEN) {
-        ws._dgConnection.close();
-      }
-      if (noInputTimer) clearTimeout(noInputTimer);
-    }
-  });
-  
-  ws.on("close", () => {
-    console.log("[WS] CLOSE");
-    if (noInputTimer) clearTimeout(noInputTimer);
-  });
-  ws.on("error", (err) => console.error("[WS] error", err));
-});
-
-// ───────────────────────────────────────────────────────────────────────────────
-// HTTP
-// ───────────────────────────────────────────────────────────────────────────────
-app.use(express.json({ limit: "1mb" }));
-app.get("/", (_req, res) => res.status(200).send("OK"));
-app.get("/debug/say", async (req, res) => {
-  try {
-    const text = (req.query.text || "This is a test.").toString();
-    const lang = (req.query.lang || "en").toString().slice(0, 5);
-    const buf = MEDIA_FORMAT === "mulaw" ? 
-      await ttsToMulaw(text, lang) : 
-      await ttsToPcm16(text, lang);
-    res.setHeader("Content-Type", MEDIA_FORMAT === "mulaw" ? "audio/basic" : "audio/L16");
-    res.send(buf);
-  } catch (e) {
-    res.status(500).send(e.message);
-  }
-});
-
-const server = app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
-
-// ───────────────────────────────────────────────────────────────────────────────
-// WebSocket upgrade with OPTIONAL authentication
-// ───────────────────────────────────────────────────────────────────────────────
-server.on("upgrade", (req, socket, head) => {
-  try {
-    const url = new URL(req.url, "http://" + req.headers.host);
-    
-    // Check path
-    if (url.pathname !== "/stream") {
-      console.log("❌ Invalid path:", url.pathname);
-      socket.destroy();
-      return;
-    }
-    
-    // OPTIONAL authentication - only check token if AUTH_ENABLED
-    if (AUTH_ENABLED) {
-      const token = url.searchParams.get("token");
-      if (token !== AGENT_TOKEN) {
-        console.log("❌ Invalid or missing token");
-        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-        socket.destroy();
-        return;
-      }
-      console.log("✅ Token validated");
-    }
-    
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  } catch (e) {
-    console.error("[UPGRADE] error:", e.message);
-    socket.destroy();
-  }
 });
