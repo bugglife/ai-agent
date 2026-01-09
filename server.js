@@ -1209,7 +1209,10 @@ const server = app.listen(PORT, () => console.log(`🚀 Server running on port $
 server.on("upgrade", (req, socket, head) => {
   try {
     const url = new URL(req.url, "http://" + req.headers.host);
-    
+
+    console.log("[AUTH DEBUG] req.url =", req.url);
+    console.log("[AUTH DEBUG] token =", JSON.stringify(url.searchParams.get("token")));
+
     // Check path
     if (url.pathname !== "/stream") {
       console.log("❌ Invalid path:", url.pathname);
