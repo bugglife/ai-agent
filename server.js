@@ -974,7 +974,6 @@ const resetNoInputTimer = () => {
   }, NO_INPUT_REPROMPT_MS);
 };
 
-  };
 
   const handleFinal = async (finalText) => {
     // Use longer grace when collecting phone to avoid interrupting
